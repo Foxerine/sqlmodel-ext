@@ -22,6 +22,7 @@ SQLModel 增强基础设施：智能元类、异步 CRUD Mixin、多态继承、
 | **RelationPreloadMixin** | 基于装饰器的关系自动预加载（防止 `MissingGreenlet` 错误） |
 | **ListResponse[T]** | 泛型分页响应模型，适用于列表接口 |
 | **字段类型** | 可复用的约束类型：`Str64`、`Port`、`IPAddress`、`HttpUrl`、`SafeHttpUrl` 等 |
+| **PostgreSQL 类型** | `Array[T]` 原生 ARRAY、`JSON100K`/`JSONList100K` 限长 JSONB、`NumpyVector` pgvector+NumPy 集成 |
 | **响应 DTO Mixin** | 预构建的 API 响应模型 Mixin，包含 id/时间戳字段 |
 
 ## 安装
@@ -34,6 +35,18 @@ pip install sqlmodel-ext
 
 ```bash
 pip install sqlmodel-ext[fastapi]
+```
+
+使用 PostgreSQL ARRAY 和 JSONB 类型（需要 `orjson`）：
+
+```bash
+pip install sqlmodel-ext[postgresql]
+```
+
+使用 pgvector + NumPy 向量支持（包含 `[postgresql]`）：
+
+```bash
+pip install sqlmodel-ext[pgvector]
 ```
 
 ## 快速开始
@@ -1017,6 +1030,160 @@ class FileRecord(SQLModelBase, UUIDTableBaseMixin, table=True):
 
 ---
 
+### PostgreSQL 类型
+
+PostgreSQL 特有的类型位于 `sqlmodel_ext.field_types.dialects.postgresql`。由于依赖 PostgreSQL 特定的库，**不会**从顶层 `sqlmodel_ext` 包导入。
+
+```python
+from sqlmodel_ext.field_types.dialects.postgresql import (
+    Array,          # pip install sqlmodel-ext（使用 sqlalchemy.dialects.postgresql）
+    JSON100K,       # pip install sqlmodel-ext[postgresql]（需要 orjson）
+    JSONList100K,   # pip install sqlmodel-ext[postgresql]（需要 orjson）
+    NumpyVector,    # pip install sqlmodel-ext[pgvector]（需要 numpy + pgvector）
+)
+```
+
+#### `Array[T]` -- PostgreSQL ARRAY
+
+泛型数组类型，将 Python `list[T]` 映射到 PostgreSQL 原生 `ARRAY` 列类型。
+
+```python
+from sqlmodel import Field
+from sqlmodel_ext.field_types.dialects.postgresql import Array
+
+class Article(SQLModelBase, UUIDTableBaseMixin, table=True):
+    tags: Array[str] = Field(default_factory=list)
+    """字符串数组，PostgreSQL 中存储为 TEXT[]"""
+
+    scores: Array[int] = Field(default_factory=list)
+    """整数数组，PostgreSQL 中存储为 INTEGER[]"""
+
+    metadata_list: Array[dict] = Field(default_factory=list)
+    """JSONB 数组，PostgreSQL 中存储为 JSONB[]"""
+
+    refs: Array[UUID] = Field(default_factory=list)
+    """UUID 数组，PostgreSQL 中存储为 UUID[]"""
+```
+
+**带最大长度限制：**
+
+```python
+class Config(SQLModelBase, UUIDTableBaseMixin, table=True):
+    version_vector: Array[dict, 20] = Field(default_factory=list)
+    """最多 20 个元素，由 Pydantic 验证"""
+```
+
+**支持的内部类型：**
+
+| Python 类型 | PostgreSQL 类型 |
+|-------------|----------------|
+| `str` | `TEXT[]` |
+| `int` | `INTEGER[]` |
+| `dict` | `JSONB[]` |
+| `UUID` | `UUID[]` |
+| `Enum` 子类 | `ENUM[]` |
+
+#### `JSON100K` / `JSONList100K` -- 限长 JSONB
+
+带 100K 字符输入限制的 JSONB 类型，在 Pydantic 验证层强制执行。使用 `orjson` 进行高速序列化。
+
+```python
+from sqlmodel_ext.field_types.dialects.postgresql import JSON100K, JSONList100K
+
+class Project(SQLModelBase, UUIDTableBaseMixin, table=True):
+    canvas: JSON100K
+    """画布数据，存储为 JSONB（最大 100K 字符）"""
+
+    messages: JSONList100K
+    """消息列表，存储为 JSONB（最大 100K 字符）"""
+```
+
+**行为说明：**
+
+| 特性 | `JSON100K` | `JSONList100K` |
+|------|-----------|---------------|
+| Python 类型 | `dict[str, Any]` | `list[dict[str, Any]]` |
+| 接受输入 | `dict` 或 JSON 字符串 | `list` 或 JSON 字符串 |
+| PostgreSQL 类型 | `JSONB` | `JSONB` |
+| 最大输入长度 | 100,000 字符 | 100,000 字符 |
+| API 序列化 | JSON 字符串 | JSON 字符串 |
+
+#### `NumpyVector` -- pgvector + NumPy 集成
+
+在 PostgreSQL 中以 pgvector 的 `Vector` 类型存储，在 Python 中以 `numpy.ndarray` 暴露。支持固定维度的向量数据和 dtype 约束。
+
+```python
+import numpy as np
+from sqlmodel import Field
+from sqlmodel_ext.field_types.dialects.postgresql import NumpyVector
+
+class SpeakerInfo(SQLModelBase, UUIDTableBaseMixin, table=True):
+    embedding: NumpyVector[1024, np.float32] = Field(...)
+    """1024 维 float32 嵌入向量"""
+
+# 默认 dtype 为 float32
+class Document(SQLModelBase, UUIDTableBaseMixin, table=True):
+    embedding: NumpyVector[768] = Field(...)
+    """768 维向量（默认 float32）"""
+```
+
+**API 序列化格式**（base64 编码，高效传输）：
+
+```json
+{
+    "dtype": "float32",
+    "shape": 1024,
+    "data_b64": "AAABAAA..."
+}
+```
+
+**支持的输入格式：**
+
+| 格式 | 示例 |
+|------|------|
+| `numpy.ndarray` | `np.zeros(1024, dtype=np.float32)` |
+| `list` / `tuple` | `[0.1, 0.2, ...]` |
+| base64 字典 | `{"dtype": "float32", "shape": 1024, "data_b64": "..."}` |
+| pgvector 字符串 | `"[0.1, 0.2, ...]"`（从数据库加载） |
+
+**向量相似度搜索**（pgvector 运算符）：
+
+```python
+from sqlalchemy import select
+
+# L2 距离（欧几里得距离）
+stmt = select(SpeakerInfo).order_by(
+    SpeakerInfo.embedding.l2_distance(query_vector)
+).limit(10)
+
+# 余弦距离
+stmt = select(SpeakerInfo).order_by(
+    SpeakerInfo.embedding.cosine_distance(query_vector)
+).limit(10)
+
+# 最大内积
+stmt = select(SpeakerInfo).order_by(
+    SpeakerInfo.embedding.max_inner_product(query_vector)
+).limit(10)
+```
+
+**向量异常：**
+
+| 异常 | 触发场景 |
+|------|----------|
+| `VectorError` | 所有向量错误的基类 |
+| `VectorDimensionError` | 数组维度与声明的大小不匹配 |
+| `VectorDTypeError` | dtype 转换失败 |
+| `VectorDecodeError` | base64 或数据库格式解码失败 |
+
+```python
+from sqlmodel_ext.field_types.dialects.postgresql import (
+    VectorError, VectorDimensionError, VectorDTypeError, VectorDecodeError,
+)
+```
+
+---
+
 ### 响应 DTO Mixin
 
 为 API 响应模型预构建的 Mixin，包含 id 和时间戳字段：
@@ -1065,6 +1232,13 @@ sqlmodel_ext/
         url.py               # Url、HttpUrl、WebSocketUrl、SafeHttpUrl
         _internal/path.py    # 路径类型处理器
         mixins/              # ModuleNameMixin
+        dialects/
+            postgresql/
+                __init__.py      # PostgreSQL 类型重导出
+                array.py         # Array[T] 泛型 ARRAY 类型
+                jsonb_types.py   # JSON100K、JSONList100K（需要 orjson）
+                numpy_vector.py  # NumpyVector[dims, dtype]（需要 numpy + pgvector）
+                exceptions.py    # VectorError 异常层次
 ```
 
 ## 环境要求
@@ -1074,6 +1248,9 @@ sqlmodel_ext/
 - **pydantic** >= 2.0
 - **sqlalchemy** >= 2.0
 - （可选）**fastapi** >= 0.100.0
+- （可选）**orjson** >= 3.0 -- 用于 `JSON100K` / `JSONList100K`
+- （可选）**numpy** >= 1.24 -- 用于 `NumpyVector`
+- （可选）**pgvector** >= 0.3 -- 用于 `NumpyVector`
 
 ## AI 使用披露
 

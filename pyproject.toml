@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-ext"
-version = "0.1.0"
+version = "0.1.1"
 description = "Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphic inheritance, optimistic locking, relation preloading, and reusable field types."
 readme = "README.md"
 license = "MIT"
@@ -35,6 +35,12 @@ dependencies = [
 
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.100.0"]
+postgresql = ["orjson>=3.0"]
+pgvector = [
+    "sqlmodel-ext[postgresql]",
+    "numpy>=1.24",
+    "pgvector>=0.3",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

@@ -22,6 +22,7 @@ Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphi
 | **RelationPreloadMixin** | Decorator-based automatic relationship preloading (prevents `MissingGreenlet` errors) |
 | **ListResponse[T]** | Generic paginated response model for list endpoints |
 | **Field Types** | Reusable constrained types: `Str64`, `Port`, `IPAddress`, `HttpUrl`, `SafeHttpUrl`, and more |
+| **PostgreSQL Types** | `Array[T]` for native ARRAY, `JSON100K`/`JSONList100K` for size-limited JSONB, `NumpyVector` for pgvector+NumPy |
 | **Info Response DTOs** | Pre-built mixins for API response models with id/timestamp fields |
 
 ## Installation
@@ -34,6 +35,18 @@ With [FastAPI](https://fastapi.tiangolo.com/) support (enables `HTTPException` i
 
 ```bash
 pip install sqlmodel-ext[fastapi]
+```
+
+With PostgreSQL ARRAY and JSONB types (requires `orjson`):
+
+```bash
+pip install sqlmodel-ext[postgresql]
+```
+
+With pgvector + NumPy vector support (includes `[postgresql]`):
+
+```bash
+pip install sqlmodel-ext[pgvector]
 ```
 
 ## Quick Start
@@ -1017,6 +1030,160 @@ class FileRecord(SQLModelBase, UUIDTableBaseMixin, table=True):
 
 ---
 
+### PostgreSQL Types
+
+PostgreSQL-specific types live in `sqlmodel_ext.field_types.dialects.postgresql`. They are **not** imported from the top-level `sqlmodel_ext` package because they require PostgreSQL-specific dependencies.
+
+```python
+from sqlmodel_ext.field_types.dialects.postgresql import (
+    Array,          # pip install sqlmodel-ext  (uses sqlalchemy.dialects.postgresql)
+    JSON100K,       # pip install sqlmodel-ext[postgresql]  (requires orjson)
+    JSONList100K,   # pip install sqlmodel-ext[postgresql]  (requires orjson)
+    NumpyVector,    # pip install sqlmodel-ext[pgvector]  (requires numpy + pgvector)
+)
+```
+
+#### `Array[T]` -- PostgreSQL ARRAY
+
+A generic array type that maps Python `list[T]` to PostgreSQL's native `ARRAY` column type.
+
+```python
+from sqlmodel import Field
+from sqlmodel_ext.field_types.dialects.postgresql import Array
+
+class Article(SQLModelBase, UUIDTableBaseMixin, table=True):
+    tags: Array[str] = Field(default_factory=list)
+    """String array stored as TEXT[] in PostgreSQL"""
+
+    scores: Array[int] = Field(default_factory=list)
+    """Integer array stored as INTEGER[] in PostgreSQL"""
+
+    metadata_list: Array[dict] = Field(default_factory=list)
+    """JSONB array stored as JSONB[] in PostgreSQL"""
+
+    refs: Array[UUID] = Field(default_factory=list)
+    """UUID array stored as UUID[] in PostgreSQL"""
+```
+
+**With max length:**
+
+```python
+class Config(SQLModelBase, UUIDTableBaseMixin, table=True):
+    version_vector: Array[dict, 20] = Field(default_factory=list)
+    """Max 20 elements, validated by Pydantic"""
+```
+
+**Supported inner types:**
+
+| Python Type | PostgreSQL Type |
+|-------------|----------------|
+| `str` | `TEXT[]` |
+| `int` | `INTEGER[]` |
+| `dict` | `JSONB[]` |
+| `UUID` | `UUID[]` |
+| `Enum` subclass | `ENUM[]` |
+
+#### `JSON100K` / `JSONList100K` -- Size-Limited JSONB
+
+JSONB types with a 100K character input limit, enforced at the Pydantic validation layer. Uses `orjson` for fast serialization.
+
+```python
+from sqlmodel_ext.field_types.dialects.postgresql import JSON100K, JSONList100K
+
+class Project(SQLModelBase, UUIDTableBaseMixin, table=True):
+    canvas: JSON100K
+    """Canvas data stored as JSONB (max 100K chars)"""
+
+    messages: JSONList100K
+    """Message list stored as JSONB (max 100K chars)"""
+```
+
+**Behavior:**
+
+| Feature | `JSON100K` | `JSONList100K` |
+|---------|-----------|---------------|
+| Python type | `dict[str, Any]` | `list[dict[str, Any]]` |
+| Accepts | `dict` or JSON string | `list` or JSON string |
+| PostgreSQL type | `JSONB` | `JSONB` |
+| Max input length | 100,000 chars | 100,000 chars |
+| API serialization | JSON string | JSON string |
+
+#### `NumpyVector` -- pgvector + NumPy Integration
+
+Stores vectors as pgvector's `Vector` type in PostgreSQL while exposing them as `numpy.ndarray` in Python. Supports fixed-dimension vectors with dtype enforcement.
+
+```python
+import numpy as np
+from sqlmodel import Field
+from sqlmodel_ext.field_types.dialects.postgresql import NumpyVector
+
+class SpeakerInfo(SQLModelBase, UUIDTableBaseMixin, table=True):
+    embedding: NumpyVector[1024, np.float32] = Field(...)
+    """1024-dimensional float32 embedding vector"""
+
+# Default dtype is float32
+class Document(SQLModelBase, UUIDTableBaseMixin, table=True):
+    embedding: NumpyVector[768] = Field(...)
+    """768-dimensional vector (float32 by default)"""
+```
+
+**API serialization format** (base64-encoded for efficiency):
+
+```json
+{
+    "dtype": "float32",
+    "shape": 1024,
+    "data_b64": "AAABAAA..."
+}
+```
+
+**Accepted input formats:**
+
+| Format | Example |
+|--------|---------|
+| `numpy.ndarray` | `np.zeros(1024, dtype=np.float32)` |
+| `list` / `tuple` | `[0.1, 0.2, ...]` |
+| base64 dict | `{"dtype": "float32", "shape": 1024, "data_b64": "..."}` |
+| pgvector string | `"[0.1, 0.2, ...]"` (from database) |
+
+**Vector similarity search** with pgvector operators:
+
+```python
+from sqlalchemy import select
+
+# L2 distance (Euclidean)
+stmt = select(SpeakerInfo).order_by(
+    SpeakerInfo.embedding.l2_distance(query_vector)
+).limit(10)
+
+# Cosine distance
+stmt = select(SpeakerInfo).order_by(
+    SpeakerInfo.embedding.cosine_distance(query_vector)
+).limit(10)
+
+# Max inner product
+stmt = select(SpeakerInfo).order_by(
+    SpeakerInfo.embedding.max_inner_product(query_vector)
+).limit(10)
+```
+
+**Vector exceptions:**
+
+| Exception | When |
+|-----------|------|
+| `VectorError` | Base class for all vector errors |
+| `VectorDimensionError` | Array dimensions don't match the declared size |
+| `VectorDTypeError` | dtype conversion fails |
+| `VectorDecodeError` | base64 or database format decoding fails |
+
+```python
+from sqlmodel_ext.field_types.dialects.postgresql import (
+    VectorError, VectorDimensionError, VectorDTypeError, VectorDecodeError,
+)
+```
+
+---
+
 ### Info Response DTO Mixins
 
 Pre-built mixins for API response models that always include id and timestamp fields:
@@ -1065,6 +1232,13 @@ sqlmodel_ext/
         url.py               # Url, HttpUrl, WebSocketUrl, SafeHttpUrl
         _internal/path.py    # Path type handlers
         mixins/              # ModuleNameMixin
+        dialects/
+            postgresql/
+                __init__.py      # PostgreSQL type re-exports
+                array.py         # Array[T] generic ARRAY type
+                jsonb_types.py   # JSON100K, JSONList100K (requires orjson)
+                numpy_vector.py  # NumpyVector[dims, dtype] (requires numpy + pgvector)
+                exceptions.py    # VectorError hierarchy
 ```
 
 ## Requirements
@@ -1074,6 +1248,9 @@ sqlmodel_ext/
 - **pydantic** >= 2.0
 - **sqlalchemy** >= 2.0
 - (optional) **fastapi** >= 0.100.0
+- (optional) **orjson** >= 3.0 -- for `JSON100K` / `JSONList100K`
+- (optional) **numpy** >= 1.24 -- for `NumpyVector`
+- (optional) **pgvector** >= 0.3 -- for `NumpyVector`
 
 ## AI Disclosure
 
