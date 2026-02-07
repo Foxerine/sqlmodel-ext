@@ -43,9 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/foxline-ai/sqlmodel-ext"
-Repository = "https://github.com/foxline-ai/sqlmodel-ext"
-Issues = "https://github.com/foxline-ai/sqlmodel-ext/issues"
+Homepage = "https://github.com/Foxerine/sqlmodel-ext"
+Repository = "https://github.com/Foxerine/sqlmodel-ext"
+Issues = "https://github.com/Foxerine/sqlmodel-ext/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqlmodel_ext"]
