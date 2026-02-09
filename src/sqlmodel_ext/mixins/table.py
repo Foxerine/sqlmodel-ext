@@ -406,13 +406,20 @@ class TableBaseMixin(AsyncAttrs):
         else:
             statement = select(cls)
 
-        # STI auto-filter
-        if issubclass(cls, PolymorphicBaseMixin) and not cls._is_joined_table_inheritance():
+        # STI auto-filter: SQLAlchemy/SQLModel does NOT auto-add WHERE discriminator
+        # filter for STI sub-class queries. We manually add WHERE _polymorphic_name IN (...)
+        # using mapper.self_and_descendants to include the class and all its children.
+        if is_sti:
             mapper = inspect(cls)
-            if mapper.polymorphic_identity is not None and not mapper.polymorphic_abstract:
-                poly_on = mapper.polymorphic_on
-                if poly_on is not None:
-                    statement = statement.where(poly_on == mapper.polymorphic_identity)
+            poly_on = mapper.polymorphic_on
+            if poly_on is not None:
+                descendant_identities = [
+                    m.polymorphic_identity
+                    for m in mapper.self_and_descendants
+                    if m.polymorphic_identity is not None
+                ]
+                if descendant_identities:
+                    statement = statement.where(poly_on.in_(descendant_identities))
 
         if condition is not None:
             statement = statement.where(condition)
@@ -659,6 +666,21 @@ class TableBaseMixin(AsyncAttrs):
                 updated_before_datetime = time_filter.updated_before_datetime
 
         statement = select(func.count()).select_from(cls)
+
+        # STI sub-class filter (consistent with get())
+        is_polymorphic = issubclass(cls, PolymorphicBaseMixin)
+        is_sti = is_polymorphic and not cls._is_joined_table_inheritance()
+        if is_sti:
+            mapper = inspect(cls)
+            poly_on = mapper.polymorphic_on
+            if poly_on is not None:
+                descendant_identities = [
+                    m.polymorphic_identity
+                    for m in mapper.self_and_descendants
+                    if m.polymorphic_identity is not None
+                ]
+                if descendant_identities:
+                    statement = statement.where(poly_on.in_(descendant_identities))
 
         if condition is not None:
             statement = statement.where(condition)

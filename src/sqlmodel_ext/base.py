@@ -9,6 +9,7 @@ Provides a smart metaclass that handles:
 - Annotated sa_type extraction and injection
 - Python 3.14 (PEP 649) compatibility
 """
+import re
 import sys
 import typing
 from typing import Any, get_args, get_origin
@@ -35,6 +36,59 @@ if sys.version_info >= (3, 14):
     import annotationlib  # noqa: F401
 else:
     annotationlib = None
+
+
+def _make_sti_fk_resolver(
+    fk_string: str,
+    sa_registry: typing.Any,
+) -> typing.Callable:
+    """
+    Convert string-format foreign_keys to a callable for deferred resolution in STI.
+
+    STI child columns are added to the parent table via _register_sti_columns(),
+    but during configure_mappers() they are not yet registered as ColumnProperty.
+    SQLAlchemy's string resolution (_GetColumns.__getattr__) looks up columns via
+    mapper.all_orm_descriptors, which fails for unregistered STI columns.
+
+    Solution: convert to callable so configure_mappers() calls it to resolve
+    Column objects directly from the table's columns collection (Phase 1 already added them).
+
+    :param fk_string: String-format foreign_keys, e.g. '[NanoBananaFunction.flash_llm_id]'
+    :param sa_registry: SQLAlchemy registry for class-name lookup
+    :return: callable returning list of Column objects
+    """
+    inner = fk_string.strip('[]')
+    specs = [s.strip() for s in inner.split(',')]
+
+    parsed: list[tuple[str, str]] = []
+    for spec in specs:
+        m = re.match(r'^(\w+)\.(\w+)$', spec)
+        if not m:
+            return fk_string  # type: ignore  # cannot parse, return original
+        parsed.append((m.group(1), m.group(2)))
+
+    _registry = sa_registry
+
+    def _resolve() -> list:
+        columns = []
+        for cls_name, col_name in parsed:
+            for mapper in _registry.mappers:
+                if mapper.class_.__name__ == cls_name:
+                    table = mapper.local_table
+                    if col_name not in table.c:
+                        raise RuntimeError(
+                            f"STI FK resolution failed: column '{col_name}' "
+                            f"not in table '{table.name}' (class {cls_name})"
+                        )
+                    columns.append(table.c[col_name])
+                    break
+            else:
+                raise RuntimeError(
+                    f"STI FK resolution failed: class '{cls_name}' not in SA registry"
+                )
+        return columns
+
+    return _resolve
 
 
 class __DeclarativeMeta(SQLModelMetaclass):
@@ -367,73 +421,107 @@ class __DeclarativeMeta(SQLModelMetaclass):
                 mapper_args = getattr(cls, '__mapper_args__', {})
                 polymorphic_identity = mapper_args.get('polymorphic_identity')
 
-                if polymorphic_identity is not None:
-                    parent_cls = None
-                    for base in bases:
-                        if is_table_model_class(base) and hasattr(base, '__mapper__'):
-                            parent_cls = base
-                            break
+                # Support both concrete classes (polymorphic_identity set) and
+                # abstract intermediate classes (polymorphic_identity=None, polymorphic_abstract=True)
+                parent_cls = None
+                for base in bases:
+                    if is_table_model_class(base) and hasattr(base, '__mapper__'):
+                        parent_cls = base
+                        break
 
-                    if parent_cls is not None:
-                        registry = parent_cls._sa_registry
+                if parent_cls is not None:
+                    registry = parent_cls._sa_registry
 
-                        rels = getattr(cls, '__sqlmodel_relationships__', {})
-                        own_rels = {}
-                        for rel_name, rel_info in rels.items():
-                            is_inherited = any(
-                                hasattr(base, '__sqlmodel_relationships__') and rel_name in base.__sqlmodel_relationships__
-                                for base in bases
-                            )
-                            if not is_inherited:
-                                own_rels[rel_name] = rel_info
-
-                        properties = {}
-                        if own_rels:
-                            for rel_name, rel_info in own_rels.items():
-                                if rel_info.sa_relationship:
-                                    properties[rel_name] = rel_info.sa_relationship
-                                else:
-                                    raw_ann = cls.__annotations__.get(rel_name)
-                                    if raw_ann:
-                                        origin = get_origin(raw_ann)
-                                        if origin is Mapped:
-                                            ann = raw_ann.__args__[0]
-                                        else:
-                                            ann = raw_ann
-                                        relationship_to = get_relationship_to(
-                                            name=rel_name, rel_info=rel_info, annotation=ann
-                                        )
-                                        rel_kwargs: dict[str, typing.Any] = {}
-                                        if rel_info.back_populates:
-                                            rel_kwargs["back_populates"] = rel_info.back_populates
-                                        if rel_info.cascade_delete:
-                                            rel_kwargs["cascade"] = "all, delete-orphan"
-                                        if rel_info.passive_deletes:
-                                            rel_kwargs["passive_deletes"] = rel_info.passive_deletes
-                                        if rel_info.link_model:
-                                            ins = sa_inspect(rel_info.link_model)
-                                            local_table = getattr(ins, "local_table")
-                                            if local_table is None:
-                                                raise RuntimeError(
-                                                    f"Could not find secondary table for {rel_name}: {rel_info.link_model}"
-                                                )
-                                            rel_kwargs["secondary"] = local_table
-
-                                        rel_args: list[typing.Any] = []
-                                        if rel_info.sa_relationship_args:
-                                            rel_args.extend(rel_info.sa_relationship_args)
-                                        if rel_info.sa_relationship_kwargs:
-                                            rel_kwargs.update(rel_info.sa_relationship_kwargs)
-
-                                        properties[rel_name] = sa_relationship(relationship_to, *rel_args, **rel_kwargs)
-
-                        registry.map_imperatively(
-                            cls,
-                            parent_cls.__table__,
-                            inherits=parent_cls,
-                            polymorphic_identity=polymorphic_identity,
-                            properties=properties if properties else None,
+                    rels = getattr(cls, '__sqlmodel_relationships__', {})
+                    own_rels = {}
+                    for rel_name, rel_info in rels.items():
+                        is_inherited = any(
+                            hasattr(base, '__sqlmodel_relationships__') and rel_name in base.__sqlmodel_relationships__
+                            for base in bases
                         )
+                        if not is_inherited:
+                            own_rels[rel_name] = rel_info
+
+                    properties = {}
+                    if own_rels:
+                        for rel_name, rel_info in own_rels.items():
+                            if rel_info.sa_relationship:
+                                properties[rel_name] = rel_info.sa_relationship
+                            else:
+                                raw_ann = cls.__annotations__.get(rel_name)
+                                if raw_ann:
+                                    origin = get_origin(raw_ann)
+                                    if origin is Mapped:
+                                        ann = raw_ann.__args__[0]
+                                    else:
+                                        ann = raw_ann
+                                    relationship_to = get_relationship_to(
+                                        name=rel_name, rel_info=rel_info, annotation=ann
+                                    )
+                                    rel_kwargs: dict[str, typing.Any] = {}
+                                    if rel_info.back_populates:
+                                        rel_kwargs["back_populates"] = rel_info.back_populates
+                                    if rel_info.cascade_delete:
+                                        rel_kwargs["cascade"] = "all, delete-orphan"
+                                    if rel_info.passive_deletes:
+                                        rel_kwargs["passive_deletes"] = rel_info.passive_deletes
+                                    if rel_info.link_model:
+                                        ins = sa_inspect(rel_info.link_model)
+                                        local_table = getattr(ins, "local_table")
+                                        if local_table is None:
+                                            raise RuntimeError(
+                                                f"Could not find secondary table for {rel_name}: {rel_info.link_model}"
+                                            )
+                                        rel_kwargs["secondary"] = local_table
+
+                                    rel_args: list[typing.Any] = []
+                                    if rel_info.sa_relationship_args:
+                                        rel_args.extend(rel_info.sa_relationship_args)
+                                    if rel_info.sa_relationship_kwargs:
+                                        rel_kwargs.update(rel_info.sa_relationship_kwargs)
+
+                                    # STI foreign_keys deferred resolution:
+                                    # STI child columns are not yet registered as ColumnProperty
+                                    # during configure_mappers(), so string foreign_keys fail.
+                                    # Convert to callable for lazy resolution from table columns.
+                                    if 'foreign_keys' in rel_kwargs:
+                                        _fk_val = rel_kwargs['foreign_keys']
+                                        if isinstance(_fk_val, str):
+                                            rel_kwargs['foreign_keys'] = _make_sti_fk_resolver(
+                                                _fk_val, registry
+                                            )
+                                    else:
+                                        # Auto-detect FK ambiguity: when the "many" side STI child
+                                        # has a {rel_name}_id FK field but foreign_keys is not
+                                        # explicitly specified, add a callable to disambiguate.
+                                        _fk_field = f'{rel_name}_id'
+                                        _model_fields = getattr(cls, 'model_fields', None) or {}
+                                        if _fk_field in _model_fields:
+                                            _tbl = parent_cls.__table__
+                                            _fn = _fk_field
+                                            rel_kwargs['foreign_keys'] = (
+                                                lambda _t=_tbl, _f=_fn: [_t.c[_f]]
+                                            )
+
+                                    properties[rel_name] = sa_relationship(relationship_to, *rel_args, **rel_kwargs)
+
+                    # Build map_imperatively kwargs conditionally
+                    map_kwargs: dict[str, typing.Any] = {
+                        'inherits': parent_cls,
+                        'properties': properties if properties else None,
+                    }
+                    if polymorphic_identity is not None:
+                        map_kwargs['polymorphic_identity'] = polymorphic_identity
+                    # Abstract intermediate classes (e.g. TencentCompatibleLLM)
+                    # need polymorphic_abstract=True forwarded to map_imperatively
+                    if mapper_args.get('polymorphic_abstract'):
+                        map_kwargs['polymorphic_abstract'] = True
+
+                    registry.map_imperatively(
+                        cls,
+                        parent_cls.__table__,
+                        **map_kwargs,
+                    )
 
     def _setup_relationships(cls, only_these: set[str] | None = None) -> None:
         """
