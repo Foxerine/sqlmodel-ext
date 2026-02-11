@@ -20,7 +20,7 @@ Quick start::
     user = await user.save(session)
     users = await User.get(session, fetch_mode="all")
 """
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # Base
 from sqlmodel_ext.base import SQLModelBase
@@ -100,4 +100,13 @@ from sqlmodel_ext.field_types import (
     UnsafeURLError,
     validate_not_private_host,
     ModuleNameMixin,
+)
+
+# Relation Load Checker (static analysis)
+from sqlmodel_ext.relation_load_checker import (
+    RelationLoadChecker,
+    RelationLoadWarning,
+    RelationLoadCheckMiddleware,
+    run_model_checks,
+    mark_app_check_completed,
 )

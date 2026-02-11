@@ -31,13 +31,16 @@ Usage Example::
         pass
 """
 import logging
+import types
 import uuid
 from abc import ABC
+from enum import StrEnum
+from typing import Annotated, Any, Union, get_args, get_origin
 from uuid import UUID
 
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
-from sqlalchemy import Column, String, inspect
+from sqlalchemy import Column, Enum as SAEnum, Integer, String, event, inspect
 from sqlalchemy.orm import ColumnProperty, Mapped, mapped_column
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlmodel import Field
@@ -77,7 +80,8 @@ def register_sti_column_properties_for_all_subclasses() -> None:
     Add column properties to mapper for all queued STI subclasses (Phase 2).
 
     Call this after ``configure_mappers()``.
-    Adds STI subclass fields as ColumnProperty to the mapper.
+    Adds STI subclass fields as ColumnProperty to the mapper,
+    and registers StrEnum field auto-coercion on load/refresh.
     """
     for cls in _sti_subclasses_to_register:
         try:
@@ -85,7 +89,93 @@ def register_sti_column_properties_for_all_subclasses() -> None:
         except Exception as e:
             logger.warning(f"Error registering STI column properties for {cls.__name__}: {e}")
 
+    # Register StrEnum field auto-coercion
+    for cls in _sti_subclasses_to_register:
+        try:
+            _register_strenum_coercion_for_subclass(cls)
+        except Exception as e:
+            logger.warning(f"Error registering StrEnum coercion for {cls.__name__}: {e}")
+
     _sti_subclasses_to_register.clear()
+
+
+def _extract_strenum_type(annotation: Any) -> type[StrEnum] | None:
+    """
+    Extract StrEnum subclass type from a type annotation.
+
+    Handles ``Annotated`` and ``Optional``/``Union`` wrappers.
+    Returns ``None`` for non-StrEnum annotations.
+    """
+    if annotation is None:
+        return None
+
+    # Unwrap Annotated[T, ...]
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+
+    # Unwrap T | None or Optional[T]
+    origin = get_origin(annotation)
+    if origin is Union or origin is types.UnionType:
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            annotation = args[0]
+
+    if isinstance(annotation, type) and issubclass(annotation, StrEnum):
+        return annotation
+
+    return None
+
+
+def _register_strenum_coercion_for_subclass(cls: type) -> None:
+    """
+    Register SQLAlchemy load/refresh event listeners for StrEnum auto-coercion.
+
+    STI subclass StrEnum columns may be stored as ``String()`` (or ``INTEGER`` etc.)
+    in the shared table. SQLAlchemy loads them as raw ``str`` (or ``int``) instead of
+    the declared StrEnum type. This registers event listeners that automatically coerce
+    raw values to the correct StrEnum type after loading.
+
+    Fields defined on the STI root class (the one that owns ``__tablename__``) use native
+    SQLAlchemy Enum columns and are loaded correctly — they are excluded from coercion.
+    """
+    model_fields = getattr(cls, 'model_fields', None)
+    if not model_fields:
+        return
+
+    # Find root class fields (use native SAEnum columns, no coercion needed)
+    root_fields: set[str] = set()
+    for base in cls.__mro__[1:]:
+        if '__tablename__' in base.__dict__ and hasattr(base, 'model_fields'):
+            root_fields = set(base.model_fields.keys())
+            break
+
+    # Collect non-root StrEnum fields
+    strenum_fields: dict[str, type[StrEnum]] = {}
+    for field_name, field_info in model_fields.items():
+        if field_name in root_fields:
+            continue
+        enum_type = _extract_strenum_type(field_info.annotation)
+        if enum_type is not None:
+            strenum_fields[field_name] = enum_type
+
+    if not strenum_fields:
+        return
+
+    def _coerce(target: Any) -> None:
+        """Coerce raw DB values (str/int) to declared StrEnum types."""
+        d = target.__dict__
+        for field_name, enum_type in strenum_fields.items():
+            raw = d.get(field_name)
+            if raw is not None and not isinstance(raw, enum_type):
+                d[field_name] = enum_type(str(raw))
+
+    @event.listens_for(cls, 'load')
+    def _on_load(target, context):
+        _coerce(target)
+
+    @event.listens_for(cls, 'refresh')
+    def _on_refresh(target, context, attrs):
+        _coerce(target)
 
 
 def _fix_polluted_model_fields(cls: type) -> None:
@@ -291,6 +381,23 @@ class AutoPolymorphicIdentityMixin:
             if field_name.startswith('_'):
                 continue
             if field_name in existing_columns:
+                # Detect type conflicts: Integer vs non-Integer is incompatible
+                existing_col = parent_table.columns[field_name]
+                try:
+                    new_col = get_column_from_field(field_info)
+                except Exception:
+                    continue
+                new_type = new_col.type
+                if isinstance(new_type, SAEnum):
+                    new_type = String()
+                if isinstance(existing_col.type, Integer) != isinstance(new_type, Integer):
+                    raise TypeError(
+                        f"STI column type conflict: {cls.__name__}.{field_name} type "
+                        f"({type(new_type).__name__}) is incompatible with existing "
+                        f"{parent_table.name}.{field_name} type "
+                        f"({type(existing_col.type).__name__}). "
+                        f"Use a different field name."
+                    )
                 continue
 
             try:

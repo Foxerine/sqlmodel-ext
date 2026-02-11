@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-ext"
-version = "0.1.1"
+version = "0.1.2"
 description = "Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphic inheritance, optimistic locking, relation preloading, and reusable field types."
 readme = "README.md"
 license = "MIT"

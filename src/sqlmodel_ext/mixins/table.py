@@ -6,7 +6,7 @@ pagination, polymorphic query support, and relationship preloading.
 """
 import uuid
 from datetime import datetime
-from typing import TypeVar, Literal, override, Any, ClassVar
+from typing import TypeVar, Literal, override, overload, Any, ClassVar
 
 from sqlalchemy import DateTime, BinaryExpression, ClauseElement, desc, asc, func, distinct, delete as sql_delete, inspect
 from sqlalchemy.orm import selectinload, Relationship, with_polymorphic
@@ -319,6 +319,81 @@ class TableBaseMixin(AsyncAttrs):
         if updated_before_datetime is not None:
             filters.append(cls.updated_at < updated_before_datetime)
         return filters
+
+    @overload
+    @classmethod
+    async def get(
+            cls: type[T],
+            session: AsyncSession,
+            condition: BinaryExpression | ClauseElement | None = None,
+            *,
+            offset: int | None = None,
+            limit: int | None = None,
+            fetch_mode: Literal["all"],
+            join: type[T] | tuple[type[T], _OnClauseArgument] | None = None,
+            options: list | None = None,
+            load: RelationshipInfo | list[RelationshipInfo] | None = None,
+            order_by: list[ClauseElement] | None = None,
+            filter: BinaryExpression | ClauseElement | None = None,
+            with_for_update: bool = False,
+            table_view: TableViewRequest | None = None,
+            jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
+            populate_existing: bool = False,
+            created_before_datetime: datetime | None = None,
+            created_after_datetime: datetime | None = None,
+            updated_before_datetime: datetime | None = None,
+            updated_after_datetime: datetime | None = None,
+    ) -> list[T]: ...
+
+    @overload
+    @classmethod
+    async def get(
+            cls: type[T],
+            session: AsyncSession,
+            condition: BinaryExpression | ClauseElement | None = None,
+            *,
+            offset: int | None = None,
+            limit: int | None = None,
+            fetch_mode: Literal["one"],
+            join: type[T] | tuple[type[T], _OnClauseArgument] | None = None,
+            options: list | None = None,
+            load: RelationshipInfo | list[RelationshipInfo] | None = None,
+            order_by: list[ClauseElement] | None = None,
+            filter: BinaryExpression | ClauseElement | None = None,
+            with_for_update: bool = False,
+            table_view: TableViewRequest | None = None,
+            jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
+            populate_existing: bool = False,
+            created_before_datetime: datetime | None = None,
+            created_after_datetime: datetime | None = None,
+            updated_before_datetime: datetime | None = None,
+            updated_after_datetime: datetime | None = None,
+    ) -> T: ...
+
+    @overload
+    @classmethod
+    async def get(
+            cls: type[T],
+            session: AsyncSession,
+            condition: BinaryExpression | ClauseElement | None = None,
+            *,
+            offset: int | None = None,
+            limit: int | None = None,
+            fetch_mode: Literal["first"] = ...,
+            join: type[T] | tuple[type[T], _OnClauseArgument] | None = None,
+            options: list | None = None,
+            load: RelationshipInfo | list[RelationshipInfo] | None = None,
+            order_by: list[ClauseElement] | None = None,
+            filter: BinaryExpression | ClauseElement | None = None,
+            with_for_update: bool = False,
+            table_view: TableViewRequest | None = None,
+            jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
+            populate_existing: bool = False,
+            created_before_datetime: datetime | None = None,
+            created_after_datetime: datetime | None = None,
+            updated_before_datetime: datetime | None = None,
+            updated_after_datetime: datetime | None = None,
+    ) -> T | None: ...
 
     @classmethod
     async def get(
