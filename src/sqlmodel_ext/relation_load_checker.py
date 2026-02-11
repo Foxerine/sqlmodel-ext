@@ -851,9 +851,14 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                 if method_name in _SAVE_METHODS:
                     obj_name = self._get_call_object_name(call)
                     if obj_name and obj_name in self.tracked_vars:
-                        if not self._has_keyword_false(call, 'commit'):
+                        commit_disabled = self._has_keyword_false(call, 'commit')
+                        if not commit_disabled:
                             # commit=True: session.commit() expires all objects
                             self._expire_all_tracked_vars()
+                            # save/update(refresh=True) refreshes the object in-place
+                            # via session.refresh() -- column attrs restored, rels still not loaded
+                            if not self._has_keyword_false(call, 'refresh'):
+                                self.tracked_vars[obj_name].post_commit = False
 
                 # await session.commit() -- direct commit call
                 elif method_name == 'commit':
@@ -861,7 +866,8 @@ class _FunctionAnalyzer(ast.NodeVisitor):
 
                 # await Model.get_or_create(session, ...) -- may commit internally
                 elif method_name in _COMMIT_QUERY_METHODS:
-                    self._expire_all_tracked_vars()
+                    if not self._has_keyword_false(call, 'commit'):
+                        self._expire_all_tracked_vars()
 
                 # await session.refresh(obj) -- restores column attrs
                 elif method_name == 'refresh':
@@ -947,7 +953,9 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                             old_var.loaded_rels = loaded_rels
                         old_var.line = self._abs_line(node)
                     else:
-                        # Return value assigned to different variable
+                        # Return value assigned to different variable (result = await self.save(...))
+                        # save/update returns self (same object), in-place refresh means
+                        # both variables point to the refreshed object
                         if commit_disabled:
                             new_rels = old_var.loaded_rels | loaded_rels
                             new_post_commit = False
@@ -964,6 +972,11 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                             caller_provided=False,
                             line=self._abs_line(node),
                         )
+                        # Original object is also refreshed in-place (save returns self,
+                        # refresh via session.refresh() restores column attrs in-place)
+                        if not commit_disabled and not refresh_disabled:
+                            old_var.post_commit = False
+                            old_var.loaded_rels = loaded_rels
 
             # Model.get_with_count(...) etc
             elif method_name == 'get_with_count':
@@ -979,8 +992,9 @@ class _FunctionAnalyzer(ast.NodeVisitor):
 
             # Model.get_or_create(session, ...) -- may commit internally + return model
             elif method_name in _COMMIT_QUERY_METHODS:
-                # Expire all tracked vars first (get_or_create may save -> commit)
-                self._expire_all_tracked_vars()
+                # commit=False means flush only, no expiration
+                if not self._has_keyword_false(call, 'commit'):
+                    self._expire_all_tracked_vars()
                 # Return value is a fresh/existing model instance (columns loaded, rels not)
                 model_name = self._get_call_class_name(call)
                 if model_name and model_name in self.model_relationships:
@@ -1007,6 +1021,11 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         # Skip method calls (e.g. obj.save())
         parent = self._get_parent(node)
         if isinstance(parent, ast.Call) and parent.func is node:
+            self.generic_visit(node)
+            return
+
+        # Skip assignment targets (self.attr = value is a write, does not trigger lazy load)
+        if isinstance(parent, ast.Assign) and node in parent.targets:
             self.generic_visit(node)
             return
 
