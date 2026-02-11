@@ -18,6 +18,7 @@ Detection rules:
     - RLC002: access to relationship after save()/update() without load=
     - RLC003: access to relationship without prior load= (only for locally obtained vars)
     - RLC005: dependency function does not preload relationships required by response_model
+    - RLC007: column access on expired (post-commit) object triggers synchronous lazy load -> MissingGreenlet
 
 Auto-check (recommended)::
 
@@ -85,7 +86,7 @@ _PROJECT_ROOT: str = os.getcwd()
 class RelationLoadWarning:
     """Relation load static analysis warning."""
     code: str
-    """Rule code (RLC001-RLC005)."""
+    """Rule code (RLC001-RLC007)."""
     file: str
     """File path."""
     line: int
@@ -103,6 +104,8 @@ _COMMIT_METHODS = frozenset({'save', 'update', 'delete'})
 _QUERY_METHODS = frozenset({'get', 'get_exist_one', 'first'})
 # save/update return refreshed object
 _SAVE_METHODS = frozenset({'save', 'update'})
+# Methods that may commit internally AND return a model instance (e.g. get_or_create may save)
+_COMMIT_QUERY_METHODS = frozenset({'get_or_create'})
 
 
 @dataclass
@@ -206,7 +209,8 @@ class RelationLoadChecker:
                 # Unwrap staticmethod
                 func = raw_attr.__func__ if isinstance(raw_attr, staticmethod) else raw_attr
 
-                if not python_inspect.iscoroutinefunction(func):
+                if not (python_inspect.iscoroutinefunction(func)
+                        or python_inspect.isasyncgenfunction(func)):
                     continue
 
                 if id(func) in self._analyzed_func_ids:
@@ -233,9 +237,11 @@ class RelationLoadChecker:
         skip_paths: list[str] | None = None,
     ) -> list[RelationLoadWarning]:
         """
-        Scan all imported modules' async functions in the project.
+        Scan all imported modules' async functions and async generators.
 
-        Iterates sys.modules, analyzing coroutine functions from project source files.
+        Iterates sys.modules, analyzing coroutine functions and async generators
+        from project source files. Also scans methods of non-model classes
+        (e.g. command handlers, service classes).
         Automatically skips functions already analyzed by check_app/check_model_methods.
 
         :param project_root: absolute path to project root directory
@@ -260,33 +266,59 @@ class RelationLoadChecker:
             if any(skip in module_file_normalized for skip in default_skip):
                 continue
 
+            # Collect functions to analyze: module-level + class methods
+            funcs_to_check: list[tuple[str, Any]] = []
+
             for attr_name in dir(module):
                 try:
                     attr = getattr(module, attr_name)
                 except Exception:
                     continue
 
-                if not python_inspect.iscoroutinefunction(attr):
-                    continue
-                if id(attr) in self._analyzed_func_ids:
-                    continue
-                self._analyzed_func_ids.add(id(attr))
+                if self._is_async_callable(attr):
+                    # Module-level async function / async generator
+                    func_module = getattr(attr, '__module__', None)
+                    if func_module == module_name:
+                        funcs_to_check.append((f"{module_name}.{attr_name}", attr))
+                elif python_inspect.isclass(attr):
+                    # Non-model class methods (model classes already covered by check_model_methods)
+                    if attr.__module__ != module_name:
+                        continue
+                    if attr.__name__ in self.model_classes:
+                        continue  # Model classes analyzed by check_model_methods
+                    for method_name in vars(attr):
+                        if method_name.startswith('__') and method_name.endswith('__'):
+                            continue
+                        raw = vars(attr)[method_name]
+                        # Unwrap classmethod / staticmethod
+                        func = raw
+                        if isinstance(raw, (classmethod, staticmethod)):
+                            func = raw.__func__
+                        if self._is_async_callable(func):
+                            funcs_to_check.append(
+                                (f"{module_name}.{attr.__name__}.{method_name}", func),
+                            )
 
-                # Only analyze functions defined in this module (skip imports)
-                func_module = getattr(attr, '__module__', None)
-                if func_module != module_name:
+            for label, func in funcs_to_check:
+                if id(func) in self._analyzed_func_ids:
                     continue
+                self._analyzed_func_ids.add(id(func))
 
-                label = f"{module_name}.{attr_name}"
                 try:
                     func_warnings = self._check_coroutine(
-                        func=attr, label=label,
+                        func=func, label=label,
                     )
                     warnings.extend(func_warnings)
                 except Exception as e:
                     logger.debug(f"Error analyzing coroutine {label}: {e}")
 
         return warnings
+
+    @staticmethod
+    def _is_async_callable(obj: Any) -> bool:
+        """Check whether obj is an async callable (coroutine function or async generator)."""
+        return (python_inspect.iscoroutinefunction(obj)
+                or python_inspect.isasyncgenfunction(obj))
 
     def check_function(self, func: Any) -> list[RelationLoadWarning]:
         """
@@ -437,6 +469,7 @@ class RelationLoadChecker:
 
         analyzer = _FunctionAnalyzer(
             model_relationships=self.model_relationships,
+            model_columns=self.model_columns,
             param_models=param_models,
             dep_loads=dep_loads,
             required_rels=required_rels,
@@ -753,6 +786,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
     def __init__(
         self,
         model_relationships: dict[str, set[str]],
+        model_columns: dict[str, set[str]],
         param_models: dict[str, str],
         dep_loads: dict[str, set[str]],
         required_rels: dict[str, str],
@@ -762,6 +796,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         caller_provided_params: set[str],
     ) -> None:
         self.model_relationships = model_relationships
+        self.model_columns = model_columns
         self.required_rels = required_rels
         self.source_file = source_file
         self.line_offset = line_offset
@@ -804,6 +839,8 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         - session.commit() expires ALL objects in the session
         - save()/update() internally calls commit(), so all tracked vars expire
         - commit=False only flushes, no expiration
+        - get_or_create() may commit internally, expiring all objects
+        - session.refresh(obj) restores column attrs (un-expires the object)
         """
         if isinstance(node.value, ast.Await):
             call = node.value.value
@@ -821,6 +858,14 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                 # await session.commit() -- direct commit call
                 elif method_name == 'commit':
                     self._expire_all_tracked_vars()
+
+                # await Model.get_or_create(session, ...) -- may commit internally
+                elif method_name in _COMMIT_QUERY_METHODS:
+                    self._expire_all_tracked_vars()
+
+                # await session.refresh(obj) -- restores column attrs
+                elif method_name == 'refresh':
+                    self._handle_session_refresh(call)
 
         self.generic_visit(node)
 
@@ -932,6 +977,21 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                         line=self._abs_line(node),
                     )
 
+            # Model.get_or_create(session, ...) -- may commit internally + return model
+            elif method_name in _COMMIT_QUERY_METHODS:
+                # Expire all tracked vars first (get_or_create may save -> commit)
+                self._expire_all_tracked_vars()
+                # Return value is a fresh/existing model instance (columns loaded, rels not)
+                model_name = self._get_call_class_name(call)
+                if model_name and model_name in self.model_relationships:
+                    self.tracked_vars[var_name] = _TrackedVar(
+                        model_name=model_name,
+                        loaded_rels=loaded_rels,
+                        post_commit=False,
+                        caller_provided=False,
+                        line=self._abs_line(node),
+                    )
+
     # ========================= Attribute access detection =========================
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -950,10 +1010,11 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             self.generic_visit(node)
             return
 
-        # Check if it's a tracked variable's relationship attribute access
+        # Check if it's a tracked variable's attribute access
         if var_name in self.tracked_vars:
             var_info = self.tracked_vars[var_name]
             rels = self.model_relationships.get(var_info.model_name, set())
+            cols = self.model_columns.get(var_info.model_name, set())
 
             if attr_name in rels and attr_name not in var_info.loaded_rels:
                 if var_info.post_commit:
@@ -982,6 +1043,23 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                             f"Suggestion: load={var_info.model_name}.{attr_name}"
                         ),
                     ))
+            elif var_info.post_commit and attr_name in cols:
+                # RLC007: column access on expired (post-commit) object
+                # After commit, ALL objects in the session are expired.
+                # Accessing any column triggers a synchronous lazy load,
+                # which causes MissingGreenlet in async context.
+                # Typical scenario: obj_a.save() then obj_b.column (obj_b not refreshed)
+                self.warnings.append(RelationLoadWarning(
+                    code='RLC007',
+                    file=self.source_file,
+                    line=self._abs_line(node),
+                    message=(
+                        f"Accessing column '{var_name}.{attr_name}' on expired object "
+                        f"after commit. The object was not refreshed and access will "
+                        f"trigger synchronous lazy load -> MissingGreenlet. "
+                        f"Suggestion: await session.refresh({var_name})"
+                    ),
+                ))
 
         self.generic_visit(node)
 
@@ -1093,6 +1171,26 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         for var in self.tracked_vars.values():
             var.post_commit = True
             var.loaded_rels.clear()
+
+    def _handle_session_refresh(self, call: ast.Call) -> None:
+        """
+        Handle ``await session.refresh(obj)`` call.
+
+        Refresh restores column attributes (un-expires the object),
+        but does NOT load relationships.
+        Matches pattern: ``await session.refresh(var_name)``
+        """
+        if not call.args:
+            return
+        first_arg = call.args[0]
+        if isinstance(first_arg, ast.Name):
+            obj_name = first_arg.id
+            if obj_name in self.tracked_vars:
+                var = self.tracked_vars[obj_name]
+                # refresh restores column attrs, un-expire the object
+                var.post_commit = False
+                # relationships are still NOT loaded (refresh doesn't load them)
+                # loaded_rels remains empty
 
     @staticmethod
     def _extract_load_from_call(call: ast.Call) -> set[str]:
