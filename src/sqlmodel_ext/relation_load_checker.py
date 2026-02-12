@@ -49,9 +49,12 @@ import logging
 import os
 import sys
 import textwrap
+import types
 import typing
 from dataclasses import dataclass, field
-from typing import Annotated, Any
+from typing import Annotated, Any, Self, TypeVar, Union
+
+from sqlmodel.ext.asyncio.session import AsyncSession as _AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -98,14 +101,8 @@ class RelationLoadWarning:
         return f"[{self.code}] {self.file}:{self.line} - {self.message}"
 
 
-# save/update/delete methods that trigger commit
-_COMMIT_METHODS = frozenset({'save', 'update', 'delete'})
-# Query methods that return model instances
-_QUERY_METHODS = frozenset({'get', 'get_exist_one', 'first'})
-# save/update return refreshed object
-_SAVE_METHODS = frozenset({'save', 'update'})
-# Methods that may commit internally AND return a model instance (e.g. get_or_create may save)
-_COMMIT_QUERY_METHODS = frozenset({'get_or_create'})
+# save/update return refreshed self (used for fine-grained tracking within commit methods)
+_REFRESH_METHODS = frozenset({'save', 'update'})
 
 
 @dataclass
@@ -136,12 +133,18 @@ class RelationLoadChecker:
         self.model_relationships: dict[str, set[str]] = {}
         # model class name -> set of column attribute names
         self.model_columns: dict[str, set[str]] = {}
+        # model class name -> set of primary key column attribute names (PKs don't expire)
+        self.model_pk_columns: dict[str, set[str]] = {}
         # model class name -> actual class object
         self.model_classes: dict[str, type] = {}
         # analyzed function ids for dedup
         self._analyzed_func_ids: set[int] = set()
+        # auto-discovered method behaviors (type system as single source of truth)
+        self.commit_methods: frozenset[str] = frozenset()
+        self.model_returning_methods: frozenset[str] = frozenset()
 
         self._build_knowledge_base(base_class)
+        self.commit_methods, self.model_returning_methods = self._discover_method_behaviors()
 
     def _build_knowledge_base(self, base_class: type) -> None:
         """Build model knowledge base from SQLAlchemy mappers."""
@@ -154,7 +157,175 @@ class RelationLoadChecker:
             self.model_columns[cls_name] = {
                 col.key for col in mapper.column_attrs
             }
+            self.model_pk_columns[cls_name] = {
+                col.key for col in mapper.primary_key
+            }
             self.model_classes[cls_name] = cls
+
+    def _discover_method_behaviors(self) -> tuple[frozenset[str], frozenset[str]]:
+        """
+        Single-pass discovery of commit methods and model-returning methods.
+
+        Uses the type system as single source of truth:
+
+        **Commit methods** (anchored on ``AsyncSession.commit()``):
+
+        1. Scan all model classes and their bases for async methods accepting ``AsyncSession``
+        2. Check if the method body calls ``.commit()`` / ``.rollback()`` on that parameter
+        3. Transitive closure: methods that call step-2 methods passing the session are also commit methods
+
+        **Model-returning methods** (anchored on return type annotations):
+
+        1. Inspect the method's return type annotation
+        2. If it returns ``Self``, a concrete model class, ``Self | None``, ``T``, etc. -> model-returning
+
+        :returns: (commit_methods, model_returning_methods)
+        """
+        # method_name -> (session_param_name, AST)
+        method_infos: dict[str, tuple[str, ast.Module]] = {}
+        # method_name -> owning class name (for resolving Self -> concrete class)
+        method_owners: dict[str, str] = {}
+        # method_name -> return type hint
+        method_return_hints: dict[str, Any] = {}
+        seen_func_ids: set[int] = set()
+
+        for cls_name, cls in self.model_classes.items():
+            for klass in cls.__mro__:
+                if klass is object:
+                    continue
+                for attr_name in vars(klass):
+                    if attr_name.startswith('__') and attr_name.endswith('__'):
+                        continue
+                    raw = vars(klass)[attr_name]
+                    func = raw.__func__ if isinstance(raw, (staticmethod, classmethod)) else raw
+                    if not callable(func):
+                        continue
+                    func_id = id(func)
+                    if func_id in seen_func_ids:
+                        continue
+                    seen_func_ids.add(func_id)
+
+                    # Only analyze async methods
+                    if not (python_inspect.iscoroutinefunction(func)
+                            or python_inspect.isasyncgenfunction(func)):
+                        continue
+
+                    # Get type hints
+                    try:
+                        hints = typing.get_type_hints(func)
+                    except Exception:
+                        continue
+
+                    # Find the AsyncSession-typed parameter name
+                    session_param: str | None = None
+                    for param_name, hint in hints.items():
+                        if hint is _AsyncSession:
+                            session_param = param_name
+                            break
+
+                    if session_param is None:
+                        continue
+
+                    # Keep only the first method of the same name (MRO order, most specific subclass first)
+                    if attr_name in method_infos:
+                        continue
+
+                    try:
+                        source = textwrap.dedent(python_inspect.getsource(func))
+                        tree = ast.parse(source)
+                    except (OSError, TypeError, SyntaxError):
+                        continue
+
+                    method_infos[attr_name] = (session_param, tree)
+                    method_owners[attr_name] = cls_name
+
+                    # Record return type
+                    return_hint = hints.get('return')
+                    if return_hint is not None:
+                        method_return_hints[attr_name] = return_hint
+
+        # -------- Commit method discovery --------
+
+        # Phase 1: methods that directly call session.commit() / session.rollback()
+        commit_methods: set[str] = set()
+        for method_name, (session_param, tree) in method_infos.items():
+            if _ast_has_typed_commit(tree, session_param):
+                commit_methods.add(method_name)
+
+        # Phase 2: transitive closure -- methods that call commit methods passing the session
+        changed = True
+        while changed:
+            changed = False
+            for method_name, (session_param, tree) in method_infos.items():
+                if method_name in commit_methods:
+                    continue
+                if _ast_calls_commit_method_with_session(
+                    tree, session_param, frozenset(commit_methods),
+                ):
+                    commit_methods.add(method_name)
+                    changed = True
+
+        # -------- Model-returning method discovery --------
+
+        def _is_model_type(hint: Any) -> bool:
+            """Check if type is a known model class."""
+            return isinstance(hint, type) and hint.__name__ in self.model_relationships
+
+        def _hint_returns_model(hint: Any) -> bool:
+            """Recursively check if return type annotation contains a model type."""
+            # Self -> returns model
+            if hint is Self:
+                return True
+
+            # Direct model class
+            if _is_model_type(hint):
+                return True
+
+            # TypeVar (T) -> only used in known contexts, treat as model (conservative but safe)
+            if isinstance(hint, TypeVar):
+                # Check if bound is a model class
+                if hint.__bound__ is not None and _is_model_type(hint.__bound__):
+                    return True
+                # Unbound TypeVar (e.g. save's T) -- in model method context, treat as model
+                return True
+
+            origin = typing.get_origin(hint)
+
+            # Union/Optional: Self | None, T | None
+            # Handle both typing.Union (Optional[X], Union[X, Y]) and types.UnionType (X | Y)
+            if origin is Union or origin is types.UnionType:
+                return any(
+                    _hint_returns_model(arg)
+                    for arg in typing.get_args(hint)
+                    if arg is not type(None)
+                )
+
+            # list[T], list[Self]
+            if origin is list:
+                args = typing.get_args(hint)
+                if args:
+                    return _hint_returns_model(args[0])
+
+            # tuple[T, bool] (get_or_create pattern)
+            if origin is tuple:
+                args = typing.get_args(hint)
+                if args:
+                    return _hint_returns_model(args[0])
+
+            # String forward reference (e.g. -> 'UserCharacterConfig')
+            if isinstance(hint, str) and hint in self.model_relationships:
+                return True
+
+            return False
+
+        model_returning: set[str] = set()
+        for method_name, return_hint in method_return_hints.items():
+            if _hint_returns_model(return_hint):
+                model_returning.add(method_name)
+
+        logger.debug(f"Auto-discovered commit methods: {sorted(commit_methods)}")
+        logger.debug(f"Auto-discovered model-returning methods: {sorted(model_returning)}")
+        return frozenset(commit_methods), frozenset(model_returning)
 
     # ========================= Public API =========================
 
@@ -206,8 +377,8 @@ class RelationLoadChecker:
                     continue
 
                 raw_attr = vars(cls)[attr_name]
-                # Unwrap staticmethod
-                func = raw_attr.__func__ if isinstance(raw_attr, staticmethod) else raw_attr
+                # Unwrap staticmethod/classmethod
+                func = raw_attr.__func__ if isinstance(raw_attr, (staticmethod, classmethod)) else raw_attr
 
                 if not (python_inspect.iscoroutinefunction(func)
                         or python_inspect.isasyncgenfunction(func)):
@@ -395,14 +566,19 @@ class RelationLoadChecker:
         # Build param_models
         param_models = self._resolve_param_models(func)
 
-        # Detect instance method
+        # Detect instance method or classmethod
         sig = python_inspect.signature(func)
         first_param = next(iter(sig.parameters), None)
         caller_provided_params: set[str] = set()
 
+        # cls -> class alias (classmethod's cls parameter doesn't enter tracked_vars,
+        # only used for resolving class-level calls)
+        class_aliases: dict[str, str] = {}
         if first_param == 'self':
             param_models['self'] = cls_name
             caller_provided_params.add('self')
+        elif first_param == 'cls':
+            class_aliases['cls'] = cls_name
 
         # @requires_relations declared rels as self's dep_loads
         dep_loads: dict[str, set[str]] = {}
@@ -417,6 +593,7 @@ class RelationLoadChecker:
             label=label,
             caller_provided_params=caller_provided_params,
             pre_parsed=(source_file, tree, line_offset),
+            class_aliases=class_aliases,
         )
         return warnings
 
@@ -448,12 +625,14 @@ class RelationLoadChecker:
         label: str,
         caller_provided_params: set[str],
         pre_parsed: tuple[str, ast.Module, int] | None = None,
+        class_aliases: dict[str, str] | None = None,
     ) -> tuple[list[RelationLoadWarning], '_FunctionAnalyzer | None']:
         """
         Core AST analysis: parse function body and run _FunctionAnalyzer.
 
         :param caller_provided_params: set of caller-provided parameter names, skip RLC003
         :param pre_parsed: pre-parsed (source_file, tree, line_offset) to avoid re-parsing
+        :param class_aliases: class alias mapping (e.g. cls -> UserFile) for resolving classmethod calls
         """
         if pre_parsed is not None:
             source_file, tree, line_offset = pre_parsed
@@ -470,6 +649,7 @@ class RelationLoadChecker:
         analyzer = _FunctionAnalyzer(
             model_relationships=self.model_relationships,
             model_columns=self.model_columns,
+            model_pk_columns=self.model_pk_columns,
             param_models=param_models,
             dep_loads=dep_loads,
             required_rels=required_rels,
@@ -477,6 +657,9 @@ class RelationLoadChecker:
             line_offset=line_offset,
             path=label,
             caller_provided_params=caller_provided_params,
+            commit_methods=self.commit_methods,
+            model_returning_methods=self.model_returning_methods,
+            class_aliases=class_aliases,
         )
         analyzer.visit(func_node)
 
@@ -767,6 +950,59 @@ def _extract_load_value(node: ast.expr) -> set[str]:
     return result
 
 
+# ========================= Commit method auto-discovery =========================
+
+
+def _ast_has_typed_commit(tree: ast.Module, session_param: str) -> bool:
+    """
+    Check if the AST calls ``.commit()`` or ``.rollback()`` on the specified session parameter.
+
+    Only matches ``<session_param>.commit()`` / ``<session_param>.rollback()``,
+    anchored by parameter name to avoid false positives.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {'commit', 'rollback'}
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == session_param
+        ):
+            return True
+    return False
+
+
+def _ast_calls_commit_method_with_session(
+    tree: ast.Module,
+    session_param: str,
+    commit_methods: frozenset[str],
+) -> bool:
+    """
+    Check if the AST calls a known commit method and passes the session parameter.
+
+    Matches patterns:
+
+    - ``await obj.save(session, ...)``
+    - ``await cls.from_remote_url(session=session, ...)``
+    """
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in commit_methods
+        ):
+            continue
+        # Check if session is passed as a positional argument
+        for arg in node.args:
+            if isinstance(arg, ast.Name) and arg.id == session_param:
+                return True
+        # Check if session is passed as a keyword argument
+        for kw in node.keywords:
+            if isinstance(kw.value, ast.Name) and kw.value.id == session_param:
+                return True
+    return False
+
+
 # ========================= AST function analyzer =========================
 
 
@@ -787,6 +1023,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         self,
         model_relationships: dict[str, set[str]],
         model_columns: dict[str, set[str]],
+        model_pk_columns: dict[str, set[str]],
         param_models: dict[str, str],
         dep_loads: dict[str, set[str]],
         required_rels: dict[str, str],
@@ -794,15 +1031,22 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         line_offset: int,
         path: str,
         caller_provided_params: set[str],
+        commit_methods: frozenset[str] = frozenset(),
+        model_returning_methods: frozenset[str] = frozenset(),
+        class_aliases: dict[str, str] | None = None,
     ) -> None:
         self.model_relationships = model_relationships
         self.model_columns = model_columns
+        self.model_pk_columns = model_pk_columns
         self.required_rels = required_rels
         self.source_file = source_file
         self.line_offset = line_offset
         self.path = path
         self.warnings: list[RelationLoadWarning] = []
         self._parent_map: dict[int, ast.AST] = {}
+        self.commit_methods = commit_methods
+        self.model_returning_methods = model_returning_methods
+        self.class_aliases: dict[str, str] = class_aliases or {}
 
         # Initialize tracked vars from parameter type annotations
         self.tracked_vars: dict[str, _TrackedVar] = {}
@@ -820,26 +1064,85 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         """Get absolute line number."""
         return self.line_offset + getattr(node, 'lineno', 0)
 
+    def _resolve_class_name(self, name: str | None) -> str | None:
+        """
+        Resolve a name to a known model class name.
+
+        Handles classmethod ``cls`` parameter aliases (e.g. ``cls`` -> ``UserFile``).
+        """
+        if name is None:
+            return None
+        resolved = self.class_aliases.get(name, name)
+        if resolved in self.model_relationships:
+            return resolved
+        return None
+
     def visit_Assign(self, node: ast.Assign) -> None:
         """Check assignment statement."""
+        self._handle_attribute_writes(node.targets, node.value)
         self._check_assign(node.targets, node.value, node)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         """Check annotated assignment statement."""
         if node.target and node.value:
+            self._handle_attribute_writes([node.target], node.value)
             self._check_assign([node.target], node.value, node)
         self.generic_visit(node)
+
+    def _handle_attribute_writes(self, targets: list[ast.expr], value: ast.expr) -> None:
+        """
+        Track attribute writes on tracked variables.
+
+        Handles two patterns:
+        1. ``self.attr = fresh_var.attr`` -- same model type from fresh var -> identity map refresh.
+           ``Model.get(session, ...)`` returns an object sharing the identity map with ``self``;
+           assigning query result attributes to self indicates self was refreshed via identity map,
+           clearing the ``post_commit`` flag (all columns and loaded rels are up-to-date).
+
+        2. ``self.rel = some_value`` -- simple attribute write -> only marks that relationship as loaded.
+        """
+        for target in targets:
+            if not isinstance(target, ast.Attribute):
+                continue
+            if not isinstance(target.value, ast.Name):
+                continue
+            var_name = target.value.id
+            attr_name = target.attr
+
+            if var_name not in self.tracked_vars:
+                continue
+            var_info = self.tracked_vars[var_name]
+            if not var_info.post_commit:
+                continue
+
+            # Pattern 1: self.attr = fresh_var.attr (same model type -> identity map refresh)
+            if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+                src_var_name = value.value.id
+                if src_var_name in self.tracked_vars:
+                    src_var = self.tracked_vars[src_var_name]
+                    if (src_var.model_name == var_info.model_name
+                            and not src_var.post_commit):
+                        # Identity map: self and fresh_var are the same database row.
+                        # The query refreshed all column attributes; rels follow fresh_var's state.
+                        var_info.post_commit = False
+                        var_info.loaded_rels = src_var.loaded_rels.copy()
+                        return
+
+            # Pattern 2: simple relationship attribute write (don't clear post_commit,
+            # only mark that specific relationship as loaded)
+            rels = self.model_relationships.get(var_info.model_name, set())
+            if attr_name in rels:
+                var_info.loaded_rels.add(attr_name)
 
     def visit_Expr(self, node: ast.Expr) -> None:
         """
         Check expression statement (await without assignment).
 
-        Tracks actual SQLAlchemy commit behavior:
-        - session.commit() expires ALL objects in the session
-        - save()/update() internally calls commit(), so all tracked vars expire
+        Tracks actual SQLAlchemy commit behavior (auto-discovered, no hardcoded method names):
+        - session.commit() / session.rollback() expires all objects
+        - Auto-discovered commit methods (save/update/delete/create_duplicate/...) same behavior
         - commit=False only flushes, no expiration
-        - get_or_create() may commit internally, expiring all objects
         - session.refresh(obj) restores column attrs (un-expires the object)
         """
         if isinstance(node.value, ast.Await):
@@ -847,31 +1150,31 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             if isinstance(call, ast.Call):
                 method_name = self._get_method_name(call)
 
-                # await obj.save(session) / await obj.update(session) -- no assignment
-                if method_name in _SAVE_METHODS:
-                    obj_name = self._get_call_object_name(call)
-                    if obj_name and obj_name in self.tracked_vars:
-                        commit_disabled = self._has_keyword_false(call, 'commit')
-                        if not commit_disabled:
-                            # commit=True: session.commit() expires all objects
-                            self._expire_all_tracked_vars()
-                            # save/update(refresh=True) refreshes the object in-place
-                            # via session.refresh() -- column attrs restored, rels still not loaded
-                            if not self._has_keyword_false(call, 'refresh'):
-                                self.tracked_vars[obj_name].post_commit = False
-
-                # await session.commit() -- direct commit call
-                elif method_name == 'commit':
+                # session.commit() / session.rollback()
+                if method_name in {'commit', 'rollback'}:
                     self._expire_all_tracked_vars()
 
-                # await Model.get_or_create(session, ...) -- may commit internally
-                elif method_name in _COMMIT_QUERY_METHODS:
-                    if not self._has_keyword_false(call, 'commit'):
-                        self._expire_all_tracked_vars()
-
-                # await session.refresh(obj) -- restores column attrs
+                # session.refresh(obj)
                 elif method_name == 'refresh':
                     self._handle_session_refresh(call)
+
+                # Auto-discovered commit methods (no assignment)
+                elif method_name in self.commit_methods:
+                    obj_name = self._get_call_object_name(call)
+                    is_model_call = (
+                        obj_name is not None
+                        and (obj_name in self.tracked_vars
+                             or self._resolve_class_name(obj_name) is not None)
+                    )
+                    if is_model_call:
+                        commit_disabled = self._has_keyword_false(call, 'commit')
+                        if not commit_disabled:
+                            self._expire_all_tracked_vars()
+                            # save/update default refresh=True, refreshes the call object in-place
+                            if (obj_name in self.tracked_vars
+                                    and method_name in _REFRESH_METHODS
+                                    and not self._has_keyword_false(call, 'refresh')):
+                                self.tracked_vars[obj_name].post_commit = False
 
         self.generic_visit(node)
 
@@ -903,103 +1206,113 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             method_name = self._get_method_name(call)
             loaded_rels = self._extract_load_from_call(call)
 
-            # Model.get(...) call
-            if method_name in _QUERY_METHODS:
-                model_name = self._get_call_class_name(call)
-                if model_name and model_name in self.model_relationships:
-                    # options= passes raw SQLAlchemy load options;
-                    # cannot determine from AST which rels are loaded, assume all
+            # Auto-discovered commit methods (with assignment)
+            # Includes save/update/delete/get_or_create/create_duplicate etc.
+            # Tracks actual SQLAlchemy commit behavior:
+            #   commit=True  -> session.commit() -> all objects expire
+            #   refresh=True (default, save/update only) -> session.refresh() -> column attrs restored
+            #   load= -> cls.get(load=) -> specified rels loaded
+            #   commit=False -> session.flush() -> no expiration
+            if method_name in self.commit_methods:
+                obj_name = self._get_call_object_name(call)
+                class_name = self._get_call_class_name(call)
+
+                # Instance method call (obj.save/update/create_duplicate/...)
+                if obj_name and obj_name in self.tracked_vars:
+                    old_var = self.tracked_vars[obj_name]
+                    commit_disabled = self._has_keyword_false(call, 'commit')
+
+                    if not commit_disabled:
+                        self._expire_all_tracked_vars()
+
+                    if method_name in _REFRESH_METHODS:
+                        # save/update: returns self, supports refresh= and load= parameters
+                        refresh_disabled = self._has_keyword_false(call, 'refresh')
+                        if var_name == obj_name:
+                            old_var.caller_provided = False
+                            if commit_disabled:
+                                old_var.post_commit = False
+                                old_var.loaded_rels |= loaded_rels
+                            elif refresh_disabled:
+                                pass  # _expire_all already marked
+                            else:
+                                old_var.post_commit = False
+                                old_var.loaded_rels = loaded_rels
+                            old_var.line = self._abs_line(node)
+                        else:
+                            # save/update returns self; in-place refresh means
+                            # both variables point to the refreshed object
+                            if commit_disabled:
+                                new_rels = old_var.loaded_rels | loaded_rels
+                                new_post_commit = False
+                            elif refresh_disabled:
+                                new_rels: set[str] = set()
+                                new_post_commit = True
+                            else:
+                                new_rels = loaded_rels
+                                new_post_commit = False
+                            self.tracked_vars[var_name] = _TrackedVar(
+                                model_name=old_var.model_name,
+                                loaded_rels=new_rels,
+                                post_commit=new_post_commit,
+                                caller_provided=False,
+                                line=self._abs_line(node),
+                            )
+                            if not commit_disabled and not refresh_disabled:
+                                old_var.post_commit = False
+                                old_var.loaded_rels = loaded_rels
+                    else:
+                        # Other commit methods (e.g. create_duplicate, get_or_create)
+                        # Return value is a new model instance, rels determined by load=
+                        self.tracked_vars[var_name] = _TrackedVar(
+                            model_name=old_var.model_name,
+                            loaded_rels=loaded_rels,
+                            post_commit=False,
+                            caller_provided=False,
+                            line=self._abs_line(node),
+                        )
+
+                # Class method call (Model.get_or_create / cls.get_or_create /...)
+                else:
+                    resolved = self._resolve_class_name(class_name)
+                    if resolved is not None:
+                        if not self._has_keyword_false(call, 'commit'):
+                            self._expire_all_tracked_vars()
+                        self.tracked_vars[var_name] = _TrackedVar(
+                            model_name=resolved,
+                            loaded_rels=loaded_rels,
+                            post_commit=False,
+                            caller_provided=False,
+                            line=self._abs_line(node),
+                        )
+
+            # Auto-discovered model-returning methods (non-commit, pure query)
+            # Includes get/find_by_content_hash/get_exist_one etc.
+            # Discovered via return type annotations, no hardcoded method names
+            elif method_name in self.model_returning_methods:
+                obj_name = self._get_call_object_name(call)
+                class_name = self._get_call_class_name(call)
+                resolved = self._resolve_class_name(class_name)
+
+                # Class method call (Model.get / cls.find_by_content_hash /...)
+                if resolved is not None:
                     if self._has_keyword(call, 'options'):
-                        effective_rels = self.model_relationships[model_name].copy()
+                        effective_rels = self.model_relationships[resolved].copy()
                     else:
                         effective_rels = loaded_rels
                     self.tracked_vars[var_name] = _TrackedVar(
-                        model_name=model_name,
+                        model_name=resolved,
                         loaded_rels=effective_rels,
                         post_commit=False,
                         caller_provided=False,
                         line=self._abs_line(node),
                     )
 
-            # var.save(...) / var.update(...) call
-            # Tracks actual SQLAlchemy commit behavior:
-            #   commit=True  -> session.commit() -> all objects expire
-            #   refresh=True (default) -> session.refresh() -> column attrs restored
-            #   load= -> cls.get(load=) -> specified rels loaded
-            #   commit=False -> session.flush() -> no expiration
-            elif method_name in _SAVE_METHODS:
-                obj_name = self._get_call_object_name(call)
-                if obj_name and obj_name in self.tracked_vars:
+                # Instance method call (tracked_var.some_query_method/...)
+                elif obj_name and obj_name in self.tracked_vars:
                     old_var = self.tracked_vars[obj_name]
-                    commit_disabled = self._has_keyword_false(call, 'commit')
-                    refresh_disabled = self._has_keyword_false(call, 'refresh')
-
-                    if not commit_disabled:
-                        # commit=True: session.commit() expires ALL objects
-                        self._expire_all_tracked_vars()
-
-                    if var_name == obj_name:
-                        old_var.caller_provided = False
-                        if commit_disabled:
-                            # commit=False: no commit no expiration, preserve loaded rels
-                            old_var.post_commit = False
-                            old_var.loaded_rels |= loaded_rels
-                        elif refresh_disabled:
-                            # commit=True, refresh=False: expired and not refreshed
-                            pass  # _expire_all already marked
-                        else:
-                            # commit=True, refresh=True: refreshed, load= rels available
-                            old_var.post_commit = False
-                            old_var.loaded_rels = loaded_rels
-                        old_var.line = self._abs_line(node)
-                    else:
-                        # Return value assigned to different variable (result = await self.save(...))
-                        # save/update returns self (same object), in-place refresh means
-                        # both variables point to the refreshed object
-                        if commit_disabled:
-                            new_rels = old_var.loaded_rels | loaded_rels
-                            new_post_commit = False
-                        elif refresh_disabled:
-                            new_rels: set[str] = set()
-                            new_post_commit = True
-                        else:
-                            new_rels = loaded_rels
-                            new_post_commit = False
-                        self.tracked_vars[var_name] = _TrackedVar(
-                            model_name=old_var.model_name,
-                            loaded_rels=new_rels,
-                            post_commit=new_post_commit,
-                            caller_provided=False,
-                            line=self._abs_line(node),
-                        )
-                        # Original object is also refreshed in-place (save returns self,
-                        # refresh via session.refresh() restores column attrs in-place)
-                        if not commit_disabled and not refresh_disabled:
-                            old_var.post_commit = False
-                            old_var.loaded_rels = loaded_rels
-
-            # Model.get_with_count(...) etc
-            elif method_name == 'get_with_count':
-                model_name = self._get_call_class_name(call)
-                if model_name and model_name in self.model_relationships:
                     self.tracked_vars[var_name] = _TrackedVar(
-                        model_name=model_name,
-                        loaded_rels=loaded_rels,
-                        post_commit=False,
-                        caller_provided=False,
-                        line=self._abs_line(node),
-                    )
-
-            # Model.get_or_create(session, ...) -- may commit internally + return model
-            elif method_name in _COMMIT_QUERY_METHODS:
-                # commit=False means flush only, no expiration
-                if not self._has_keyword_false(call, 'commit'):
-                    self._expire_all_tracked_vars()
-                # Return value is a fresh/existing model instance (columns loaded, rels not)
-                model_name = self._get_call_class_name(call)
-                if model_name and model_name in self.model_relationships:
-                    self.tracked_vars[var_name] = _TrackedVar(
-                        model_name=model_name,
+                        model_name=old_var.model_name,
                         loaded_rels=loaded_rels,
                         post_commit=False,
                         caller_provided=False,
@@ -1063,6 +1376,10 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                         ),
                     ))
             elif var_info.post_commit and attr_name in cols:
+                # PK columns don't expire (SQLAlchemy identity map retains PK values), skip
+                pk_cols = self.model_pk_columns.get(var_info.model_name, set())
+                if attr_name in pk_cols:
+                    return
                 # RLC007: column access on expired (post-commit) object
                 # After commit, ALL objects in the session are expired.
                 # Accessing any column triggers a synchronous lazy load,
@@ -1099,24 +1416,28 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                 method_name = self._get_method_name(call)
                 loaded_rels = self._extract_load_from_call(call)
 
-                # return await Model.get(..., load=...)
-                if method_name in _QUERY_METHODS:
-                    model_name = self._get_call_class_name(call)
-                    if model_name:
-                        self._check_return_loaded(model_name, loaded_rels, node)
-
-                # return await obj.save(session, load=...)
-                elif method_name in _SAVE_METHODS:
+                # return await obj.save/update/create_duplicate/... (commit methods)
+                if method_name in self.commit_methods:
                     obj_name = self._get_call_object_name(call)
                     if obj_name and obj_name in self.tracked_vars:
                         model_name = self.tracked_vars[obj_name].model_name
                         self._check_return_loaded(model_name, loaded_rels, node)
+                    else:
+                        # Class method call (Model.get_or_create/...)
+                        class_name = self._get_call_class_name(call)
+                        if class_name:
+                            self._check_return_loaded(class_name, loaded_rels, node)
 
-                # return await Model.get_with_count(...)
-                elif method_name == 'get_with_count':
-                    model_name = self._get_call_class_name(call)
-                    if model_name:
+                # return await Model.get/find_by_content_hash/... (model-returning methods)
+                elif method_name in self.model_returning_methods:
+                    obj_name = self._get_call_object_name(call)
+                    if obj_name and obj_name in self.tracked_vars:
+                        model_name = self.tracked_vars[obj_name].model_name
                         self._check_return_loaded(model_name, loaded_rels, node)
+                    else:
+                        class_name = self._get_call_class_name(call)
+                        if class_name:
+                            self._check_return_loaded(class_name, loaded_rels, node)
 
         self.generic_visit(node)
 
