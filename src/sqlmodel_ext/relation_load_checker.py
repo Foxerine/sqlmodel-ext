@@ -19,6 +19,8 @@ Detection rules:
     - RLC003: access to relationship without prior load= (only for locally obtained vars)
     - RLC005: dependency function does not preload relationships required by response_model
     - RLC007: column access on expired (post-commit) object triggers synchronous lazy load -> MissingGreenlet
+    - RLC008: method call on expired (post-commit) object; method internals may access expired column attrs -> MissingGreenlet
+    - RLC009: type annotation parsing error (likely mixed resolved types and string forward references)
 
 Auto-check (recommended)::
 
@@ -89,7 +91,7 @@ _PROJECT_ROOT: str = os.getcwd()
 class RelationLoadWarning:
     """Relation load static analysis warning."""
     code: str
-    """Rule code (RLC001-RLC007)."""
+    """Rule code (RLC001-RLC009)."""
     file: str
     """File path."""
     line: int
@@ -398,7 +400,28 @@ class RelationLoadChecker:
                     )
                     warnings.extend(method_warnings)
                 except Exception as e:
-                    logger.debug(f"Error analyzing model method {label}: {e}")
+                    logger.warning(
+                        f"Error analyzing model method {label} "
+                        f"(likely mixed type annotation issue): {e}"
+                    )
+                    # Try to get source file for better error reporting
+                    try:
+                        source_file = python_inspect.getfile(func)
+                        line_num = python_inspect.getsourcelines(func)[1]
+                    except (TypeError, OSError):
+                        source_file = '<unknown>'
+                        line_num = 0
+                    warnings.append(RelationLoadWarning(
+                        code='RLC009',
+                        file=source_file,
+                        line=line_num,
+                        message=(
+                            f"Type annotation parsing failed for {label}: {e}. "
+                            f"Check for mixed resolved types and string forward references "
+                            f"(e.g. `type[T] | 'tuple[...]'`). "
+                            f"Wrap the entire union in quotes instead: `'type[T] | tuple[...]'`"
+                        ),
+                    ))
 
         return warnings
 
@@ -719,6 +742,9 @@ class RelationLoadChecker:
         Resolve function parameter model types.
 
         Handles ``Annotated[Model, Depends(...)]`` type aliases.
+        Falls back to iterating ``__annotations__`` directly when
+        ``typing.get_type_hints()`` fails (e.g. due to TYPE_CHECKING
+        forward references that cannot be resolved at runtime).
 
         :returns: param_name -> model_class_name
         """
@@ -727,7 +753,15 @@ class RelationLoadChecker:
         try:
             hints = typing.get_type_hints(func, include_extras=True)
         except Exception:
-            return param_models
+            # get_type_hints may fail due to TYPE_CHECKING forward references.
+            # Fall back to iterating __annotations__ directly
+            # (skip string annotations, only process already-resolved types).
+            hints = {}
+            annotations: dict[str, Any] = getattr(func, '__annotations__', {})
+            for param_name, annotation in annotations.items():
+                if isinstance(annotation, str):
+                    continue  # Skip string annotations that can't be resolved at runtime
+                hints[param_name] = annotation
 
         for param_name, hint in hints.items():
             model_name = self._extract_model_from_hint(hint)
@@ -861,22 +895,29 @@ class RelationLoadChecker:
         """
         Parse function source code.
 
+        Uses ``inspect.unwrap()`` to follow ``__wrapped__`` chains from
+        decorators like ``@functools.wraps``, ensuring the analyzer sees
+        the original function source rather than a wrapper.
+
         :returns: (source_file, ast_tree_or_None, line_offset)
         """
+        # Unwrap decorator chains (e.g. @functools.wraps) to get the original function
+        unwrapped = python_inspect.unwrap(func, stop=lambda f: not hasattr(f, '__wrapped__'))
+
         try:
-            source_file = python_inspect.getfile(func)
+            source_file = python_inspect.getfile(unwrapped)
         except (TypeError, OSError):
             source_file = '<unknown>'
 
         try:
-            source = python_inspect.getsource(func)
+            source = python_inspect.getsource(unwrapped)
             source = textwrap.dedent(source)
             tree = ast.parse(source)
         except (OSError, TypeError, SyntaxError):
             return source_file, None, 0
 
         try:
-            line_offset = python_inspect.getsourcelines(func)[1] - 1
+            line_offset = python_inspect.getsourcelines(unwrapped)[1] - 1
         except (OSError, TypeError):
             line_offset = 0
 
@@ -1319,6 +1360,21 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                         line=self._abs_line(node),
                     )
 
+        # Model constructor call (synchronous): var = Model(...)
+        # Track model instances created via constructor so that subsequent
+        # var.save() calls are recognized as commit operations.
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+            class_name = value.func.id
+            resolved = self._resolve_class_name(class_name)
+            if resolved is not None:
+                self.tracked_vars[var_name] = _TrackedVar(
+                    model_name=resolved,
+                    loaded_rels=set(),
+                    post_commit=False,
+                    caller_provided=False,
+                    line=self._abs_line(node),
+                )
+
     # ========================= Attribute access detection =========================
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -1334,6 +1390,40 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         # Skip method calls (e.g. obj.save())
         parent = self._get_parent(node)
         if isinstance(parent, ast.Call) and parent.func is node:
+            # RLC008: method call on post-commit (expired) object.
+            # After commit, all objects in the session are expired. Calling a business method
+            # on an expired object is dangerous because the method internals may access expired
+            # column attributes, triggering synchronous lazy load -> MissingGreenlet.
+            # Typical scenario: obj_a.save() then obj_b.some_method() (obj_b not refreshed).
+            #
+            # Only check non-self variables: self's methods often operate on runtime attributes
+            # (_queue, _cache, etc.) that don't necessarily trigger database column access.
+            # Self's column attribute access is already covered by RLC007.
+            # External objects (e.g. s3_client) almost certainly access database column attrs.
+            if var_name != 'self' and var_name in self.tracked_vars:
+                var_info = self.tracked_vars[var_name]
+                if var_info.post_commit:
+                    method_name = node.attr
+                    # Known safe methods don't need warnings (handled by other rules
+                    # or don't trigger database access)
+                    safe_methods = (
+                        self.commit_methods
+                        | self.model_returning_methods
+                        | frozenset({'refresh', 'commit', 'rollback'})
+                    )
+                    if method_name not in safe_methods:
+                        self.warnings.append(RelationLoadWarning(
+                            code='RLC008',
+                            file=self.source_file,
+                            line=self._abs_line(node),
+                            message=(
+                                f"Calling method '{method_name}()' on expired object "
+                                f"'{var_name}' after commit. The method internals may access "
+                                f"expired column attributes, causing MissingGreenlet. "
+                                f"Suggestion: call before commit, or "
+                                f"await session.refresh({var_name}) first"
+                            ),
+                        ))
             self.generic_visit(node)
             return
 
@@ -1468,6 +1558,81 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     ),
                 ))
 
+    # ========================= Branch-aware traversal =========================
+
+    def visit_If(self, node: ast.If) -> None:
+        """
+        Branch-aware if/elif/else traversal.
+
+        If a branch contains a commit but unconditionally returns, the post-commit
+        state does not leak into subsequent code (the returning branch is a dead end).
+
+        Avoids common false positive patterns::
+
+            if existing_file is not None:
+                user_file = await existing_file.create_duplicate(session)  # commit
+                return user_file  # unconditionally returns
+            # code here should NOT be marked as post-commit
+        """
+        # Visit the condition expression (may contain attribute access checks)
+        self.visit(node.test)
+
+        # Save state before entering if body
+        pre_body = self._snapshot_tracked_vars()
+
+        # Visit if body
+        for child in node.body:
+            self.visit(child)
+
+        # If body unconditionally returns, restore state (commits don't leak)
+        if self._branch_unconditionally_returns(node.body):
+            self._restore_tracked_vars(pre_body)
+
+        # Visit orelse (elif/else)
+        if node.orelse:
+            pre_else = self._snapshot_tracked_vars()
+            for child in node.orelse:
+                self.visit(child)
+            if self._branch_unconditionally_returns(node.orelse):
+                self._restore_tracked_vars(pre_else)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        """
+        Branch-aware try/except/else/finally traversal.
+
+        - When try body unconditionally returns: subsequent code is only reached via
+          handlers; restore pre-try state (exception may occur before commit).
+        - When except handlers unconditionally return: state changes don't leak.
+        - else/finally: visited normally.
+        """
+        # Save state before entering try
+        pre_try = self._snapshot_tracked_vars()
+
+        # Visit try body
+        for child in node.body:
+            self.visit(child)
+
+        # If try body unconditionally returns, subsequent code only reached via handlers.
+        # Restore pre-try state (exception may occur before commit).
+        if self._branch_unconditionally_returns(node.body):
+            self._restore_tracked_vars(pre_try)
+
+        # Visit except handlers
+        for handler in node.handlers:
+            pre_handler = self._snapshot_tracked_vars()
+            for child in handler.body:
+                self.visit(child)
+            if self._branch_unconditionally_returns(handler.body):
+                self._restore_tracked_vars(pre_handler)
+
+        # Visit else (executes when try succeeds without exception)
+        for child in node.orelse:
+            self.visit(child)
+
+        # Visit finally
+        for child in node.finalbody:
+            self.visit(child)
+
     # ========================= AST utility methods =========================
 
     @staticmethod
@@ -1511,6 +1676,72 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         for var in self.tracked_vars.values():
             var.post_commit = True
             var.loaded_rels.clear()
+
+    # ========================= Branch-aware state management =========================
+
+    def _snapshot_tracked_vars(self) -> dict[str, _TrackedVar]:
+        """
+        Deep-copy tracked_vars state for branch analysis.
+
+        Saves state before entering if/try branches. When a branch unconditionally
+        returns, the snapshot can be restored to prevent commit state from leaking
+        into subsequent code.
+        """
+        return {
+            name: _TrackedVar(
+                model_name=var.model_name,
+                loaded_rels=var.loaded_rels.copy(),
+                post_commit=var.post_commit,
+                caller_provided=var.caller_provided,
+                line=var.line,
+            )
+            for name, var in self.tracked_vars.items()
+        }
+
+    def _restore_tracked_vars(self, snapshot: dict[str, _TrackedVar]) -> None:
+        """
+        Restore tracked_vars state from a snapshot.
+
+        Removes variables added during the branch and restores existing variable states.
+        Used after an unconditionally returning branch ends, to undo that branch's
+        commit effects.
+        """
+        self.tracked_vars.clear()
+        self.tracked_vars.update(snapshot)
+
+    @staticmethod
+    def _branch_unconditionally_returns(stmts: list[ast.stmt]) -> bool:
+        """
+        Check if a statement list unconditionally returns (return/raise).
+
+        Recursively checks nested if/elif/else and try/except:
+        - if/elif/else: all branches must return (must have else)
+        - try/except: try body and all handlers must return
+        """
+        if not stmts:
+            return False
+        last = stmts[-1]
+        if isinstance(last, ast.Return):
+            return True
+        if isinstance(last, ast.Raise):
+            return True
+        # if/elif/else: all branches must return
+        if isinstance(last, ast.If):
+            if not last.orelse:
+                return False  # no else -> may not return
+            return (
+                _FunctionAnalyzer._branch_unconditionally_returns(last.body)
+                and _FunctionAnalyzer._branch_unconditionally_returns(last.orelse)
+            )
+        # try/except: try body and all handlers must return
+        if isinstance(last, ast.Try):
+            body_returns = _FunctionAnalyzer._branch_unconditionally_returns(last.body)
+            handlers_return = all(
+                _FunctionAnalyzer._branch_unconditionally_returns(h.body)
+                for h in last.handlers
+            ) if last.handlers else False
+            return body_returns and handlers_return
+        return False
 
     def _handle_session_refresh(self, call: ast.Call) -> None:
         """
