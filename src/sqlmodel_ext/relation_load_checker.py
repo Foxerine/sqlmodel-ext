@@ -1208,6 +1208,29 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                              or self._resolve_class_name(obj_name) is not None)
                     )
                     if is_model_call:
+                        # RLC008: calling a commit method on an already-expired object.
+                        # Commit methods internally access self.id and other column attrs
+                        # to build SQL. On an expired object this triggers synchronous
+                        # lazy load -> MissingGreenlet.
+                        # save/update use ORM primitives (session.add/merge) and don't
+                        # directly access column attrs, so they are exempt.
+                        # self is excluded: self's column access is covered by RLC007.
+                        if (obj_name != 'self'
+                                and obj_name in self.tracked_vars
+                                and self.tracked_vars[obj_name].post_commit
+                                and method_name not in _REFRESH_METHODS):
+                            self.warnings.append(RelationLoadWarning(
+                                code='RLC008',
+                                file=self.source_file,
+                                line=self._abs_line(node),
+                                message=(
+                                    f"Calling commit method '{method_name}()' on expired "
+                                    f"object '{obj_name}' after commit. The method internals "
+                                    f"may access expired column attributes (e.g. self.id) to "
+                                    f"build SQL, causing MissingGreenlet. "
+                                    f"Suggestion: await session.refresh({obj_name}) first"
+                                ),
+                            ))
                         commit_disabled = self._has_keyword_false(call, 'commit')
                         if not commit_disabled:
                             self._expire_all_tracked_vars()
@@ -1261,6 +1284,25 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                 # Instance method call (obj.save/update/create_duplicate/...)
                 if obj_name and obj_name in self.tracked_vars:
                     old_var = self.tracked_vars[obj_name]
+
+                    # RLC008: calling a commit method on an already-expired object
+                    # (same check as visit_Expr)
+                    if (obj_name != 'self'
+                            and old_var.post_commit
+                            and method_name not in _REFRESH_METHODS):
+                        self.warnings.append(RelationLoadWarning(
+                            code='RLC008',
+                            file=self.source_file,
+                            line=self._abs_line(node),
+                            message=(
+                                f"Calling commit method '{method_name}()' on expired "
+                                f"object '{obj_name}' after commit. The method internals "
+                                f"may access expired column attributes (e.g. self.id) to "
+                                f"build SQL, causing MissingGreenlet. "
+                                f"Suggestion: await session.refresh({obj_name}) first"
+                            ),
+                        ))
+
                     commit_disabled = self._has_keyword_false(call, 'commit')
 
                     if not commit_disabled:
