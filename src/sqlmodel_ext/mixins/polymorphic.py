@@ -74,6 +74,15 @@ def register_sti_columns_for_all_subclasses() -> None:
         except Exception as e:
             logger.warning(f"Error fixing model_fields for STI subclass {cls.__name__}: {e}")
 
+        # Rebuild Pydantic core schema so model_validate uses the fixed defaults.
+        # _fix_polluted_model_fields only patches the model_fields dict;
+        # the compiled core schema (used by model_validate) still caches
+        # InstrumentedAttribute-polluted defaults until we force a rebuild.
+        try:
+            cls.model_rebuild(force=True)
+        except Exception as e:
+            logger.warning(f"Error rebuilding Pydantic schema for STI subclass {cls.__name__}: {e}")
+
 
 def register_sti_column_properties_for_all_subclasses() -> None:
     """
