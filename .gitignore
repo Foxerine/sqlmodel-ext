@@ -14,6 +14,7 @@ build/
 .venv/
 venv/
 ENV/
+node_modules/
 
 # IDE
 .idea/
@@ -25,6 +26,10 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# VitePress
+docs/.vitepress/cache/
+docs/.vitepress/dist/
 
 # OS
 .DS_Store
