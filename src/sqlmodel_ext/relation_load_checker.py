@@ -71,6 +71,30 @@ except ImportError:
     _HAS_FASTAPI = False
 
 
+def _collect_noreturn_names(func: Any) -> frozenset[str]:
+    """
+    Collect NoReturn function names from the module namespace of a function.
+
+    Uses runtime type annotations to detect functions returning ``NoReturn``.
+    Used by ``_branch_unconditionally_returns()`` to recognize calls that never return
+    (e.g. ``raise_bad_request()``).
+    """
+    module = python_inspect.getmodule(func)
+    if module is None:
+        return frozenset()
+    names: set[str] = set()
+    for attr_name, obj in vars(module).items():
+        if not callable(obj):
+            continue
+        try:
+            hints = typing.get_type_hints(obj)
+        except Exception:
+            continue
+        if hints.get('return') is typing.NoReturn:
+            names.add(attr_name)
+    return frozenset(names)
+
+
 # ========================= Auto-check configuration =========================
 
 check_on_startup: bool = True
@@ -826,6 +850,8 @@ class RelationLoadChecker:
         if func_node is None:
             return [], None
 
+        noreturn_names = _collect_noreturn_names(func)
+
         analyzer = _FunctionAnalyzer(
             model_relationships=self.model_relationships,
             model_columns=self.model_columns,
@@ -842,6 +868,7 @@ class RelationLoadChecker:
             sync_model_returning_methods=self.sync_model_returning_methods,
             class_aliases=class_aliases,
             model_dunder_rels=self.model_dunder_rels,
+            noreturn_names=noreturn_names,
         )
         analyzer.visit(func_node)
 
@@ -1303,6 +1330,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         sync_model_returning_methods: frozenset[str] | None = None,
         class_aliases: dict[str, str] | None = None,
         model_dunder_rels: dict[str, dict[str, set[str]]] | None = None,
+        noreturn_names: frozenset[str] | None = None,
     ) -> None:
         self.model_relationships: dict[str, set[str]] = model_relationships
         self.model_columns: dict[str, set[str]] = model_columns
@@ -1315,6 +1343,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         self._parent_map: dict[int, ast.AST] = {}
         self.commit_methods: frozenset[str] = commit_methods or frozenset()
         self.model_returning_methods: frozenset[str] = model_returning_methods or frozenset()
+        self.noreturn_names: frozenset[str] = noreturn_names or frozenset()
         # Complete model-returning set for variable tracking (includes sync methods).
         # Sync methods are NOT added to safe_methods because calling sync methods
         # on expired objects is equally dangerous.
@@ -1434,6 +1463,11 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                 # RLC010: check args for expired ORM objects (before commit side effects)
                 self._check_expired_call_args(call, node)
 
+                # Visit call children in pre-commit state: Python evaluates arguments
+                # BEFORE executing the call, so attribute accesses in args/kwargs
+                # must be checked before commit processing potentially expires all tracked vars
+                self.visit(call)
+
                 method_name = self._get_method_name(call)
 
                 # session.commit() / session.rollback()
@@ -1484,6 +1518,9 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                                     and method_name in _REFRESH_METHODS
                                     and not self._has_keyword_false(call, 'refresh')):
                                 self.tracked_vars[obj_name].post_commit = False
+
+                # call children already visited above in pre-commit state
+                return
 
         self.generic_visit(node)
 
@@ -2274,6 +2311,65 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         self._check_iteration_context(node.iter)
         self.generic_visit(node)
 
+    # ========================= Comprehension scoping =========================
+
+    def _visit_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        elements: list[ast.expr],
+    ) -> None:
+        """
+        Visit comprehension with proper scoping for iteration variables.
+
+        Python 3 comprehensions (ListComp/SetComp/DictComp/GeneratorExp) have
+        independent scopes -- iteration variables don't shadow outer variables.
+        Temporarily remove same-named tracked vars to prevent false positives
+        from attribute access on comprehension-local iteration variables being
+        reported as access on outer expired variables.
+        """
+        shadowed: dict[str, _TrackedVar] = {}
+        for gen in generators:
+            for name in self._extract_target_names(gen.target):
+                if name in self.tracked_vars:
+                    shadowed[name] = self.tracked_vars.pop(name)
+
+        for gen in generators:
+            self.visit(gen.iter)
+            for if_clause in gen.ifs:
+                self.visit(if_clause)
+        for elt in elements:
+            self.visit(elt)
+
+        self.tracked_vars.update(shadowed)
+
+    @staticmethod
+    def _extract_target_names(target: ast.expr) -> list[str]:
+        """Extract all variable names from an assignment target (supports tuple unpacking)."""
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: list[str] = []
+            for elt in target.elts:
+                names.extend(_FunctionAnalyzer._extract_target_names(elt))
+            return names
+        return []
+
+    @override
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    @override
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    @override
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    @override
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value])
+
     # ========================= AST utility methods =========================
 
     @staticmethod
@@ -2382,35 +2478,37 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         self.tracked_vars.clear()
         self.tracked_vars.update(merged)
 
-    @staticmethod
-    def _branch_unconditionally_returns(stmts: list[ast.stmt]) -> bool:
+    def _branch_unconditionally_returns(self, stmts: list[ast.stmt]) -> bool:
         """
-        Check if a statement list unconditionally returns (return/raise).
+        Check if a statement list unconditionally exits (return/raise/continue/break/NoReturn call).
 
         Recursively checks nested if/elif/else and try/except:
-        - if/elif/else: all branches must return to be considered unconditional (must have else)
-        - try/except: try body and all handlers must return to be considered unconditional
+        - if/elif/else: all branches must exit to be considered unconditional (must have else)
+        - try/except: try body and all handlers must exit to be considered unconditional
         """
         if not stmts:
             return False
         last = stmts[-1]
-        if isinstance(last, ast.Return):
+        if isinstance(last, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
             return True
-        if isinstance(last, ast.Raise):
-            return True
-        # if/elif/else: all branches must return
+        # NoReturn function calls (e.g. raise_bad_request(), raise_internal_error())
+        if isinstance(last, ast.Expr) and isinstance(last.value, ast.Call):
+            call_func = last.value.func
+            if isinstance(call_func, ast.Name) and call_func.id in self.noreturn_names:
+                return True
+        # if/elif/else: all branches must exit
         if isinstance(last, ast.If):
             if not last.orelse:
-                return False  # no else -> may not return
+                return False  # no else -> may not exit
             return (
-                _FunctionAnalyzer._branch_unconditionally_returns(last.body)
-                and _FunctionAnalyzer._branch_unconditionally_returns(last.orelse)
+                self._branch_unconditionally_returns(last.body)
+                and self._branch_unconditionally_returns(last.orelse)
             )
-        # try/except: try body and all handlers must return
+        # try/except: try body and all handlers must exit
         if isinstance(last, ast.Try):
-            body_returns = _FunctionAnalyzer._branch_unconditionally_returns(last.body)
+            body_returns = self._branch_unconditionally_returns(last.body)
             handlers_return = all(
-                _FunctionAnalyzer._branch_unconditionally_returns(h.body)
+                self._branch_unconditionally_returns(h.body)
                 for h in last.handlers
             ) if last.handlers else False
             return body_returns and handlers_return
