@@ -22,19 +22,18 @@ class RelationLoadChecker:
 
 ## 分析流程
 
-```
-启动时:
-  run_model_checks(SQLModelBase)
-    → 扫描所有 SQLModelBase 的子类
-    → 对每个类的方法做 AST 分析
-    → 生成 warnings
+```mermaid
+flowchart TD
+    Start["应用启动"] --> A["run_model_checks(SQLModelBase)"]
+    A --> B["扫描所有 SQLModelBase 子类"]
+    B --> C["对每个类的方法做 AST 分析"]
+    C --> D["生成 warnings"]
 
-  RelationLoadCheckMiddleware（ASGI 中间件）
-    → 第一个请求到来时
-    → 扫描所有 FastAPI 路由函数
-    → 扫描所有已导入模块中的协程
-    → 生成 warnings
-    → 记录到日志
+    Start --> E["RelationLoadCheckMiddleware"]
+    E --> F["第一个请求到来时"]
+    F --> G["扫描所有 FastAPI 路由函数"]
+    G --> H["扫描已导入模块中的协程"]
+    H --> I["生成 warnings → 记录到日志"]
 ```
 
 ## 检测规则详解

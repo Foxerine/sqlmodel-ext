@@ -111,10 +111,8 @@ await instance.preload_for(session, 'calculate_cost', 'validate')
 
 sqlmodel-ext 对 MissingGreenlet 问题提供了三层保护：
 
-::: info 多层保护架构
+```mermaid
+flowchart LR
+    A["1️⃣ 启动时 AST 静态分析<br/><i>最早发现问题</i>"] --> B["2️⃣ @requires_relations<br/><i>运行时自动加载</i>"]
+    B --> C["3️⃣ lazy='raise_on_sql'<br/><i>最后的安全网</i>"]
 ```
-1. 启动时 AST 静态分析    ← 最早发现问题（见静态分析器）
-2. @requires_relations    ← 运行时自动加载
-3. lazy='raise_on_sql'    ← 最后的安全网
-```
-:::

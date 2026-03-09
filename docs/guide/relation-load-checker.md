@@ -6,13 +6,11 @@
 
 这是 MissingGreenlet 问题的**第一道防线**——在任何请求到来之前，扫描你的代码，找出所有潜在问题。
 
-::: info 三道防线
+```mermaid
+flowchart LR
+    A["1️⃣ 启动时 AST 静态分析<br/><b>本模块</b><br/><i>最早发现问题</i>"] --> B["2️⃣ @requires_relations<br/><i>运行时自动修复</i>"]
+    B --> C["3️⃣ lazy='raise_on_sql'<br/><i>最后的安全网</i>"]
 ```
-1. 启动时 AST 静态分析（本模块）  ← 最早发现问题
-2. @requires_relations 运行时预加载  ← 自动修复问题
-3. lazy='raise_on_sql' 运行时拦截    ← 最后的安全网
-```
-:::
 
 ## 检测规则
 

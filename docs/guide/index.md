@@ -8,19 +8,14 @@
 
 ## 技术栈
 
-```
-你的应用代码
-    ↓ 使用
-sqlmodel-ext          ← 本项目（增强层）
-    ↓ 构建于
-SQLModel              ← Pydantic + SQLAlchemy 的融合
-    ↓ 包装
-┌─────────┐  ┌──────────────┐
-│ Pydantic │  │  SQLAlchemy   │
-│ 数据验证  │  │  ORM 映射     │
-└─────────┘  └──────────────┘
-    ↓               ↓
-         数据库（SQLite / PostgreSQL / ...）
+```mermaid
+graph TD
+    A["你的应用代码"] -->|使用| B["<b>sqlmodel-ext</b><br/><i>本项目（增强层）</i>"]
+    B -->|构建于| C["<b>SQLModel</b><br/><i>Pydantic + SQLAlchemy 的融合</i>"]
+    C -->|包装| D["<b>Pydantic</b><br/>数据验证"]
+    C -->|包装| E["<b>SQLAlchemy</b><br/>ORM 映射"]
+    D --> F[("数据库<br/>SQLite / PostgreSQL / ...")]
+    E --> F
 ```
 
 ## 解决了什么痛点？
@@ -50,6 +45,24 @@ user = await user.update(session, update_data)               # 局部更新
 
 ```bash
 pip install sqlmodel-ext
+```
+
+同时安装 [FastAPI](https://fastapi.tiangolo.com/) 支持 (支持在 `get_exist_one()` 时错误自动抛出 `HTTPException`):
+
+```bash
+pip install sqlmodel-ext[fastapi]
+```
+
+支持 PostgreSQL ARRAY 和 JSONB 类型 (要求 `orjson`):
+
+```bash
+pip install sqlmodel-ext[postgresql]
+```
+
+安装 pgvector + NumPy vector 支持 (这会同时安装 `[postgresql]`):
+
+```bash
+pip install sqlmodel-ext[pgvector]
 ```
 
 ## 基本用法

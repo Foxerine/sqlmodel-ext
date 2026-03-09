@@ -87,18 +87,24 @@ async def save(self, session, ..., optimistic_retry_count=0):
 
 ### 重试流程可视化
 
-```
-第 1 次尝试:
-  读取 → version=3, status="待发货"
-  修改 → status="已发货"
-  commit → StaleDataError（别人已经改过了）
-  rollback
+```mermaid
+sequenceDiagram
+    participant App as 应用
+    participant DB as 数据库
 
-第 2 次尝试（重试）:
-  重新读取 → version=4, amount=200（别人的修改）
-  重新应用 → status="已发货"（我的修改）
-  commit → 成功
-  结果: version=5, status="已发货", amount=200（两人的修改都保留了）
+    Note over App,DB: 第 1 次尝试
+    App->>DB: 读取 (version=3, status="待发货")
+    App->>App: 修改 status="已发货"
+    App->>DB: commit
+    DB-->>App: StaleDataError（版本冲突）
+    App->>App: rollback
+
+    Note over App,DB: 第 2 次尝试（重试）
+    App->>DB: 重新读取 (version=4, amount=200)
+    App->>App: 重新应用 status="已发货"
+    App->>DB: commit
+    DB-->>App: 成功 ✓
+    Note over DB: version=5, status="已发货"<br/>amount=200（两人的修改都保留）
 ```
 
 ### 关键实现细节

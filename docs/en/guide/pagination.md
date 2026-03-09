@@ -1,59 +1,59 @@
-# 分页与列表
+# Pagination & Lists
 
-sqlmodel-ext 提供了四个数据模型来处理分页请求和响应，以及一组 DTO Mixin 用于 API 响应。
+sqlmodel-ext provides four data models for handling pagination requests and responses, along with a set of DTO Mixins for API responses.
 
-## 请求模型
+## Request Models
 
-### `PaginationRequest` — 分页排序
+### `PaginationRequest` — Pagination & Sorting
 
 ```python
 from sqlmodel_ext import PaginationRequest
 
 class PaginationRequest(SQLModelBase):
-    offset: int | None = Field(default=0, ge=0)            # 跳过前 N 条
-    limit:  int | None = Field(default=50, le=100)          # 每页最多 N 条
-    desc:   bool | None = True                              # 降序排列
+    offset: int | None = Field(default=0, ge=0)            # Skip first N records
+    limit:  int | None = Field(default=50, le=100)          # Max N records per page
+    desc:   bool | None = True                              # Descending order
     order:  Literal["created_at", "updated_at"] | None = "created_at"
 ```
 
-默认行为：按 `created_at` 降序，每页 50 条，上限 100 条。
+Default behavior: ordered by `created_at` descending, 50 per page, max 100.
 
-### `TimeFilterRequest` — 时间过滤
+### `TimeFilterRequest` — Time Filtering
 
 ```python
 from sqlmodel_ext import TimeFilterRequest
 
 class TimeFilterRequest(SQLModelBase):
-    created_after_datetime:  datetime | None = None   # created_at >= 此值
-    created_before_datetime: datetime | None = None   # created_at < 此值
-    updated_after_datetime:  datetime | None = None   # updated_at >= 此值
-    updated_before_datetime: datetime | None = None   # updated_at < 此值
+    created_after_datetime:  datetime | None = None   # created_at >= this value
+    created_before_datetime: datetime | None = None   # created_at < this value
+    updated_after_datetime:  datetime | None = None   # updated_at >= this value
+    updated_before_datetime: datetime | None = None   # updated_at < this value
 ```
 
-使用左闭右开区间 `[after, before)`。内置验证：`after` 必须小于 `before`。
+Uses half-open intervals `[after, before)`. Built-in validation: `after` must be less than `before`.
 
-### `TableViewRequest` — 组合
+### `TableViewRequest` — Combined
 
 ```python
 from sqlmodel_ext import TableViewRequest
 
 class TableViewRequest(TimeFilterRequest, PaginationRequest):
-    pass  # 同时携带分页参数和时间过滤参数
+    pass  # Carries both pagination and time filtering parameters
 ```
 
-## 响应模型
+## Response Model
 
-### `ListResponse[T]` — 分页响应
+### `ListResponse[T]` — Paginated Response
 
 ```python
 from sqlmodel_ext import ListResponse
 
 class ListResponse(BaseModel, Generic[ItemT]):
-    count: int           # 匹配条件的总记录数
-    items: list[ItemT]   # 当前页的数据列表
+    count: int           # Total records matching the condition
+    items: list[ItemT]   # Data list for the current page
 ```
 
-## 在 FastAPI 中使用
+## Using with FastAPI
 
 ```python
 from typing import Annotated
@@ -73,13 +73,13 @@ async def list_articles(
     ) # [!code focus]
 ```
 
-客户端发送：
+Client sends:
 
 ```
 GET /articles?offset=0&limit=10&desc=true&created_after_datetime=2024-01-01T00:00:00
 ```
 
-返回的 JSON：
+Response JSON:
 
 ```json
 {
@@ -90,9 +90,9 @@ GET /articles?offset=0&limit=10&desc=true&created_after_datetime=2024-01-01T00:0
 }
 ```
 
-## 响应 DTO Mixin
+## Response DTO Mixins
 
-用于 API 响应模型的 Mixin，字段为必填（数据已入库，一定有值）：
+Mixins for API response models, where fields are required (data is already persisted, values are guaranteed):
 
 ```python
 from sqlmodel_ext import UUIDIdDatetimeInfoMixin
@@ -101,30 +101,30 @@ class ArticleBase(SQLModelBase):
     title: Str64
     body: Text10K
 
-# 表模型
+# Table model
 class Article(ArticleBase, UUIDTableBaseMixin, table=True):
     author_id: UUID = Field(foreign_key='user.id')
 
-# 响应 DTO
+# Response DTO
 class ArticleResponse(ArticleBase, UUIDIdDatetimeInfoMixin):
     author_id: UUID
 ```
 
-可用的 DTO Mixin：
+Available DTO Mixins:
 
-| Mixin | 字段 |
-|-------|------|
+| Mixin | Fields |
+|-------|--------|
 | `IntIdInfoMixin` | `id: int` |
 | `UUIDIdInfoMixin` | `id: UUID` |
 | `DatetimeInfoMixin` | `created_at: datetime`, `updated_at: datetime` |
-| `IntIdDatetimeInfoMixin` | `id: int` + 时间戳 |
-| `UUIDIdDatetimeInfoMixin` | `id: UUID` + 时间戳 |
+| `IntIdDatetimeInfoMixin` | `id: int` + timestamps |
+| `UUIDIdDatetimeInfoMixin` | `id: UUID` + timestamps |
 
-## 数据流全景
+## Data Flow Overview
 
 ```mermaid
 flowchart LR
-    A["客户端请求<br/><code>GET /articles?<br/>offset=0&limit=10&desc=true</code>"] --> B["TableViewRequest"]
+    A["Client Request<br/><code>GET /articles?<br/>offset=0&limit=10&desc=true</code>"] --> B["TableViewRequest"]
     B --> C["Article.get_with_count()"]
     C --> D["count()"]
     C --> E["get(fetch_mode=&quot;all&quot;)"]
@@ -132,5 +132,5 @@ flowchart LR
     E --> G[("SELECT ... LIMIT 10")]
     D --> H["ListResponse"]
     E --> H
-    H --> I["客户端响应<br/><code>{ count: 42, items: [...] }</code>"]
+    H --> I["Client Response<br/><code>{ count: 42, items: [...] }</code>"]
 ```

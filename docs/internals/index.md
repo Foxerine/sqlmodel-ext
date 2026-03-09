@@ -8,19 +8,14 @@
 
 ## 技术栈层次
 
-```
-你的应用代码
-    ↓ 使用
-sqlmodel-ext          ← 本项目（增强层）
-    ↓ 构建于
-SQLModel              ← Pydantic + SQLAlchemy 的融合
-    ↓ 包装
-┌─────────┐  ┌──────────────┐
-│ Pydantic │  │  SQLAlchemy   │
-│ 数据验证  │  │  ORM 映射     │
-└─────────┘  └──────────────┘
-    ↓               ↓
-         数据库（SQLite / PostgreSQL / ...）
+```mermaid
+graph TD
+    A["你的应用代码"] -->|使用| B["<b>sqlmodel-ext</b><br/><i>本项目（增强层）</i>"]
+    B -->|构建于| C["<b>SQLModel</b><br/><i>Pydantic + SQLAlchemy 的融合</i>"]
+    C -->|包装| D["<b>Pydantic</b><br/>数据验证"]
+    C -->|包装| E["<b>SQLAlchemy</b><br/>ORM 映射"]
+    D --> F[("数据库<br/>SQLite / PostgreSQL / ...")]
+    E --> F
 ```
 
 ## 文件结构

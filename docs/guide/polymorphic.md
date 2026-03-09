@@ -16,29 +16,35 @@
 
 每个子类一张表，通过外键关联父表。**子类字段差异大时选用。**
 
-```
-notification 表                emailnotification 表
-┌────────────────────────┐    ┌───────────────────────┐
-│ id (PK)                │←───│ id (PK, FK)           │
-│ user_id                │    │ email_to              │
-│ message                │    └───────────────────────┘
-│ _polymorphic_name      │
-└────────────────────────┘
+```mermaid
+erDiagram
+    notification {
+        UUID id PK
+        UUID user_id
+        string message
+        string _polymorphic_name
+    }
+    emailnotification {
+        UUID id "PK, FK → notification.id"
+        string email_to
+    }
+    notification ||--o| emailnotification : ""
 ```
 
 ### 单表继承（STI）
 
 所有子类共用一张表。**子类额外字段少（1~2 个）时选用。**
 
-```
-notification 表
-┌────────────────────────────────────┐
-│ id (PK)                            │
-│ user_id, message                   │
-│ _polymorphic_name                  │  ← 鉴别列
-│ email_to        (nullable)         │
-│ device_token    (nullable)         │
-└────────────────────────────────────┘
+```mermaid
+erDiagram
+    notification {
+        UUID id PK
+        UUID user_id
+        string message
+        string _polymorphic_name "鉴别列"
+        string email_to "nullable"
+        string device_token "nullable"
+    }
 ```
 
 ## JTI 用法

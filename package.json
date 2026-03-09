@@ -1,7 +1,9 @@
 {
   "devDependencies": {
     "@fontsource/maple-mono": "^5.2.6",
-    "vitepress": "2.0.0-alpha.16"
+    "mermaid": "^11.12.3",
+    "vitepress": "2.0.0-alpha.16",
+    "vitepress-plugin-mermaid": "^2.0.17"
   },
   "scripts": {
     "docs:dev": "vitepress dev docs",
