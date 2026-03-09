@@ -1,7 +1,6 @@
-import { defineConfig } from 'vitepress'
 import { withMermaid } from 'vitepress-plugin-mermaid'
-import { zh } from './zh.mjs'
-import { en } from './en.mjs'
+import { zh } from './zh.mts'
+import { en } from './en.mts'
 
 export default withMermaid({
   title: 'sqlmodel-ext',
@@ -23,16 +22,6 @@ export default withMermaid({
     ],
     search: {
       provider: 'local',
-    },
-  },
-
-  markdown: {
-    container: {
-      tipLabel: '提示',
-      warningLabel: '注意',
-      dangerLabel: '危险',
-      infoLabel: '信息',
-      detailsLabel: '详细信息',
     },
   },
 })
