@@ -16,8 +16,9 @@ SQLModel 增强基础设施：智能元类、异步 CRUD Mixin、多态继承、
 
 | 特性 | 说明 |
 |------|------|
-| **SQLModelBase** | 智能元类，自动设置 `table=True`、合并 `mapper_args`，兼容 Python 3.14 (PEP 649) |
+| **SQLModelBase** | 智能元类，自动 `table=True`、合并 `mapper_args`、`all_fields_optional` UpdateRequest DTO、属性 docstring 继承、兼容 Python 3.14 (PEP 649) |
 | **TableBaseMixin / UUIDTableBaseMixin** | 完整异步 CRUD：`add()`、`save()`、`update()`、`delete()`、`get()`、`count()`、`get_with_count()`、`get_exist_one()` |
+| **CachedTableBaseMixin** | 双层 Redis 缓存（ID + 查询），版本号失效、STI 级联感知、可选 metrics 回调 |
 | **PolymorphicBaseMixin** | 简化联表继承 (JTI) 和单表继承 (STI) 配置 |
 | **AutoPolymorphicIdentityMixin** | 根据类名自动生成 `polymorphic_identity` |
 | **OptimisticLockMixin** | 基于版本号的乐观锁，支持自动重试 |
@@ -43,6 +44,12 @@ pip install sqlmodel-ext[fastapi]
 
 ```bash
 pip install sqlmodel-ext[postgresql]
+```
+
+使用 Redis 缓存（启用 `CachedTableBaseMixin`）：
+
+```bash
+pip install sqlmodel-ext[cache]
 ```
 
 使用 pgvector + NumPy 向量支持（包含 `[postgresql]`）：
@@ -1209,6 +1216,89 @@ class UserResponse(UserBase, UUIDIdDatetimeInfoMixin):
 
 ---
 
+### Redis 缓存 (CachedTableBaseMixin)
+
+为任何表模型添加双层 Redis 缓存。查询先走 Redis，未命中再查数据库。
+
+```bash
+pip install sqlmodel-ext[cache]  # 安装 redis + orjson
+```
+
+**启动配置（一次性）：**
+
+```python
+from redis.asyncio import Redis
+from sqlmodel_ext import CachedTableBaseMixin
+
+redis = Redis.from_url("redis://localhost:6379/0", decode_responses=False)
+CachedTableBaseMixin.configure_redis(redis)
+```
+
+**定义缓存模型：**
+
+```python
+class Character(CachedTableBaseMixin, CharacterBase, UUIDTableBaseMixin, table=True, cache_ttl=1800):
+    pass  # 30 分钟缓存 TTL
+```
+
+所有 `get()` 调用自动先查 Redis。`save()`、`update()`、`delete()` 时自动失效缓存。
+
+**缓存架构：**
+
+| 层 | Key 格式 | 失效方式 |
+|----|---------|---------|
+| ID 缓存 | `id:{Model}:{id}` | 行级 DEL |
+| 查询缓存 | `query:{Model}:v{version}:{hash}` | 版本号 INCR（O(1)）使旧 key 不可达 |
+| 版本号 | `ver:{Model}` | 写入时 INCR；STI 子类变更级联 bump 所有祖先 |
+
+**可选 metrics 回调：**
+
+```python
+CachedTableBaseMixin.on_cache_hit = lambda name: print(f"命中: {name}")
+CachedTableBaseMixin.on_cache_miss = lambda name: print(f"未命中: {name}")
+```
+
+**不用 Redis？** 不调用 `configure_redis()`、不继承 `CachedTableBaseMixin`，则零 Redis 依赖。缓存层完全可选。
+
+---
+
+### all_fields_optional
+
+自动将所有继承字段转为可选，用于 PATCH/UpdateRequest DTO：
+
+```python
+class ArticleBase(SQLModelBase):
+    title: Str64
+    """文章标题"""
+    body: Text10K
+    """文章内容"""
+
+class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
+    pass
+    # 所有字段变为: title: Str64 | None = None, body: Text10K | None = None, ...
+    # Annotated 约束（max_length, ge, le）保留
+    # 属性 docstring 从 ArticleBase 继承
+```
+
+---
+
+### 属性 Docstring 继承
+
+`SQLModelBase` 默认启用 Pydantic 的 `use_attribute_docstrings=True`，字段后的 docstring 自动出现在 OpenAPI Schema 中。当子类覆盖字段时，Pydantic 不会继承父类的 description——**sqlmodel-ext 在元类中自动修复此问题**。
+
+---
+
+### safe_reset
+
+安全重置异步会话，同时清理 FOR UPDATE 锁跟踪：
+
+```python
+from sqlmodel_ext import safe_reset
+await safe_reset(session)
+```
+
+---
+
 ## 架构
 
 ```
@@ -1222,7 +1312,8 @@ sqlmodel_ext/
     pagination.py            # ListResponse、TimeFilterRequest、PaginationRequest、TableViewRequest
     mixins/
         __init__.py          # Mixin 重导出
-        table.py             # TableBaseMixin、UUIDTableBaseMixin（异步 CRUD）
+        table.py             # TableBaseMixin、UUIDTableBaseMixin、safe_reset（异步 CRUD）
+        cached_table.py      # CachedTableBaseMixin（双层 Redis 缓存 + 版本号失效）
         polymorphic.py       # PolymorphicBaseMixin、AutoPolymorphicIdentityMixin、create_subclass_id_mixin
         optimistic_lock.py   # OptimisticLockMixin、OptimisticLockError
         relation_preload.py  # RelationPreloadMixin、@requires_relations
@@ -1250,7 +1341,8 @@ sqlmodel_ext/
 - **pydantic** >= 2.0
 - **sqlalchemy** >= 2.0
 - （可选）**fastapi** >= 0.100.0
-- （可选）**orjson** >= 3.0 -- 用于 `JSON100K` / `JSONList100K`
+- （可选）**redis** >= 5.0 -- 用于 `CachedTableBaseMixin`
+- （可选）**orjson** >= 3.0 -- 用于 `CachedTableBaseMixin` 和 `JSON100K` / `JSONList100K`
 - （可选）**numpy** >= 1.24 -- 用于 `NumpyVector`
 - （可选）**pgvector** >= 0.3 -- 用于 `NumpyVector`
 

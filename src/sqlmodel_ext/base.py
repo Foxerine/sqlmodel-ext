@@ -9,9 +9,11 @@ Provides a smart metaclass that handles:
 - Annotated sa_type extraction and injection
 - Python 3.14 (PEP 649) compatibility
 """
+import copy
 import logging
 import re
 import sys
+import types
 import typing
 from typing import Any, get_args, get_origin
 
@@ -21,7 +23,13 @@ from pydantic_core import PydanticUndefined as Undefined
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Mapped, relationship as sa_relationship
 from sqlmodel import Field, SQLModel
-from sqlmodel.main import SQLModelMetaclass, is_table_model_class, get_relationship_to
+from sqlmodel.main import (
+    SQLModelMetaclass,
+    is_table_model_class,
+    get_relationship_to,
+    FieldInfo as SQLModelFieldInfo,  # Internal API: stable since sqlmodel 0.0.22
+    get_column_from_field,  # Internal API: stable since sqlmodel 0.0.22
+)
 
 # Import _compat for side effects (Python 3.14 monkey-patches)
 import sqlmodel_ext._compat  # noqa: F401
@@ -39,6 +47,276 @@ else:
     annotationlib = None
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_field_info_attrs(target: SQLModelFieldInfo, source: SQLModelFieldInfo) -> None:
+    """
+    Merge explicitly-set attributes from ``source`` into ``target``.
+
+    Used when ``Annotated[Str64, Field(unique=True)]`` expands to multiple FieldInfo:
+    ``Annotated[str, Field(max_length=64), Field(unique=True)]``.
+    Merges attributes dynamically (via ``__slots__`` / ``__annotations__`` / ``__dict__``),
+    no hardcoded attribute names — upstream additions are handled automatically.
+    """
+    attr_names: set[str] = set()
+    for klass in type(source).__mro__:
+        for slot in getattr(klass, '__slots__', ()):
+            if not slot.startswith('_'):
+                attr_names.add(slot)
+        for ann in getattr(klass, '__annotations__', {}):
+            if not ann.startswith('_'):
+                attr_names.add(ann)
+    for key in (vars(source) if hasattr(source, '__dict__') else ()):
+        if not key.startswith('_'):
+            attr_names.add(key)
+
+    # metadata lists should be merged, not replaced
+    attr_names.discard('metadata')
+
+    for attr_name in attr_names:
+        try:
+            val = getattr(source, attr_name)
+        except AttributeError:
+            continue
+
+        if val is None or val is Undefined:
+            continue
+        if isinstance(val, (list, dict, set)) and not val:
+            continue
+
+        # Boolean flags (unique, primary_key, etc.): don't overwrite True with False
+        if isinstance(val, bool) and not val:
+            current = getattr(target, attr_name, None)
+            if isinstance(current, bool) and current:
+                continue
+
+        try:
+            setattr(target, attr_name, val)
+        except (AttributeError, TypeError):
+            continue  # read-only slot
+
+    # Merge metadata lists (Pydantic validator metadata like MaxLen, etc.)
+    source_meta = getattr(source, 'metadata', None)
+    if source_meta:
+        target_meta = getattr(target, 'metadata', None) or []
+        target.metadata = list(target_meta) + list(source_meta)
+
+
+def _make_annotation_optional(annotation: typing.Any) -> typing.Any:
+    """
+    Convert type annotation to optional: ``T → T | None``
+
+    Places ``| None`` inside ``Annotated[]`` to preserve Field metadata.
+
+    Examples::
+
+        str → str | None
+        Annotated[float, Field(ge=0.0)] → Annotated[float | None, Field(ge=0.0)]
+        str | None → str | None  (already optional, unchanged)
+    """
+    origin = get_origin(annotation)
+
+    # Annotated[T, metadata...] → Annotated[T | None, metadata...]
+    if origin is typing.Annotated:
+        args = get_args(annotation)
+        inner_type = args[0]
+        metadata = args[1:]
+        optional_inner = _make_annotation_optional(inner_type)
+        return typing.Annotated[tuple([optional_inner, *metadata])]
+
+    # Union / UnionType already contains None → unchanged
+    if origin is typing.Union or isinstance(annotation, types.UnionType):
+        args = get_args(annotation)
+        if type(None) in args:
+            return annotation
+
+    # T → T | None
+    return annotation | None
+
+
+def _apply_all_fields_optional(
+        annotations: dict[str, typing.Any],
+        attrs: dict[str, typing.Any],
+        bases: tuple[type, ...],
+) -> None:
+    """
+    Automatically convert inherited fields to optional.
+
+    Two-step strategy (same MRO traversal pattern as ``_recover_annotated_sqlmodel_fields``):
+
+    1. Collect data field names from base ``model_fields`` (filtering ClassVar/Relationship)
+    2. Get original type annotations from base MRO ``__annotations__`` (preserving ``Annotated`` metadata)
+
+    Ensures ``Annotated[float, Field(ge=0.0)]`` constraints are not lost.
+    """
+    # 1. Collect all base class data field names
+    field_names: set[str] = set()
+    for base in bases:
+        base_model_fields = getattr(base, 'model_fields', None)
+        if base_model_fields:
+            field_names.update(base_model_fields.keys())
+
+    # 2. For each field, get original annotation from MRO and make optional
+    for field_name in field_names:
+        if field_name in annotations:
+            continue
+        # Find original annotation from MRO (preserves Annotated metadata)
+        original_ann: typing.Any = None
+        for base in bases:
+            for cls in base.__mro__:
+                if cls is object:
+                    continue
+                cls_ann = getattr(cls, '__annotations__', None)
+                if not cls_ann or field_name not in cls_ann:
+                    continue
+                candidate = cls_ann[field_name]
+                if isinstance(candidate, str):
+                    continue
+                original_ann = candidate
+                break
+            if original_ann is not None:
+                break
+        if original_ann is None:
+            continue
+
+        # Skip Literal type fields (e.g. discriminator):
+        # Literal['text'] | None breaks Pydantic discriminated union
+        raw_type = original_ann
+        if get_origin(raw_type) is typing.Annotated:
+            raw_type = get_args(raw_type)[0]
+        if get_origin(raw_type) is typing.Literal:
+            continue
+
+        optional_ann = _make_annotation_optional(original_ann)
+
+        # Replace default_factory with default=None for Annotated[T, Field(default_factory=...)]
+        # Unified behavior: all_fields_optional fields all default to None, no factory retained.
+        if get_origin(optional_ann) is typing.Annotated:
+            ann_args = list(get_args(optional_ann))
+            for i, meta in enumerate(ann_args[1:], 1):
+                if isinstance(meta, FieldInfo) and meta.default_factory is not None:
+                    new_fi = meta._copy() if hasattr(meta, '_copy') else copy.copy(meta)
+                    new_fi.default_factory = None
+                    new_fi.default = None
+                    new_fi._attributes_set = dict(new_fi._attributes_set)
+                    new_fi._attributes_set.pop('default_factory', None)
+                    new_fi._attributes_set['default'] = None
+                    ann_args[i] = new_fi
+                    optional_ann = typing.Annotated[tuple(ann_args)]
+                    break
+
+        annotations[field_name] = optional_ann
+        if field_name not in attrs:
+            attrs[field_name] = None
+
+
+def _recover_annotated_sqlmodel_fields(
+    annotations: dict[str, typing.Any],
+    attrs: dict[str, typing.Any],
+    bases: tuple[type, ...],
+    is_table: bool,
+) -> None:
+    """
+    Recover ``Annotated[T, Field(...)]`` back to ``T = Field(default=..., ...)``.
+
+    Pydantic v2 replaces sqlmodel.main.FieldInfo with pydantic.fields.FieldInfo when
+    processing Annotated metadata. The latter doesn't support SQLModel-specific attributes
+    (foreign_key, sa_type, etc.), causing get_column_from_field() to miss DB constraints.
+
+    This function dynamically discovers all SQLModel FieldInfo in Annotated metadata and
+    converts them to ``= Field(...)`` style. Future upstream additions are handled automatically.
+
+    **Only executes for table classes**: non-table classes (e.g. Base classes) keep their
+    original Annotated annotations so child table classes can recover inherited constraints.
+
+    :param annotations: Class ``__annotations__`` dict (modified in place)
+    :param attrs: Class namespace dict (modified in place)
+    :param bases: Base class tuple for checking inherited Annotated fields
+    :param is_table: Whether this class is a table class
+    """
+    # Python 3.14 (PEP 649): when annotations contain unresolvable forward references,
+    # get_type_hints() raises NameError and returns empty dict.
+    # Recover from __annotate_func__(Format.VALUE) which keeps unresolved refs as str/ForwardRef.
+    if not annotations and annotationlib is not None:
+        annotate_func = attrs.get('__annotate_func__')
+        if annotate_func is not None:
+            try:
+                annotations.update(annotate_func(annotationlib.Format.VALUE))
+            except Exception:
+                pass
+
+    # Non-table classes: keep original Annotated annotations unchanged
+    if not is_table:
+        return
+
+    # Collect all Annotated fields: current class + inherited from parents
+    all_annotated: dict[str, typing.Any] = {}
+
+    # Inherited Annotated fields (traverse MRO for multi-level inheritance)
+    for base in bases:
+        for cls in base.__mro__:
+            if cls is object:
+                continue
+            cls_ann = getattr(cls, '__annotations__', None)
+            if not cls_ann:
+                continue
+            for field_name, field_type in cls_ann.items():
+                if field_name not in all_annotated and field_name not in annotations:
+                    all_annotated[field_name] = field_type
+
+    # Current class fields (higher priority)
+    all_annotated.update(annotations)
+
+    for field_name, field_type in all_annotated.items():
+        if get_origin(field_type) is not typing.Annotated:
+            continue
+
+        args = get_args(field_type)
+        if len(args) < 2:
+            continue
+
+        # Find all SQLModel FieldInfo in Annotated metadata
+        sqlmodel_fis: list[SQLModelFieldInfo] = [
+            arg for arg in args[1:] if isinstance(arg, SQLModelFieldInfo)
+        ]
+
+        if not sqlmodel_fis:
+            continue
+
+        # Merge multiple FieldInfo: shallow-copy first then merge to avoid mutating
+        # shared Annotated metadata singletons (e.g. Str64 = Annotated[str, Field(max_length=64)])
+        sqlmodel_fi = copy.copy(sqlmodel_fis[0])
+        for extra_fi in sqlmodel_fis[1:]:
+            _merge_field_info_attrs(sqlmodel_fi, extra_fi)
+
+        # Transfer plain defaults from attrs (e.g. = 0, = None) to FieldInfo
+        existing_default = attrs.get(field_name, Undefined)
+        if existing_default is not Undefined and not isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
+            sqlmodel_fi.default = existing_default
+        elif existing_default is Undefined:
+            # Inherit default from parent model_fields, but only when FieldInfo has no default/factory
+            if sqlmodel_fi.default is Undefined and sqlmodel_fi.default_factory is None:
+                for base in bases:
+                    base_fields = getattr(base, 'model_fields', None)
+                    if base_fields and field_name in base_fields:
+                        base_fi = base_fields[field_name]
+                        if base_fi.default is not Undefined:
+                            sqlmodel_fi.default = base_fi.default
+                        elif base_fi.default_factory is not None:
+                            sqlmodel_fi.default_factory = base_fi.default_factory
+                        break
+
+        # Inject SQLModel FieldInfo as field default (equivalent to = Field(...) style)
+        attrs[field_name] = sqlmodel_fi
+
+        # Update annotations: remove SQLModel FieldInfo from Annotated
+        base_type = args[0]
+        remaining_metadata = [a for a in args[1:] if not isinstance(a, SQLModelFieldInfo)]
+        if remaining_metadata:
+            new_ann = typing.Annotated[tuple([base_type] + remaining_metadata)]
+        else:
+            new_ann = base_type
+        annotations[field_name] = new_ann
 
 
 def _make_sti_fk_resolver(
@@ -178,6 +456,18 @@ class __DeclarativeMeta(SQLModelMetaclass):
         # 4. Extract sa_type from Annotated metadata and inject into Field
         annotations, annotation_strings, eval_globals, eval_locals = _resolve_annotations(attrs)
 
+        # 4.5. Fix Annotated[T, Field(foreign_key=...)] where SQLModel FieldInfo gets replaced
+        # by Pydantic FieldInfo. Must run before super().__new__() because SQLModel calls
+        # get_column_from_field() during __new__. Only for table classes; non-table classes
+        # keep original Annotated annotations for child table classes to inherit.
+        _recover_annotated_sqlmodel_fields(annotations, attrs, bases, will_be_table)
+
+        # 4.6. all_fields_optional: automatically convert inherited fields to optional (T | None = None)
+        # Used for UpdateRequest DTOs to avoid manually overriding each field.
+        is_all_optional = kwargs.pop('all_fields_optional', False)
+        if is_all_optional:
+            _apply_all_fields_optional(annotations, attrs, bases)
+
         if annotations:
             attrs['__annotations__'] = annotations
             if annotationlib is not None:
@@ -207,13 +497,41 @@ class __DeclarativeMeta(SQLModelMetaclass):
                 if field_value is Undefined:
                     attrs[field_name] = Field(sa_type=sa_type)
                 elif isinstance(field_value, FieldInfo):
-                    if not hasattr(field_value, 'sa_type') or field_value.sa_type is Undefined:
-                        field_value.sa_type = sa_type
+                    if getattr(field_value, 'sa_type', Undefined) is Undefined:
+                        setattr(field_value, 'sa_type', sa_type)
 
-        # 5. Call parent __new__
+        # 5. Save SQLModel FieldInfo from Annotated fields before super().__new__(),
+        # because Pydantic rebuilds model_fields with plain FieldInfo that lacks
+        # SQLModel-specific attributes (unique, index, foreign_key, sa_type, etc.).
+        _saved_sqlmodel_fis: dict[str, SQLModelFieldInfo] = {}
+        if will_be_table:
+            for _fn in annotations:
+                _fv = attrs.get(_fn)
+                if isinstance(_fv, SQLModelFieldInfo):
+                    _saved_sqlmodel_fis[_fn] = _fv
+
+        # 6. Call parent __new__
         result = super().__new__(cls, name, bases, attrs, **kwargs)
 
-        # 6. Fix: inherit parent's __sqlmodel_relationships__ for JTI
+        # 7. Restore SQLModel FieldInfo attributes discarded by Pydantic and rebuild Columns.
+        # Pydantic FieldInfo uses __slots__, so setattr for SQLModel extensions is silently
+        # ignored. We replace the Pydantic FieldInfo with our saved SQLModelFieldInfo and
+        # rebuild the Column via get_column_from_field().
+        if _saved_sqlmodel_fis:
+            for _fn, _saved_fi in _saved_sqlmodel_fis.items():
+                _current_fi = result.model_fields.get(_fn)
+                if _current_fi is None:
+                    continue
+                _merge_field_info_attrs(_saved_fi, _current_fi)
+                if _saved_fi.default is Undefined and _current_fi.default is not Undefined:
+                    _saved_fi.default = _current_fi.default
+                if _saved_fi.default_factory is None and _current_fi.default_factory is not None:
+                    _saved_fi.default_factory = _current_fi.default_factory
+                result.model_fields[_fn] = _saved_fi
+                _col = get_column_from_field(_saved_fi)
+                setattr(result, _fn, _col)
+
+        # 8. Fix: inherit parent's __sqlmodel_relationships__ for JTI
         if kwargs.get('table', False):
             for base in bases:
                 if hasattr(base, '__sqlmodel_relationships__'):
@@ -224,7 +542,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
                                 base_attr = getattr(base, rel_name)
                                 setattr(result, rel_name, base_attr)
 
-        # 7. Forbid redefining parent's Relationship fields
+        # 9. Forbid redefining parent's Relationship fields
         for base in bases:
             parent_relationships = getattr(base, '__sqlmodel_relationships__', {})
             for rel_name in parent_relationships:
@@ -235,23 +553,42 @@ class __DeclarativeMeta(SQLModelMetaclass):
                         f"Modify the relationship in the parent class instead."
                     )
 
-        # 8. Fix: remove Relationship fields from model_fields/__pydantic_fields__
+        # 10. Inherit parent field descriptions (use_attribute_docstrings fix)
+        # Pydantic's use_attribute_docstrings parses docstrings from source AST.
+        # When a subclass overrides a field (e.g. UpdateRequest changes `name: str`
+        # to `name: str | None = None`) or all_fields_optional programmatically
+        # generates annotations, there is no docstring in source → description lost.
+        # Fix: inherit missing descriptions from parent's model_fields via MRO.
+        needs_rebuild = False
+        for fname, finfo in result.model_fields.items():
+            if finfo.description is not None:
+                continue
+            for parent in result.__mro__[1:]:
+                parent_fields = getattr(parent, 'model_fields', None)
+                if parent_fields and fname in parent_fields:
+                    parent_desc = parent_fields[fname].description
+                    if parent_desc is not None:
+                        finfo.description = parent_desc
+                        needs_rebuild = True
+                        break
+
+        # 11. Fix: remove Relationship fields from model_fields/__pydantic_fields__
         relationships = getattr(result, '__sqlmodel_relationships__', {})
         if relationships:
             model_fields = getattr(result, 'model_fields', {})
             pydantic_fields = getattr(result, '__pydantic_fields__', {})
 
-            fields_removed = False
             for rel_name in relationships:
                 if rel_name in model_fields:
                     del model_fields[rel_name]
-                    fields_removed = True
+                    needs_rebuild = True
                 if rel_name in pydantic_fields:
                     del pydantic_fields[rel_name]
-                    fields_removed = True
+                    needs_rebuild = True
 
-            if fields_removed and hasattr(result, 'model_rebuild'):
-                result.model_rebuild(force=True)
+        # Rebuild Pydantic schema (description inheritance or Relationship removal)
+        if needs_rebuild and hasattr(result, 'model_rebuild'):
+            result.model_rebuild(force=True)
 
         return result
 
@@ -613,6 +950,30 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
     """
 
     model_config = ConfigDict(use_attribute_docstrings=True, validate_by_name=True, extra='forbid')
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema: Any,
+        handler: Any,
+    ) -> dict[str, Any]:
+        """
+        Fix Pydantic JSON Schema dropping description for $ref properties.
+
+        When a field type is an enum or nested model, Pydantic sometimes generates
+        a bare ``{"$ref": "..."}`` without the ``description`` (even though
+        ``model_fields`` has the description correctly set). This method patches
+        the generated schema to restore missing descriptions.
+        """
+        json_schema = handler(core_schema)
+        props = json_schema.get('properties')
+        if props:
+            for fname, prop in props.items():
+                if '$ref' in prop and 'description' not in prop:
+                    finfo = cls.model_fields.get(fname)
+                    if finfo and finfo.description:
+                        prop['description'] = finfo.description
+        return json_schema
 
     @classmethod
     def get_computed_field_names(cls) -> set[str]:

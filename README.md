@@ -16,8 +16,9 @@ Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphi
 
 | Feature | Description |
 |---------|-------------|
-| **SQLModelBase** | Smart metaclass with automatic `table=True`, `mapper_args` merging, and Python 3.14 (PEP 649) compatibility |
+| **SQLModelBase** | Smart metaclass with automatic `table=True`, `mapper_args` merging, `all_fields_optional` for UpdateRequest DTOs, attribute docstring inheritance, and Python 3.14 (PEP 649) compatibility |
 | **TableBaseMixin / UUIDTableBaseMixin** | Full async CRUD: `add()`, `save()`, `update()`, `delete()`, `get()`, `count()`, `get_with_count()`, `get_exist_one()` |
+| **CachedTableBaseMixin** | Two-tier Redis cache (ID + query) with version-based invalidation, STI-aware cascade, and optional metrics callbacks |
 | **PolymorphicBaseMixin** | Simplified Joined Table Inheritance (JTI) and Single Table Inheritance (STI) |
 | **AutoPolymorphicIdentityMixin** | Auto-generated `polymorphic_identity` from class names |
 | **OptimisticLockMixin** | Version-based optimistic locking with automatic retry |
@@ -43,6 +44,12 @@ With PostgreSQL ARRAY and JSONB types (requires `orjson`):
 
 ```bash
 pip install sqlmodel-ext[postgresql]
+```
+
+With Redis caching support (enables `CachedTableBaseMixin`):
+
+```bash
+pip install sqlmodel-ext[cache]
 ```
 
 With pgvector + NumPy vector support (includes `[postgresql]`):
@@ -1209,6 +1216,130 @@ These mixins define the fields as **required** (non-optional), because in API re
 
 ---
 
+### Redis Caching (CachedTableBaseMixin)
+
+Add a two-tier Redis cache to any table model. Queries go through Redis first; cache misses fall through to the database.
+
+```bash
+pip install sqlmodel-ext[cache]  # installs redis + orjson
+```
+
+**Setup (once at application startup):**
+
+```python
+from redis.asyncio import Redis
+from sqlmodel_ext import CachedTableBaseMixin
+
+redis = Redis.from_url("redis://localhost:6379/0", decode_responses=False)
+CachedTableBaseMixin.configure_redis(redis)
+```
+
+**Define a cached model:**
+
+```python
+class Character(CachedTableBaseMixin, CharacterBase, UUIDTableBaseMixin, table=True, cache_ttl=1800):
+    pass  # 30-minute cache TTL
+```
+
+That's it. All `get()` calls now check Redis first. Cache invalidation is automatic on `save()`, `update()`, and `delete()`.
+
+**Cache architecture:**
+
+| Layer | Key format | Invalidation |
+|-------|-----------|--------------|
+| ID cache | `id:{Model}:{id}` | Row-level DEL on save/update/delete |
+| Query cache | `query:{Model}:v{version}:{hash}` | Version bump (O(1) INCR) makes old keys unreachable |
+| Version | `ver:{Model}` | INCR on any write; STI subclass changes bump all ancestor versions |
+
+**Optional metrics callbacks:**
+
+```python
+CachedTableBaseMixin.on_cache_hit = lambda name: print(f"HIT: {name}")
+CachedTableBaseMixin.on_cache_miss = lambda name: print(f"MISS: {name}")
+```
+
+**Cache skip conditions** (automatically detected):
+- `no_cache=True` (explicit bypass)
+- `with_for_update=True` (pessimistic lock needs latest)
+- `join` is set (join target changes don't trigger invalidation)
+- `options` is set (custom loading options)
+
+**No Redis? No problem.** If you don't call `configure_redis()` and don't inherit `CachedTableBaseMixin`, there is zero Redis dependency. The caching layer is entirely opt-in.
+
+---
+
+### all_fields_optional
+
+Automatically convert all inherited fields to optional for PATCH/UpdateRequest DTOs:
+
+```python
+class ArticleBase(SQLModelBase):
+    title: Str64
+    """Article title"""
+    body: Text10K
+    """Article body"""
+    is_published: bool = False
+    """Publication status"""
+
+class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
+    pass
+    # All fields become: title: Str64 | None = None, body: Text10K | None = None, etc.
+    # Annotated constraints (max_length, ge, le) are preserved
+    # Attribute docstrings are inherited from ArticleBase
+```
+
+**What it does:**
+- Converts `T` to `T | None = None` for all inherited fields
+- Preserves `Annotated` metadata (e.g. `Field(ge=0)` constraints stay intact)
+- Skips `Literal` fields (discriminator fields must remain required)
+- Replaces `default_factory` with `default=None`
+
+**No more manual overrides** like this:
+
+```python
+# Before: tedious and error-prone
+class ArticleUpdateRequest(ArticleBase):
+    title: Str64 | None = None    # Must manually repeat type + optional
+    body: Text10K | None = None   # Easy to forget constraints
+    is_published: bool | None = None
+```
+
+---
+
+### Attribute Docstring Inheritance
+
+When using Pydantic's `use_attribute_docstrings=True` (enabled by default in `SQLModelBase`), field descriptions appear in OpenAPI schemas. However, Pydantic's AST-based docstring parser doesn't inherit descriptions when subclasses override fields.
+
+**sqlmodel-ext fixes this automatically.** The metaclass inherits missing descriptions from parent classes via MRO traversal, and `__get_pydantic_json_schema__` patches bare `$ref` properties to include descriptions.
+
+```python
+class UserBase(SQLModelBase):
+    name: str
+    """User display name"""     # ← parsed by Pydantic
+
+class UserUpdateRequest(UserBase, all_fields_optional=True):
+    pass
+    # name: str | None = None   — description "User display name" is automatically inherited
+    # Shows up correctly in OpenAPI/Swagger docs
+```
+
+---
+
+### safe_reset
+
+Safely reset an async session, clearing both the DB connection and FOR UPDATE lock tracking:
+
+```python
+from sqlmodel_ext import safe_reset
+
+# In long-lived tasks (e.g. background workers) between operations:
+await safe_reset(session)
+```
+
+This prevents stale `FOR UPDATE` lock tracking in `session.info` when Python reuses object IDs across `reset()` cycles.
+
+---
+
 ## Architecture
 
 ```
@@ -1222,7 +1353,8 @@ sqlmodel_ext/
     pagination.py            # ListResponse, TimeFilterRequest, PaginationRequest, TableViewRequest
     mixins/
         __init__.py          # Mixin re-exports
-        table.py             # TableBaseMixin, UUIDTableBaseMixin (async CRUD)
+        table.py             # TableBaseMixin, UUIDTableBaseMixin, safe_reset (async CRUD)
+        cached_table.py      # CachedTableBaseMixin (two-tier Redis cache with version invalidation)
         polymorphic.py       # PolymorphicBaseMixin, AutoPolymorphicIdentityMixin, create_subclass_id_mixin
         optimistic_lock.py   # OptimisticLockMixin, OptimisticLockError
         relation_preload.py  # RelationPreloadMixin, @requires_relations
@@ -1250,7 +1382,8 @@ sqlmodel_ext/
 - **pydantic** >= 2.0
 - **sqlalchemy** >= 2.0
 - (optional) **fastapi** >= 0.100.0
-- (optional) **orjson** >= 3.0 -- for `JSON100K` / `JSONList100K`
+- (optional) **redis** >= 5.0 -- for `CachedTableBaseMixin`
+- (optional) **orjson** >= 3.0 -- for `CachedTableBaseMixin` and `JSON100K` / `JSONList100K`
 - (optional) **numpy** >= 1.24 -- for `NumpyVector`
 - (optional) **pgvector** >= 0.3 -- for `NumpyVector`
 

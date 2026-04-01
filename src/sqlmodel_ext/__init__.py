@@ -44,6 +44,7 @@ from sqlmodel_ext.mixins import (
     UUIDTableBaseMixin,
     rel,
     cond,
+    safe_reset,
     # Polymorphic
     PolymorphicBaseMixin,
     AutoPolymorphicIdentityMixin,

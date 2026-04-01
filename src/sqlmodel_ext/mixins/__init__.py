@@ -20,6 +20,7 @@ from .table import (
     UUIDTableBaseMixin,
     rel,
     cond,
+    safe_reset,
 )
 from .relation_preload import (
     RelationPreloadMixin,

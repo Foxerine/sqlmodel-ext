@@ -196,6 +196,7 @@ def _register_strenum_coercion_for_subclass(cls: type) -> None:
         original_init(self, *args, **kwargs)
         _coerce(self)
 
+    cls.__original_init__ = original_init  # type: ignore[attr-defined]  # preserve for unwrap
     cls.__init__ = _wrapped_init  # type: ignore[method-assign]
 
 

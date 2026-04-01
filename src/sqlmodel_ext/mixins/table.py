@@ -50,6 +50,22 @@ M = TypeVar("M", bound="SQLModelBase")
 SESSION_FOR_UPDATE_KEY = '_for_update_locked'
 """Key in session.info storing the set of id() values for FOR UPDATE locked instances."""
 
+
+async def safe_reset(session: AsyncSession) -> None:
+    """
+    session.reset() + clear FOR UPDATE lock tracking.
+
+    reset() releases the transaction and DB connection but does not clear session.info.
+    Long-lived sessions (e.g. Taskiq tasks with multiple reset+reuse cycles) accumulate
+    stale locked id() values. If Python reuses an object id, @requires_for_update may
+    incorrectly treat an unlocked instance as locked.
+
+    :param session: The async session to reset
+    """
+    await session.reset()
+    session.info.pop(SESSION_FOR_UPDATE_KEY, None)
+
+
 # NOTE(SQLModel typing): load parameter uses QueryableAttribute[Any] (InstrumentedAttribute at runtime).
 # basedpyright infers SQLModel Relationship fields as the annotated type (e.g. LLM), not QueryableAttribute.
 # Callers should use rel(Model.relation) to pass load args (see rel() below).
