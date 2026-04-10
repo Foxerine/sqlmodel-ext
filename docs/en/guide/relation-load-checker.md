@@ -1,5 +1,26 @@
 # Static Analyzer
 
+::: warning Experimental (off by default)
+Starting with 0.3.0 the relation-load static analyzer is **experimental** and
+ships with `check_on_startup = False`. Every auto-check entry point
+(`run_model_checks`, `RelationLoadCheckMiddleware`, the `atexit` warning)
+short-circuits immediately and the analyzer has no effect on your app.
+
+The analyzer's AST rules are tuned for a specific project layout (FastAPI
+endpoints, STI inheritance conventions, `save`/`update`/`delete` naming, and
+more). On projects that deviate from those assumptions it may emit false
+positives or fail to parse source files. Only enable it after verifying that
+your project matches the assumptions described below:
+
+```python
+import sqlmodel_ext.relation_load_checker as rlc
+rlc.check_on_startup = True  # explicit opt-in, experimental
+```
+
+The module API is not covered by semver stability guarantees; rules and
+signatures may change in subsequent releases.
+:::
+
 The static analyzer uses AST analysis to scan source code **at application startup**, detecting code that could cause `MissingGreenlet` errors before any request is served.
 
 ## Purpose
@@ -20,25 +41,33 @@ flowchart LR
 | **RLC002** | Accessing relations after `save()`/`update()` without `load=` |
 | **RLC003** | Accessing relations without prior `load=` loading (local variables only) |
 | **RLC005** | Dependency function doesn't preload relations needed by `response_model` |
-| **RLC007** | Accessing column attributes on expired objects after commit |
-| **RLC008** | Calling methods on expired objects after commit |
-| **RLC009** | Type annotation resolution errors (mixing resolved types with string forward references) |
+| **RLC007** | Accessing column attributes on expired objects after commit (triggers sync lazy load → MissingGreenlet) |
+| **RLC008** | Calling business methods on expired objects after commit (method body may touch expired columns) |
+| **RLC010** | Passing expired ORM objects after commit as arguments into other functions/methods |
+| **RLC011** | Implicit dunder access (`if not obj:` → `__len__`, `for x in obj:` → `__iter__`) triggers relation load |
+| **RLC012** | `response_model` declares STI-subclass-specific columns but the endpoint returns STI base-class results (heterogeneous serialization touches missing columns) |
 
 ## Usage
 
-### Automatic Checking (Recommended)
+### Automatic Checking (requires explicit opt-in)
 
 ```python
-# In models/__init__.py, after configure_mappers():
+# 1. Enable the experimental checker at your earliest bootstrap entrypoint
+import sqlmodel_ext.relation_load_checker as rlc
+rlc.check_on_startup = True  # experimental, off by default
+
+# 2. In models/__init__.py, after configure_mappers():
 from sqlmodel_ext import run_model_checks, SQLModelBase
 run_model_checks(SQLModelBase)
 
-# In main.py:
+# 3. In main.py:
 from sqlmodel_ext import RelationLoadCheckMiddleware
 app.add_middleware(RelationLoadCheckMiddleware)
 ```
 
-`run_model_checks` scans all model class methods. `RelationLoadCheckMiddleware` scans all FastAPI route functions when the first request arrives.
+`run_model_checks` scans every model class method; `RelationLoadCheckMiddleware`
+scans FastAPI routes when the lifespan startup completes. Without
+`check_on_startup = True`, both entry points return immediately and do nothing.
 
 ### Manual Checking
 

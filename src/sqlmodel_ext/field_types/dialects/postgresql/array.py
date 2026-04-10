@@ -41,9 +41,15 @@ class _ArrayTypeHandler:
             self.item_schema = core_schema.literal_schema(
                 [member.value for member in origin_type]  # pyright: ignore[reportAny]
             )
-            self.sa_array_type = ARRAY(
-                sa.Enum(origin_type, name=origin_type.__name__.lower())
-            )
+            # values_callable ensures the PG ENUM is populated with the member
+            # string values (StrEnum.value) rather than the Python identifiers
+            # (Enum.name). Required so StrEnum subclasses serialize as their
+            # user-facing strings (e.g. 'read:own' instead of 'READ_OWN').
+            self.sa_array_type = ARRAY(sa.Enum(
+                origin_type,
+                name=origin_type.__name__.lower(),
+                values_callable=lambda e: [m.value for m in e],
+            ))
             return
 
         # Per-type dispatch to avoid union types that cannot satisfy ARRAY's invariant _T

@@ -74,6 +74,7 @@ from sqlmodel_ext.field_types import (
     DirectoryPathType,
     FilePathType,
     # String constraints
+    Str16,
     Str24,
     Str32,
     Str36,
@@ -93,12 +94,15 @@ from sqlmodel_ext.field_types import (
     Text3K,
     Text5K,
     Text10K,
+    Text32K,
     Text60K,
     Text64K,
     Text100K,
     Text1M,
     # Numeric constraints
     INT32_MAX,
+    INT64_MAX,
+    JS_MAX_SAFE_INTEGER,
     Port,
     Percentage,
     PositiveInt,
@@ -106,6 +110,7 @@ from sqlmodel_ext.field_types import (
     PositiveBigInt,
     NonNegativeBigInt,
     PositiveFloat,
+    NonNegativeFloat,
     # Custom types
     IPAddress,
     Url,

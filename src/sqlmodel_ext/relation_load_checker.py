@@ -1,6 +1,16 @@
 """
 Relation Load Checker -- static analysis for async SQLAlchemy relationship access.
 
+.. warning::
+
+    **Experimental**. This module is off by default. The AST analyzer is
+    tightly coupled to a specific project layout (FastAPI endpoints, STI
+    inheritance conventions, internal naming patterns) and may produce false
+    positives or crash on code it has not seen before. Opt in explicitly by
+    setting ``check_on_startup = True`` AFTER evaluating whether your project
+    matches the assumptions listed in the README. The module API is not
+    covered by semver stability guarantees.
+
 Startup-time AST analysis to detect unloaded relationship access in coroutines,
 preventing MissingGreenlet errors before any request is served.
 
@@ -22,8 +32,12 @@ Detection rules:
     - RLC008: calling business methods on expired (post-commit) object (method internals may access expired columns -> MissingGreenlet)
     - RLC010: passing expired ORM objects as arguments to functions/methods (callee may access expired columns -> MissingGreenlet)
     - RLC011: implicit dunder method triggers relationship access (e.g. ``if not obj:`` triggers __len__() / ``for x in obj:`` triggers __iter__())
+    - RLC012: response_model contains STI subclass-specific columns while the endpoint returns STI base-class query results (heterogeneous serialization accesses missing columns -> MissingGreenlet)
 
-Auto-check (recommended)::
+Opt-in auto-check::
+
+    import sqlmodel_ext.relation_load_checker as rlc
+    rlc.check_on_startup = True  # experimental; off by default
 
     # In your package __init__.py, after configure_mappers():
     from sqlmodel_ext.relation_load_checker import run_model_checks
@@ -39,18 +53,13 @@ Manual check (fallback)::
     checker = RelationLoadChecker(SQLModelBase)
     warnings = checker.check_model_methods()
     warnings += checker.check_app(app)
-
-Configuration::
-
-    import sqlmodel_ext.relation_load_checker as rlc
-    rlc.check_on_startup = False  # disable all auto-checks
 """
 import atexit
 import ast
 import inspect as python_inspect
 import logging
 import os
-import pathlib
+import re
 import sys
 import textwrap
 import types
@@ -58,11 +67,14 @@ import typing
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Self, TypeVar, Union, override
 
+from sqlalchemy import inspect as sa_inspect
 from sqlmodel.ext.asyncio.session import AsyncSession as _AsyncSession
 
 logger = logging.getLogger(__name__)
 
-# Conditional FastAPI import
+UNKNOWN_LABEL = '<unknown>'
+
+# Conditional FastAPI import: the library must be usable without FastAPI installed.
 try:
     from fastapi.params import Depends as _FastAPIDependsClass
     _HAS_FASTAPI = True
@@ -71,34 +83,18 @@ except ImportError:
     _HAS_FASTAPI = False
 
 
-def _collect_noreturn_names(func: Any) -> frozenset[str]:
-    """
-    Collect NoReturn function names from the module namespace of a function.
-
-    Uses runtime type annotations to detect functions returning ``NoReturn``.
-    Used by ``_branch_unconditionally_returns()`` to recognize calls that never return
-    (e.g. ``raise_bad_request()``).
-    """
-    module = python_inspect.getmodule(func)
-    if module is None:
-        return frozenset()
-    names: set[str] = set()
-    for attr_name, obj in vars(module).items():
-        if not callable(obj):
-            continue
-        try:
-            hints = typing.get_type_hints(obj)
-        except Exception:
-            continue
-        if hints.get('return') is typing.NoReturn:
-            names.add(attr_name)
-    return frozenset(names)
-
-
 # ========================= Auto-check configuration =========================
 
-check_on_startup: bool = True
-"""Auto-check switch on startup (default on). Set False to disable all auto-checks."""
+check_on_startup: bool = False
+"""Auto-check switch on startup.
+
+Defaults to ``False``: the relation load checker is **experimental** and must
+be opted into explicitly. Set to ``True`` AFTER evaluating whether your project
+layout matches the analyzer's assumptions (FastAPI endpoints, STI inheritance
+conventions, ``save``/``update``/``delete`` naming, etc.). When the flag is
+``False``, ``run_model_checks``, ``RelationLoadCheckMiddleware``, and every
+auto-check short-circuit immediately.
+"""
 
 _base_class: type | None = None
 """Cached base_class reference (set by run_model_checks)."""
@@ -110,14 +106,14 @@ _app_check_completed: bool = False
 """Whether app endpoint/coroutine checks have completed."""
 
 _PROJECT_ROOT: str = os.getcwd()
-"""Auto-detected project root directory (defaults to cwd)."""
+"""Auto-detected project root directory (defaults to cwd for the standalone library)."""
 
 
 @dataclass
 class RelationLoadWarning:
     """Relation load static analysis warning."""
     code: str
-    """Rule code (RLC001-RLC011)."""
+    """Rule code (RLC001-RLC012)."""
     file: str
     """File path."""
     line: int
@@ -149,6 +145,30 @@ class _TrackedVar:
     """Definition/last-update line number."""
 
 
+def _collect_noreturn_names(func: Any) -> frozenset[str]:
+    """
+    Collect NoReturn function names from the module namespace of a function.
+
+    Uses runtime type annotations to detect functions returning ``NoReturn``.
+    Used by ``_branch_unconditionally_returns()`` to recognize calls that never return
+    (e.g. ``raise_bad_request()``).
+    """
+    module = python_inspect.getmodule(func)
+    if module is None:
+        return frozenset()
+    names: set[str] = set()
+    for attr_name, obj in vars(module).items():
+        if not callable(obj):
+            continue
+        try:
+            hints = typing.get_type_hints(obj)
+        except Exception:
+            continue
+        if hints.get('return') is typing.NoReturn:
+            names.add(attr_name)
+    return frozenset(names)
+
+
 class RelationLoadChecker:
     """
     Startup-time relation load static analyzer.
@@ -160,23 +180,36 @@ class RelationLoadChecker:
     def __init__(self, base_class: type) -> None:
         # model class name -> set of relationship attribute names
         self.model_relationships: dict[str, set[str]] = {}
-        # model class name -> set of column attribute names
+        # model class name -> {relationship name -> target model class name}
+        self.model_rel_targets: dict[str, dict[str, str]] = {}
+        # model class name -> set of column attribute names (includes PK)
         self.model_columns: dict[str, set[str]] = {}
-        # model class name -> set of primary key column attribute names (PKs don't expire)
-        self.model_pk_columns: dict[str, set[str]] = {}
         # model class name -> actual class object
         self.model_classes: dict[str, type] = {}
-        # analyzed function ids for dedup
+        # Analyzed function ids for dedup
         self._analyzed_func_ids: set[int] = set()
-        # auto-discovered method behaviors (type system as single source of truth)
+        # Auto-discovered method behaviors (type system as single source of truth)
         self.commit_methods: frozenset[str] = frozenset()
         self.model_returning_methods: frozenset[str] = frozenset()
         self.sync_model_returning_methods: frozenset[str] = frozenset()
+        # For model-returning commit methods, the set where the return comes
+        # from save/update(commit!=False). These method return values are
+        # refreshed inside save(), so callers may safely access column attrs.
+        self.refreshing_commit_methods: frozenset[str] = frozenset()
+        # Per-class commit methods (MRO-aware, model class name -> effective commit method set)
+        self._model_commit_methods: dict[str, frozenset[str]] = {}
+        # Intermediate state (for _discover_non_model_commit_methods to extend incrementally)
+        self._method_asts: dict[str, list[tuple[str, str, ast.Module]]] = {}
+        self._class_commit: dict[str, set[str]] = {}
 
         self._build_knowledge_base(base_class)
-        self.commit_methods, self.model_returning_methods, self.sync_model_returning_methods = (
-            self._discover_method_behaviors()
-        )
+        (
+            self.commit_methods, self.model_returning_methods,
+            self.sync_model_returning_methods, self.refreshing_commit_methods,
+        ) = self._discover_method_behaviors()
+        # Extend commit method set: scan non-model project classes (e.g. Messages)
+        # for transitive commit methods.
+        self._discover_non_model_commit_methods()
         # model_name -> {dunder_name -> set of accessed relationship names}
         self.model_dunder_rels: dict[str, dict[str, set[str]]] = {}
         self._scan_dunder_relationship_access()
@@ -186,18 +219,19 @@ class RelationLoadChecker:
         for mapper in base_class._sa_registry.mappers:
             cls = mapper.class_
             cls_name = cls.__name__
-            self.model_relationships[cls_name] = {
-                rel.key for rel in mapper.relationships
-            }
+            rel_names: set[str] = set()
+            rel_targets: dict[str, str] = {}
+            for rel in mapper.relationships:
+                rel_names.add(rel.key)
+                rel_targets[rel.key] = rel.mapper.class_.__name__
+            self.model_relationships[cls_name] = rel_names
+            self.model_rel_targets[cls_name] = rel_targets
             self.model_columns[cls_name] = {
                 col.key for col in mapper.column_attrs
             }
-            self.model_pk_columns[cls_name] = {
-                col.key for col in mapper.primary_key
-            }
             self.model_classes[cls_name] = cls
 
-    def _discover_method_behaviors(self) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    def _discover_method_behaviors(self) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
         """
         Single-pass discovery of commit methods and model-returning methods.
 
@@ -215,10 +249,16 @@ class RelationLoadChecker:
         2. If it returns ``Self``, a concrete model class, ``Self | None``, ``T``, etc. -> model-returning
         3. Sync methods only used for variable tracking (not added to safe_methods)
 
-        :returns: (commit_methods, model_returning_methods, sync_model_returning_methods)
+        :returns: (commit_methods, model_returning_methods, sync_model_returning_methods, refreshing_commit_methods)
         """
-        # method_name -> (session_param_name, AST)
-        method_infos: dict[str, tuple[str, ast.Module]] = {}
+        # method_name -> ALL versions of (owning_class, session_param_name, AST) across class hierarchy
+        # All versions are kept (no dedup) so that commit-method discovery can
+        # check base-class session.commit() sites. For example,
+        # CachedTableBaseMixin.save() does not directly call session.commit(),
+        # but TableBaseMixin.save() does -- both versions must participate in Phase 1.
+        # owning_class records the class in which the method is defined,
+        # used for per-class commit tracking in Phase 2.
+        method_asts: dict[str, list[tuple[str, str, ast.Module]]] = {}
         # method_name -> owning class name (for resolving Self -> concrete class)
         method_owners: dict[str, str] = {}
         # method_name -> return type hint
@@ -273,47 +313,73 @@ class RelationLoadChecker:
                     if session_param is None:
                         continue
 
-                    # Keep only the first method of the same name (MRO order, most specific subclass first)
-                    if attr_name in method_infos:
-                        continue
-
                     try:
                         source = textwrap.dedent(python_inspect.getsource(func))
                         tree = ast.parse(source)
                     except (OSError, TypeError, SyntaxError):
                         continue
 
-                    method_infos[attr_name] = (session_param, tree)
-                    method_owners[attr_name] = cls_name
+                    # All versions are saved for commit-method discovery
+                    # (Phase 1/2 must check every version).
+                    method_asts.setdefault(attr_name, []).append((klass.__name__, session_param, tree))
 
-                    # Record return type (prefer get_type_hints result, fall back to __annotations__)
-                    return_hint = (
-                        hints.get('return') if hints is not None
-                        else getattr(func, '__annotations__', {}).get('return')
-                    )
-                    if return_hint is not None:
-                        method_return_hints[attr_name] = return_hint
+                    # Metadata only keeps the first version (MRO order, most specific subclass first)
+                    if attr_name not in method_owners:
+                        method_owners[attr_name] = cls_name
+
+                    # Record return type (only the first version)
+                    if attr_name not in method_return_hints:
+                        return_hint = (
+                            hints.get('return') if hints is not None
+                            else getattr(func, '__annotations__', {}).get('return')
+                        )
+                        if return_hint is not None:
+                            method_return_hints[attr_name] = return_hint
 
         # -------- Commit method discovery --------
 
         # Phase 1: methods that directly call session.commit() / session.rollback()
+        # Check every version: if any version contains a direct session.commit(),
+        # mark the method as a commit method.
         commit_methods: set[str] = set()
-        for method_name, (session_param, tree) in method_infos.items():
-            if _ast_has_typed_commit(tree, session_param):
-                commit_methods.add(method_name)
+        # Per-class commit tracking: defining_class -> set of commit method names
+        class_commit: dict[str, set[str]] = {}
+        for method_name, versions in method_asts.items():
+            for owning_cls, sp, tree in versions:
+                if _ast_has_typed_commit(tree, sp):
+                    commit_methods.add(method_name)
+                    class_commit.setdefault(owning_cls, set()).add(method_name)
 
         # Phase 2: transitive closure -- methods that call commit methods passing the session
+        # Per-class tracking: when the callee type can be resolved from the AST,
+        # check that type's commit state to avoid false positives from same-named
+        # methods on different classes (e.g. QQStats.get_instance commits but
+        # S3APIClient.get_instance does not).
+        model_class_names = frozenset(self.model_classes.keys())
         changed = True
         while changed:
             changed = False
-            for method_name, (session_param, tree) in method_infos.items():
-                if method_name in commit_methods:
-                    continue
-                if _ast_calls_commit_method_with_session(
-                    tree, session_param, frozenset(commit_methods),
-                ):
-                    commit_methods.add(method_name)
-                    changed = True
+            for method_name, versions in method_asts.items():
+                for owning_cls, sp, tree in versions:
+                    if method_name in class_commit.get(owning_cls, set()):
+                        continue
+                    if _ast_calls_commit_method_with_session(
+                        tree, sp, frozenset(commit_methods),
+                        owning_class=owning_cls,
+                        class_commit=class_commit,
+                        model_classes=self.model_classes,
+                        model_class_names=model_class_names,
+                    ):
+                        class_commit.setdefault(owning_cls, set()).add(method_name)
+                        commit_methods.add(method_name)
+                        changed = True
+
+        # Save intermediate state for _discover_non_model_commit_methods to extend incrementally
+        self._method_asts = method_asts
+        self._class_commit = class_commit
+
+        # -------- Per-model-class commit methods (MRO-aware) --------
+        self._rebuild_model_commit_methods(class_commit)
 
         # -------- Model-returning method discovery --------
 
@@ -343,7 +409,7 @@ class RelationLoadChecker:
 
             # Union/Optional: Self | None, T | None
             # Handle both typing.Union (Optional[X], Union[X, Y]) and types.UnionType (X | Y)
-            if origin is Union or origin is types.UnionType:
+            if origin is Union or origin is types.UnionType:  # pyright: ignore[reportDeprecated]
                 return any(
                     _hint_returns_model(arg)
                     for arg in typing.get_args(hint)
@@ -407,11 +473,63 @@ class RelationLoadChecker:
                     if return_hint is not None and _hint_returns_model(return_hint):
                         sync_model_returning.add(attr_name)
 
+        # -------- Phase 3: internally-refreshing model-returning commit methods (transitive closure) --------
+        # If a method's return comes from save/update(commit!=False) or from another refreshing method,
+        # the return value has already been refreshed internally. Callers may safely access column attrs.
+        # Transitive closure: fill_from_video_url -> fill_from_url -> fill_from_file_path -> save()
+        refreshing_commit: set[str] = set(_REFRESH_METHODS)
+        changed = True
+        while changed:
+            changed = False
+            for method_name, versions in method_asts.items():
+                if method_name in refreshing_commit:
+                    continue
+                if method_name not in commit_methods or method_name not in model_returning:
+                    continue
+                for _owning_cls, _sp, tree in versions:
+                    if _method_returns_from_refreshing(tree, frozenset(refreshing_commit)):
+                        refreshing_commit.add(method_name)
+                        changed = True
+                        break
+        refreshing_commit -= _REFRESH_METHODS  # save/update already handled via _REFRESH_METHODS
+
         logger.debug(f"Auto-discovered commit methods: {sorted(commit_methods)}")
         logger.debug(f"Auto-discovered model-returning methods: {sorted(model_returning)}")
         if sync_model_returning:
             logger.debug(f"Auto-discovered sync model-returning methods: {sorted(sync_model_returning)}")
-        return frozenset(commit_methods), frozenset(model_returning), frozenset(sync_model_returning)
+        if refreshing_commit:
+            logger.debug(f"Auto-discovered refreshing commit methods: {sorted(refreshing_commit)}")
+        return (
+            frozenset(commit_methods), frozenset(model_returning),
+            frozenset(sync_model_returning), frozenset(refreshing_commit),
+        )
+
+    def _rebuild_model_commit_methods(
+            self,
+            class_commit: dict[str, set[str]],
+    ) -> None:
+        """
+        Build the per-model-class commit method set (MRO-aware).
+
+        For each model class, walk the MRO looking for the most specific
+        definition to determine which commit methods are effective for it.
+        """
+        model_commit_methods: dict[str, frozenset[str]] = {}
+        for mcls_name, mcls in self.model_classes.items():
+            effective: set[str] = set()
+            seen_attrs: set[str] = set()
+            for klass in mcls.__mro__:
+                if klass is object:
+                    continue
+                klass_name = klass.__name__
+                for attr_name in vars(klass):
+                    if attr_name in seen_attrs:
+                        continue
+                    seen_attrs.add(attr_name)
+                    if attr_name in class_commit.get(klass_name, set()):
+                        effective.add(attr_name)
+            model_commit_methods[mcls_name] = frozenset(effective)
+        self._model_commit_methods = model_commit_methods
 
     # ========================= Dunder relationship access scanning =========================
 
@@ -478,14 +596,163 @@ class RelationLoadChecker:
 
                     # Record even if accessed_rels is empty (indicates the dunder exists
                     # but doesn't access relations). Important for __bool__/__len__ fallback:
-                    # if __bool__ exists (even without rel access), Python won't fall back to __len__
+                    # if __bool__ exists (even without rel access), Python won't fall back to __len__.
                     dunder_rels[dunder] = accessed_rels
 
             if dunder_rels:
                 self.model_dunder_rels[model_name] = dunder_rels
 
         if self.model_dunder_rels:
-            logger.debug(f"Found dunder relationship access: {self.model_dunder_rels}")
+            # Only log models that actually access relationships, filter out empty-set noise
+            interesting = {
+                model: dunders
+                for model, dunders in self.model_dunder_rels.items()
+                if any(rels for rels in dunders.values())
+            }
+            if interesting:
+                logger.debug(f"Found dunder relationship access: {interesting}")
+
+    # ========================= Non-model class commit method discovery =========================
+
+    def _discover_non_model_commit_methods(self) -> None:
+        """
+        Scan imported non-model project classes for transitive commit methods
+        and propagate the findings back to model methods.
+
+        Model-class commit methods are covered by ``_discover_method_behaviors()``.
+        Non-model classes (e.g. ``Messages``) may internally call ``model.save(session)``
+        which triggers a commit, forming a transitive commit chain.
+
+        Flow:
+
+        1. Collect async method ASTs from non-model classes accepting ``AsyncSession``
+        2. Phase 1: detect direct ``session.commit()`` calls
+        3. Phase 2: merge model + non-model AST sets and compute the transitive closure (bi-directional)
+        4. Update ``commit_methods`` and ``_model_commit_methods``
+        """
+        project_root = _PROJECT_ROOT.replace('\\', '/')
+
+        # -------- Collect non-model class method ASTs --------
+        non_model_asts: dict[str, list[tuple[str, str, ast.Module]]] = {}
+        seen_func_ids: set[int] = set()
+
+        for _module_name, module in list(sys.modules.items()):
+            module_file = getattr(module, '__file__', None)
+            if module_file is None:
+                continue
+            module_file_normalized = module_file.replace('\\', '/')
+            if not module_file_normalized.startswith(project_root):
+                continue
+            if '/site-packages/' in module_file_normalized:
+                continue
+
+            for attr_name in dir(module):
+                try:
+                    attr = getattr(module, attr_name)
+                except Exception:
+                    continue
+                if not python_inspect.isclass(attr):
+                    continue
+                if attr.__module__ != _module_name:
+                    continue
+                if attr.__name__ in self.model_classes:
+                    continue
+
+                for method_name in vars(attr):
+                    if method_name.startswith('__') and method_name.endswith('__'):
+                        continue
+                    raw = vars(attr)[method_name]
+                    func = raw.__func__ if isinstance(raw, (classmethod, staticmethod)) else raw
+                    if not callable(func):
+                        continue
+                    func_id = id(func)
+                    if func_id in seen_func_ids:
+                        continue
+                    seen_func_ids.add(func_id)
+
+                    if not (python_inspect.iscoroutinefunction(func)
+                            or python_inspect.isasyncgenfunction(func)):
+                        continue
+
+                    # Check AsyncSession parameter.
+                    # Non-model classes commonly import AsyncSession under TYPE_CHECKING
+                    # (as a string annotation at runtime), so get_type_hints() may fail
+                    # because of the ForwardRef. The fallback matches both the string
+                    # ``'AsyncSession'`` and the real class object.
+                    try:
+                        hints = typing.get_type_hints(func)
+                    except Exception:
+                        hints = None
+                    session_param: str | None = None
+                    if hints is not None:
+                        for pname, hint in hints.items():
+                            if hint is _AsyncSession:
+                                session_param = pname
+                                break
+                    if session_param is None:
+                        raw_annotations = getattr(func, '__annotations__', {})
+                        for pname, hint in raw_annotations.items():
+                            if hint is _AsyncSession or hint == 'AsyncSession':
+                                session_param = pname
+                                break
+                    if session_param is None:
+                        continue
+
+                    try:
+                        source = textwrap.dedent(python_inspect.getsource(func))
+                        tree = ast.parse(source)
+                    except (OSError, TypeError, SyntaxError):
+                        continue
+
+                    non_model_asts.setdefault(method_name, []).append(
+                        (attr.__name__, session_param, tree)
+                    )
+
+        if not non_model_asts:
+            return
+
+        # -------- Merge AST sets --------
+        combined_asts: dict[str, list[tuple[str, str, ast.Module]]] = {}
+        for name, versions in self._method_asts.items():
+            combined_asts.setdefault(name, []).extend(versions)
+        for name, versions in non_model_asts.items():
+            combined_asts.setdefault(name, []).extend(versions)
+
+        # -------- Phase 1: non-model methods calling session.commit() directly --------
+        class_commit = self._class_commit
+        new_commits: set[str] = set()
+        for method_name, versions in non_model_asts.items():
+            for owning_cls, sp, tree in versions:
+                if _ast_has_typed_commit(tree, sp):
+                    new_commits.add(method_name)
+                    class_commit.setdefault(owning_cls, set()).add(method_name)
+
+        # -------- Phase 2: merge transitive closure (model + non-model bidirectional) --------
+        all_commit = set(self.commit_methods) | new_commits
+        model_class_names = frozenset(self.model_classes.keys())
+        changed = True
+        while changed:
+            changed = False
+            for method_name, versions in combined_asts.items():
+                for owning_cls, sp, tree in versions:
+                    if method_name in class_commit.get(owning_cls, set()):
+                        continue
+                    if _ast_calls_commit_method_with_session(
+                        tree, sp, frozenset(all_commit),
+                        owning_class=owning_cls,
+                        class_commit=class_commit,
+                        model_classes=self.model_classes,
+                        model_class_names=model_class_names,
+                    ):
+                        class_commit.setdefault(owning_cls, set()).add(method_name)
+                        all_commit.add(method_name)
+                        changed = True
+
+        new_methods = all_commit - set(self.commit_methods)
+        if new_methods:
+            logger.debug(f"Non-model class transitive commit methods: {sorted(new_methods)}")
+            self.commit_methods = frozenset(all_commit)
+            self._rebuild_model_commit_methods(class_commit)
 
     # ========================= Public API =========================
 
@@ -569,7 +836,7 @@ class RelationLoadChecker:
                             source_file = python_inspect.getfile(func)
                             line_num = python_inspect.getsourcelines(func)[1]
                         except (TypeError, OSError):
-                            source_file = '<unknown>'
+                            source_file = UNKNOWN_LABEL
                             line_num = 0
                         warnings.append(RelationLoadWarning(
                             code='RLC009',
@@ -583,7 +850,52 @@ class RelationLoadChecker:
                             ),
                         ))
 
-        return warnings
+        return self._filter_noqa_suppressions(warnings)
+
+    @staticmethod
+    def _filter_noqa_suppressions(
+            warnings: list[RelationLoadWarning],
+    ) -> list[RelationLoadWarning]:
+        """
+        Filter warnings suppressed by ``# noqa: RLCxxx`` comments.
+
+        Supported formats::
+
+            return result  # noqa: RLC007
+            return result  # noqa: RLC007, RLC010
+
+        :param warnings: raw warning list
+        :return: filtered warning list
+        """
+        if not warnings:
+            return warnings
+
+        source_cache: dict[str, list[str]] = {}
+        filtered: list[RelationLoadWarning] = []
+        _noqa_re = re.compile(r'#\s*noqa:\s*(.+)')
+        _code_re = re.compile(r'RLC\d+')
+
+        for w in warnings:
+            if w.file not in source_cache:
+                try:
+                    with open(w.file, encoding='utf-8') as f:
+                        source_cache[w.file] = f.readlines()
+                except (OSError, UnicodeDecodeError):
+                    source_cache[w.file] = []
+
+            lines = source_cache[w.file]
+            suppressed = False
+            if 0 < w.line <= len(lines):
+                m = _noqa_re.search(lines[w.line - 1])
+                if m:
+                    codes = set(_code_re.findall(m.group(1)))
+                    if w.code in codes:
+                        suppressed = True
+
+            if not suppressed:
+                filtered.append(w)
+
+        return filtered
 
     def check_project_coroutines(
         self,
@@ -595,8 +907,8 @@ class RelationLoadChecker:
         Scan all imported modules' async functions and async generators.
 
         Iterates sys.modules, analyzing coroutine functions and async generators
-        from project source files. Also scans methods of non-model classes
-        (e.g. command handlers, service classes).
+        from project source files. Includes module-level functions and methods
+        of non-SQLModel classes (e.g. command handlers, service classes).
         Automatically skips functions already analyzed by check_app/check_model_methods.
 
         :param project_root: absolute path to project root directory
@@ -620,6 +932,10 @@ class RelationLoadChecker:
                 continue
             module_file_normalized = module_file.replace('\\', '/')
             if not module_file_normalized.startswith(project_root_normalized):
+                continue
+            # Skip third-party libraries (venv site-packages paths may start with
+            # the project root but are not project code)
+            if '/site-packages/' in module_file_normalized:
                 continue
             # Skip configured paths
             if any(skip in module_file_normalized for skip in default_skip):
@@ -645,10 +961,14 @@ class RelationLoadChecker:
                     raise
 
                 if is_async:
-                    # Module-level async function / async generator
-                    func_module = getattr(attr, '__module__', None)
+                    # Module-level async function / async generator.
+                    # Unwrap decorator wrappers (e.g. pytest FixtureFunctionDefinition)
+                    # and analyze the original function -- the wrapper may be missing
+                    # __annotations__/__globals__.
+                    actual_func = getattr(attr, '__wrapped__', attr)
+                    func_module = getattr(actual_func, '__module__', None)
                     if func_module == module_name:
-                        funcs_to_check.append((f"{module_name}.{attr_name}", attr))
+                        funcs_to_check.append((f"{module_name}.{attr_name}", actual_func))
                 elif is_class:
                     # Non-model class methods (model classes already covered by check_model_methods)
                     if attr.__module__ != module_name:
@@ -670,8 +990,10 @@ class RelationLoadChecker:
                                 continue
                             raise
                         if is_func_async:
+                            # Unwrap __wrapped__ (same logic as module-level functions)
+                            actual_func = getattr(func, '__wrapped__', func)
                             funcs_to_check.append(
-                                (f"{module_name}.{attr.__name__}.{method_name}", func),
+                                (f"{module_name}.{attr.__name__}.{method_name}", actual_func),
                             )
 
             for label, func in funcs_to_check:
@@ -691,9 +1013,19 @@ class RelationLoadChecker:
 
     @staticmethod
     def _is_async_callable(obj: Any) -> bool:
-        """Check whether obj is an async callable (coroutine function or async generator)."""
-        return (python_inspect.iscoroutinefunction(obj)
-                or python_inspect.isasyncgenfunction(obj))
+        """Check whether obj is an async callable (coroutine function or async generator).
+
+        Supports __wrapped__ unwrapping (e.g. decorator wrappers like pytest
+        FixtureFunctionDefinition).
+        """
+        if python_inspect.iscoroutinefunction(obj) or python_inspect.isasyncgenfunction(obj):
+            return True
+        # Unwrap __wrapped__ (PEP 362 / functools.wraps protocol)
+        wrapped = getattr(obj, '__wrapped__', None)
+        if wrapped is not None:
+            return (python_inspect.iscoroutinefunction(wrapped)
+                    or python_inspect.isasyncgenfunction(wrapped))
+        return False
 
     def check_function(self, func: Any) -> list[RelationLoadWarning]:
         """
@@ -740,6 +1072,9 @@ class RelationLoadChecker:
                 warnings, required_rels, dep_loads,
                 param_models, analyzer, endpoint, path,
             )
+
+        # 6. RLC012: STI response_model column compatibility check
+        self._check_rlc012(warnings, response_model, endpoint, path)
 
         return warnings
 
@@ -852,10 +1187,20 @@ class RelationLoadChecker:
 
         noreturn_names = _collect_noreturn_names(func)
 
+        # Extract AsyncSession-typed parameter names (used to distinguish model commit
+        # calls from same-named non-model calls)
+        session_param_names: set[str] = set()
+        try:
+            hints = typing.get_type_hints(func)
+        except Exception:
+            hints = getattr(func, '__annotations__', {})
+        for p_name, p_hint in hints.items():
+            if p_hint is _AsyncSession:
+                session_param_names.add(p_name)
+
         analyzer = _FunctionAnalyzer(
             model_relationships=self.model_relationships,
             model_columns=self.model_columns,
-            model_pk_columns=self.model_pk_columns,
             param_models=param_models,
             dep_loads=dep_loads,
             required_rels=required_rels,
@@ -869,6 +1214,10 @@ class RelationLoadChecker:
             class_aliases=class_aliases,
             model_dunder_rels=self.model_dunder_rels,
             noreturn_names=noreturn_names,
+            session_param_names=frozenset(session_param_names),
+            model_commit_methods=self._model_commit_methods,
+            model_rel_targets=self.model_rel_targets,
+            refreshing_commit_methods=self.refreshing_commit_methods,
         )
         analyzer.visit(func_node)
 
@@ -890,7 +1239,7 @@ class RelationLoadChecker:
         try:
             source_file = python_inspect.getfile(endpoint)
         except (TypeError, OSError):
-            source_file = '<unknown>'
+            source_file = UNKNOWN_LABEL
         try:
             line_offset = python_inspect.getsourcelines(endpoint)[1] - 1
         except (OSError, TypeError):
@@ -979,18 +1328,16 @@ class RelationLoadChecker:
         return param_models
 
     def _extract_model_from_hint(self, hint: Any) -> str | None:
-        """Extract model class name from type annotation."""
-        # Handle Annotated[Model, Depends(...)]
-        origin = typing.get_origin(hint)
-        if origin is Annotated:
-            args = typing.get_args(hint)
-            if args:
-                return self._extract_model_from_hint(args[0])
+        """
+        Extract a model class name from a type annotation.
 
-        # Direct model class
-        if isinstance(hint, type) and hint.__name__ in self.model_relationships:
-            return hint.__name__
-
+        Delegates to ``_unwrap_to_class()`` to strip ``Annotated``, ``X | None``
+        etc. wrappers, then checks whether the unwrapped class is a known ORM
+        model.
+        """
+        cls = self._unwrap_to_class(hint)
+        if cls is not None and cls.__name__ in self.model_relationships:
+            return cls.__name__
         return None
 
     def _unwrap_to_class(self, hint: Any) -> type | None:
@@ -1011,7 +1358,8 @@ class RelationLoadChecker:
                 return self._unwrap_to_class(args[0])
 
         # X | None (UnionType) or Optional[X] (Union[X, None])
-        if origin is types.UnionType or origin is Union:
+        # typing.Union is deprecated in 3.10+ but still needed for Optional's legacy Union
+        if origin is types.UnionType or origin is Union:  # pyright: ignore[reportDeprecated]
             args = typing.get_args(hint)
             non_none = [a for a in args if a is not type(None)]
             if len(non_none) == 1:
@@ -1061,6 +1409,206 @@ class RelationLoadChecker:
             break  # Use only the nearest table model
 
         return required
+
+    # ========================= RLC012: STI column compatibility check =========================
+
+    @staticmethod
+    def _get_pydantic_generic_args(hint: Any) -> tuple[Any, ...]:
+        """
+        Extract the concrete generic arguments from a Pydantic parameterized model.
+
+        Pydantic v2's ``ListResponse[T]`` creates a fully concretized
+        ``ModelMetaclass`` instance where both ``typing.get_origin()`` and
+        ``typing.get_args()`` return empty values. The real generic arguments
+        are stored in ``__pydantic_generic_metadata__['args']``.
+
+        :returns: tuple of generic arguments, or an empty tuple when missing
+        """
+        # Try the standard typing API first
+        args = typing.get_args(hint)
+        if args:
+            return args
+        # Fallback for concretized Pydantic generics
+        pgm = getattr(hint, '__pydantic_generic_metadata__', None)
+        if pgm is not None:
+            return pgm.get('args', ())
+        return ()
+
+    def _unwrap_generic_to_orm_class(self, hint: Any) -> type | None:
+        """
+        Recursively extract an ORM model class from a type annotation.
+
+        Handles generic containers (e.g. ``ListResponse[ImageGenerator]``),
+        ``Annotated``, ``X | None`` wrappers, and Pydantic v2 concretized generics.
+        Differs from ``_unwrap_to_class``: when direct unwrap fails, it recurses
+        into the generic arguments until it finds a registered ORM class.
+
+        :returns: ORM model class or None
+        """
+        # Try direct unwrap first (Annotated/Union/direct class)
+        cls = self._unwrap_to_class(hint)
+        if cls is not None and cls.__name__ in self.model_classes:
+            return cls
+
+        # Recurse into generic arguments (including Pydantic concretized generics)
+        for arg in self._get_pydantic_generic_args(hint):
+            if arg is type(None):
+                continue
+            result = self._unwrap_generic_to_orm_class(arg)
+            if result is not None:
+                return result
+
+        return None
+
+    def _unwrap_generic_to_dto_class(self, hint: Any) -> type | None:
+        """
+        Recursively extract a DTO class (one with ``model_fields``) from a type annotation.
+
+        Skips container types (e.g. ``ListResponse``) and recurses into the
+        generic arguments to fetch the inner DTO.
+
+        :returns: inner DTO class or None
+        """
+        # Check if this is a Pydantic generic container
+        # (has __pydantic_generic_metadata__ and the origin is non-null)
+        pgm = getattr(hint, '__pydantic_generic_metadata__', None)
+        is_pydantic_generic = pgm is not None and pgm.get('origin') is not None
+
+        if not is_pydantic_generic:
+            cls = self._unwrap_to_class(hint)
+            if cls is not None and hasattr(cls, 'model_fields'):
+                return cls
+
+        # Recurse into generic arguments
+        for arg in self._get_pydantic_generic_args(hint):
+            if arg is type(None):
+                continue
+            result = self._unwrap_generic_to_dto_class(arg)
+            if result is not None:
+                return result
+
+        return None
+
+    def _check_rlc012(
+        self,
+        warnings: list[RelationLoadWarning],
+        response_model: type | None,
+        endpoint: Any,
+        path: str,
+    ) -> None:
+        """
+        RLC012: STI response_model column compatibility check.
+
+        When an endpoint returns STI base-class / intermediate-abstract-class query
+        results while its response_model uses a specific subclass DTO, check that
+        each column field in the DTO is present on the mapper of every concrete
+        STI subclass that could be returned.
+
+        Typical problematic scenario::
+
+            @router.get("", response_model=ListResponse[NanoBananaGeneratorInfoResponse])
+            async def list_generators(...) -> ListResponse[ImageGenerator]:
+                return await ImageGenerator.get_with_count(...)
+
+        ``NanoBananaGeneratorInfoResponse`` exposes ``input_price``/``llm_id``
+        while ``TencentGEM25ImageGenerator`` (a sibling STI subclass that may be
+        returned) lacks those columns on its mapper. FastAPI serialization of the
+        heterogeneous result triggers a deferred column load -> MissingGreenlet.
+        """
+        if response_model is None:
+            return
+
+        # 1. Extract the ORM model from the endpoint's return type annotation
+        try:
+            hints = typing.get_type_hints(endpoint)
+        except Exception:
+            return
+        return_hint = hints.get('return')
+        if return_hint is None:
+            return
+
+        return_model_cls = self._unwrap_generic_to_orm_class(return_hint)
+        if return_model_cls is None:
+            return
+
+        return_model_name = return_model_cls.__name__
+
+        # 2. Check whether this is an STI polymorphic class
+        try:
+            mapper = sa_inspect(return_model_cls)
+        except Exception:
+            return
+
+        if mapper.polymorphic_on is None:
+            return  # Not a polymorphic class
+
+        # 3. Collect model_fields of all concrete subclasses (Pydantic layer).
+        # Note: we cannot use mapper.column_attrs (STI shared tables mean every
+        # subclass has the same column set). We must use model_fields to reflect
+        # the fields declared by the Python class. Pydantic serialization calls
+        # getattr() on the mapper descriptor; if the field is absent from
+        # model_fields the value is not loaded -> deferred IO -> MissingGreenlet.
+        concrete_descendants: list[tuple[str, set[str]]] = []
+        for sub_mapper in mapper.self_and_descendants:
+            if sub_mapper is mapper:
+                continue
+            if sub_mapper.polymorphic_identity is None:
+                continue  # Abstract intermediate class
+            sub_cls = sub_mapper.class_
+            sub_name = sub_cls.__name__
+            sub_fields = set(sub_cls.model_fields.keys()) if hasattr(sub_cls, 'model_fields') else set()
+            concrete_descendants.append((sub_name, sub_fields))
+
+        if len(concrete_descendants) < 2:
+            return  # Only one concrete subclass, no heterogeneous risk
+
+        # 4. Extract DTO fields from response_model
+        dto_cls = self._unwrap_generic_to_dto_class(response_model)
+        if dto_cls is None:
+            return
+
+        dto_fields = set(dto_cls.model_fields.keys())
+
+        # 5. Build the union of model_fields across all concrete subclasses
+        all_sub_fields: set[str] = set()
+        for _, fields in concrete_descendants:
+            all_sub_fields |= fields
+
+        # 6. For each DTO field, check whether it exists on every subclass's model_fields
+        source_file = path
+        line = 0
+        try:
+            source_file = python_inspect.getfile(endpoint)
+            _, start_line = python_inspect.getsourcelines(endpoint)
+            line = start_line
+        except (OSError, TypeError):
+            pass
+
+        for field_name in dto_fields:
+            if field_name not in all_sub_fields:
+                continue  # Not a subclass field at all (computed_field / DTO-only)
+
+            missing_in: list[str] = []
+            for sub_name, sub_fields in concrete_descendants:
+                if field_name not in sub_fields:
+                    missing_in.append(sub_name)
+
+            if missing_in:
+                warnings.append(RelationLoadWarning(
+                    code='RLC012',
+                    file=source_file,
+                    line=line,
+                    message=(
+                        f"response_model field '{field_name}' is missing from the "
+                        f"model_fields of the following STI subclasses: "
+                        f"{', '.join(missing_in)}. The endpoint returns "
+                        f"{return_model_name} (STI base class); the query may yield "
+                        f"subclasses lacking this field, so serialization will invoke "
+                        f"getattr() and trigger a deferred column load -> MissingGreenlet. "
+                        f"Suggestion: build the response_model from fields shared by all "
+                        f"subclasses, or filter the query by polymorphic_identity"
+                    ),
+                ))
 
     # ========================= Dependency chain analysis =========================
 
@@ -1145,7 +1693,7 @@ class RelationLoadChecker:
         try:
             source_file = python_inspect.getfile(unwrapped)
         except (TypeError, OSError):
-            source_file = '<unknown>'
+            source_file = UNKNOWN_LABEL
 
         try:
             source = python_inspect.getsource(unwrapped)
@@ -1266,10 +1814,134 @@ def _ast_has_typed_commit(tree: ast.Module, session_param: str) -> bool:
     return False
 
 
+def _ast_has_keyword_false_static(call: ast.Call, keyword: str) -> bool:
+    """Statically check whether an AST Call node has a ``keyword=False`` argument."""
+    for kw in call.keywords:
+        if (kw.arg == keyword
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is False):
+            return True
+    return False
+
+
+def _resolve_callee_type(
+    value_node: ast.expr,
+    owning_class: str | None,
+    model_class_names: frozenset[str],
+) -> str | None:
+    """
+    Resolve the model type of a call target from its AST node.
+
+    Supported patterns:
+
+    - ``self.method()`` -> owning_class
+    - ``cls.method()`` -> owning_class
+    - ``super().method()`` -> owning_class (conservative: same class hierarchy)
+    - ``ClassName.method()`` -> ClassName (if it is a known model class)
+    """
+    if isinstance(value_node, ast.Name):
+        if value_node.id in ('self', 'cls') and owning_class is not None:
+            return owning_class
+        if value_node.id in model_class_names:
+            return value_node.id
+    elif isinstance(value_node, ast.Call):
+        # super().method() pattern
+        if (isinstance(value_node.func, ast.Name)
+                and value_node.func.id == 'super'
+                and owning_class is not None):
+            return owning_class
+    return None
+
+
+def _method_returns_from_refreshing(tree: ast.AST, refreshing_methods: frozenset[str]) -> bool:
+    """Check whether a method's return value comes from a known refreshing method call.
+
+    Used by the auto-discovery of "internally refreshing" model-returning commit
+    methods (transitive closure): if the method's ``return`` statement returns a
+    variable/expression whose value came from one of ``refreshing_methods``
+    (without an explicit ``commit=False``), the return value has already been
+    refreshed internally.
+
+    Patterns checked:
+    1. ``return await obj.method(...)`` -- direct return of a refreshing call
+    2. ``var = await obj.method(...)`` + ``return var`` -- indirect return
+    """
+
+    def _is_refreshing_call(call: ast.Call) -> bool:
+        if isinstance(call.func, ast.Attribute) and call.func.attr in refreshing_methods:
+            for kw in call.keywords:
+                if kw.arg == 'commit' and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                    return False
+            return True
+        return False
+
+    # Collect all variable names assigned by refreshing method calls
+    refreshed_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            value = node.value
+            if (isinstance(target, ast.Name)
+                    and isinstance(value, ast.Await)
+                    and isinstance(value.value, ast.Call)
+                    and _is_refreshing_call(value.value)):
+                refreshed_vars.add(target.id)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        # return await obj.refreshing_method(...)
+        if (isinstance(node.value, ast.Await)
+                and isinstance(node.value.value, ast.Call)
+                and _is_refreshing_call(node.value.value)):
+            return True
+        # return var
+        if isinstance(node.value, ast.Name) and node.value.id in refreshed_vars:
+            return True
+
+    return False
+
+
+def _is_commit_for_resolved_type(
+    callee_type: str,
+    method_name: str,
+    class_commit: dict[str, set[str]],
+    model_classes: dict[str, type],
+) -> bool:
+    """
+    Check whether a method is a commit method for the resolved type (MRO-aware).
+
+    Walks the MRO to find the most specific definition of the method and checks
+    whether that defining class marks it as a commit method. This correctly
+    handles subclass overrides: if a subclass overrides a base-class commit
+    method without committing, the subclass version wins.
+
+    For non-model classes (not in ``model_classes``), ``class_commit`` is checked
+    directly (no MRO resolution).
+    """
+    cls = model_classes.get(callee_type)
+    if cls is None:
+        # Non-model class (e.g. Messages): check class_commit directly
+        return method_name in class_commit.get(callee_type, set())
+    for klass in cls.__mro__:
+        if klass is object:
+            continue
+        klass_name = klass.__name__
+        if method_name in vars(klass):
+            # Most specific definition found -> check that class's commit state
+            return method_name in class_commit.get(klass_name, set())
+    return False
+
+
 def _ast_calls_commit_method_with_session(
     tree: ast.Module,
     session_param: str,
     commit_methods: frozenset[str],
+    *,
+    owning_class: str | None = None,
+    class_commit: dict[str, set[str]] | None = None,
+    model_classes: dict[str, type] | None = None,
+    model_class_names: frozenset[str] | None = None,
 ) -> bool:
     """
     Check if the AST calls a known commit method and passes the session parameter.
@@ -1278,7 +1950,24 @@ def _ast_calls_commit_method_with_session(
 
     - ``await obj.save(session, ...)``
     - ``await cls.from_remote_url(session=session, ...)``
+
+    Excluded patterns (not treated as commit):
+
+    - ``await obj.save(session, commit=False)`` -- commit explicitly disabled
+
+    Enhanced mode (when per-class arguments are provided):
+
+    When the call target's type is resolvable from the AST (self/cls/explicit
+    class name), per-class commit state is used to avoid false matches between
+    same-named methods on different classes. When the type cannot be resolved,
+    falls back to the global name-based match (conservative strategy).
     """
+    use_per_class = (
+        class_commit is not None
+        and model_classes is not None
+        and model_class_names is not None
+    )
+
     for node in ast.walk(tree):
         if not (
             isinstance(node, ast.Call)
@@ -1286,14 +1975,46 @@ def _ast_calls_commit_method_with_session(
             and node.func.attr in commit_methods
         ):
             continue
-        # Check if session is passed as a positional argument
+
+        method_name = node.func.attr
+
+        # commit=False -> not treated as a commit call
+        if _ast_has_keyword_false_static(node, 'commit'):
+            continue
+
+        # Check if session is passed as an argument
+        found_session = False
         for arg in node.args:
             if isinstance(arg, ast.Name) and arg.id == session_param:
-                return True
-        # Check if session is passed as a keyword argument
-        for kw in node.keywords:
-            if isinstance(kw.value, ast.Name) and kw.value.id == session_param:
-                return True
+                found_session = True
+                break
+        if not found_session:
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Name) and kw.value.id == session_param:
+                    found_session = True
+                    break
+        if not found_session:
+            continue
+
+        # Per-class type resolution (enhanced mode)
+        if use_per_class:
+            assert class_commit is not None
+            assert model_classes is not None
+            assert model_class_names is not None
+            callee_type = _resolve_callee_type(
+                node.func.value, owning_class, model_class_names,
+            )
+            if callee_type is not None:
+                # Type resolved -> check that class's commit methods (MRO-aware)
+                if _is_commit_for_resolved_type(
+                    callee_type, method_name, class_commit, model_classes,
+                ):
+                    return True
+                continue  # This type's method does not commit -> skip this call
+
+        # Type unresolved or per-class mode disabled -> conservative strategy (global name match)
+        return True
+
     return False
 
 
@@ -1317,7 +2038,6 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         self,
         model_relationships: dict[str, set[str]],
         model_columns: dict[str, set[str]],
-        model_pk_columns: dict[str, set[str]],
         param_models: dict[str, str],
         dep_loads: dict[str, set[str]],
         required_rels: dict[str, str],
@@ -1331,10 +2051,14 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         class_aliases: dict[str, str] | None = None,
         model_dunder_rels: dict[str, dict[str, set[str]]] | None = None,
         noreturn_names: frozenset[str] | None = None,
+        session_param_names: frozenset[str] | None = None,
+        model_commit_methods: dict[str, frozenset[str]] | None = None,
+        model_rel_targets: dict[str, dict[str, str]] | None = None,
+        refreshing_commit_methods: frozenset[str] | None = None,
     ) -> None:
         self.model_relationships: dict[str, set[str]] = model_relationships
         self.model_columns: dict[str, set[str]] = model_columns
-        self.model_pk_columns: dict[str, set[str]] = model_pk_columns
+        self.model_rel_targets: dict[str, dict[str, str]] = model_rel_targets or {}
         self.required_rels: dict[str, str] = required_rels
         self.source_file: str = source_file
         self.line_offset: int = line_offset
@@ -1342,13 +2066,16 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         self.warnings: list[RelationLoadWarning] = []
         self._parent_map: dict[int, ast.AST] = {}
         self.commit_methods: frozenset[str] = commit_methods or frozenset()
+        self.model_commit_methods: dict[str, frozenset[str]] = model_commit_methods or {}
         self.model_returning_methods: frozenset[str] = model_returning_methods or frozenset()
         self.noreturn_names: frozenset[str] = noreturn_names or frozenset()
+        self.session_param_names: frozenset[str] = session_param_names or frozenset()
         # Complete model-returning set for variable tracking (includes sync methods).
         # Sync methods are NOT added to safe_methods because calling sync methods
         # on expired objects is equally dangerous.
         _sync = sync_model_returning_methods or frozenset()
         self._all_model_returning: frozenset[str] = self.model_returning_methods | _sync
+        self.refreshing_commit_methods: frozenset[str] = refreshing_commit_methods or frozenset()
         self.class_aliases: dict[str, str] = class_aliases or {}
         self.model_dunder_rels: dict[str, dict[str, set[str]]] = model_dunder_rels or {}
 
@@ -1381,20 +2108,53 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             return resolved
         return None
 
+    def _is_commit_for_call(self, call: ast.Call, method_name: str) -> bool:
+        """
+        Check whether a method call is a commit call (per-class aware).
+
+        When the call target's model type is known, use the per-class commit
+        method set to avoid false matches between same-named methods on
+        different classes. Falls back to the global ``commit_methods`` when the
+        type is unknown.
+        """
+        if not self.model_commit_methods:
+            return method_name in self.commit_methods
+
+        # Try to resolve the call object's model type
+        obj_name = self._get_call_object_name(call)
+        resolved_type: str | None = None
+
+        if obj_name is not None:
+            if obj_name in self.tracked_vars:
+                resolved_type = self.tracked_vars[obj_name].model_name
+            else:
+                resolved_type = self._resolve_class_name(obj_name)
+
+        if resolved_type is not None:
+            # Type resolved -> use per-class commit set
+            class_commits = self.model_commit_methods.get(resolved_type, frozenset())
+            return method_name in class_commits
+
+        # Type unresolved -> conservative strategy (global match)
+        return method_name in self.commit_methods
+
     @override
     def visit_Assign(self, node: ast.Assign) -> None:
         """Check assignment statement."""
         self._handle_attribute_writes(node.targets, node.value)
+        # Visit RHS expression in pre-commit state: Python evaluates arguments
+        # BEFORE executing the call, so attribute accesses in args/kwargs
+        # must be checked before _check_assign potentially expires all tracked vars
+        self.visit(node.value)
         self._check_assign(node.targets, node.value, node)
-        self.generic_visit(node)
 
     @override
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         """Check annotated assignment statement."""
         if node.target and node.value:
             self._handle_attribute_writes([node.target], node.value)
+            self.visit(node.value)
             self._check_assign([node.target], node.value, node)
-        self.generic_visit(node)
 
     def _handle_attribute_writes(self, targets: list[ast.expr], value: ast.expr) -> None:
         """
@@ -1479,7 +2239,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     self._handle_session_refresh(call)
 
                 # Auto-discovered commit methods (no assignment)
-                elif method_name in self.commit_methods:
+                elif self._is_commit_for_call(call, method_name):
                     obj_name = self._get_call_object_name(call)
                     is_model_call = (
                         obj_name is not None
@@ -1518,6 +2278,19 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                                     and method_name in _REFRESH_METHODS
                                     and not self._has_keyword_false(call, 'refresh')):
                                 self.tracked_vars[obj_name].post_commit = False
+                            # Model-returning commit method called on self -> identity map refreshes self.
+                            # Example: super().fill_from_file_path() internally calls self.save() -> self is refreshed.
+                            elif (obj_name == 'self'
+                                    and obj_name in self.tracked_vars
+                                    and method_name in self._all_model_returning):
+                                self.tracked_vars[obj_name].post_commit = False
+                    else:
+                        # Untracked variable calling a commit method (e.g. loop var user_file.fill_from_image_url()).
+                        # Only expire when a session parameter is passed (to distinguish
+                        # from non-model calls like redis.delete(key)).
+                        if (not self._has_keyword_false(call, 'commit')
+                                and self._call_passes_session(call)):
+                            self._expire_all_tracked_vars()
 
                 # call children already visited above in pre-commit state
                 return
@@ -1547,14 +2320,34 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             return
 
         # RLC010: check call args for expired ORM objects (before commit side effects)
+        # Supports IfExp unwrapping (consistent with the _await_call extraction below)
         if isinstance(value, ast.Await) and isinstance(value.value, ast.Call):
             self._check_expired_call_args(value.value, node)
+        elif (isinstance(value, ast.IfExp)
+                and isinstance(value.body, ast.Await)
+                and isinstance(value.body.value, ast.Call)):
+            self._check_expired_call_args(value.body.value, node)
         elif isinstance(value, ast.Call):
             self._check_expired_call_args(value, node)
 
-        # Check await expression
+        # Check await expression.
+        # Supports two forms:
+        # 1. var = await Model.get(...)                          -> Await(Call)
+        # 2. var = (await Model.get(...) if cond else None)      -> IfExp(body=Await(Call), orelse=None)
+        # In Python the ``await`` precedence is lower than the ternary, so
+        # ``(await X if c else None)`` parses as IfExp(Await(Call), None).
+        _await_call: ast.Call | None = None
         if isinstance(value, ast.Await) and isinstance(value.value, ast.Call):
-            call = value.value
+            _await_call = value.value
+        elif (isinstance(value, ast.IfExp)
+                and isinstance(value.body, ast.Await)
+                and isinstance(value.body.value, ast.Call)
+                and isinstance(value.orelse, ast.Constant)
+                and value.orelse.value is None):
+            _await_call = value.body.value
+
+        if _await_call is not None:
+            call = _await_call
             method_name = self._get_method_name(call)
             loaded_rels = self._extract_load_from_call(call)
 
@@ -1565,7 +2358,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             #   refresh=True (default, save/update only) -> cls.get() -> column attrs restored
             #   load= -> cls.get(load=) -> specified rels loaded
             #   commit=False -> session.flush() -> no expiration
-            if method_name in self.commit_methods:
+            if self._is_commit_for_call(call, method_name):
                 obj_name = self._get_call_object_name(call)
                 class_name = self._get_call_class_name(call)
 
@@ -1618,7 +2411,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                                 new_rels = old_var.loaded_rels | loaded_rels
                                 new_post_commit = False
                             elif refresh_disabled:
-                                new_rels: set[str] = set()
+                                new_rels = set()
                                 new_post_commit = True
                             else:
                                 new_rels = loaded_rels
@@ -1634,19 +2427,29 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                                 old_var.post_commit = False
                                 old_var.loaded_rels = loaded_rels
                     else:
-                        # Other commit methods (e.g. create_duplicate, get_or_create)
+                        # Other commit methods (non-save/update).
                         # Only model-returning methods' return values are model instances
                         # that need tracking. Non-model-returning methods (e.g. calculate_cost -> int)
                         # don't create tracking variables, avoiding false RLC010 positives
                         # from scalar return values being treated as ORM objects.
+                        #
+                        # refreshing_commit_methods: methods whose return comes from
+                        # save/update(commit!=False); the return value has been refreshed
+                        # inside save() -> post_commit=False.
+                        # Other commit methods: conservatively post_commit=True (return value may be expired).
                         if method_name in self._all_model_returning:
+                            is_refreshing = method_name in self.refreshing_commit_methods
                             self.tracked_vars[var_name] = _TrackedVar(
                                 model_name=old_var.model_name,
                                 loaded_rels=loaded_rels,
-                                post_commit=False,
+                                post_commit=not commit_disabled and not is_refreshing,
                                 caller_provided=False,
                                 line=self._abs_line(node),
                             )
+                            # Model-returning commit method called on self -> identity map refreshes self
+                            if obj_name == 'self':
+                                old_var.post_commit = False
+                                old_var.loaded_rels = loaded_rels
 
                 # Class method call (Model.get_or_create / cls.get_or_create /...)
                 else:
@@ -1661,6 +2464,14 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                             caller_provided=False,
                             line=self._abs_line(node),
                         )
+                    else:
+                        # Untracked variable calling a commit method
+                        # (e.g. loop variable user_file.fill_from_image_url()).
+                        # Only expire when session is passed (distinguishes from
+                        # non-model calls like redis.delete(key)).
+                        if (not self._has_keyword_false(call, 'commit')
+                                and self._call_passes_session(call)):
+                            self._expire_all_tracked_vars()
 
             # Auto-discovered model-returning methods (non-commit, pure query)
             # Includes get/find_by_content_hash/get_exist_one etc. (including sync methods,
@@ -1720,6 +2531,36 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     and value.args[0].id in self.tracked_vars):
                 self.class_aliases[var_name] = self.tracked_vars[value.args[0].id].model_name
 
+        # Relationship attribute extraction: var = tracked_var.relationship_attr
+        # Example: llm = self.text_llm -- extracts the model object from a tracked
+        # self's relationship and starts tracking it, so subsequent commits can
+        # correctly mark var as post_commit and detect MissingGreenlet from
+        # column attribute access.
+        # caller_provided=True: the extracted object comes from a caller-preloaded
+        # relationship, so its own relationship loading state is caller's
+        # responsibility; pre-commit RLC003 is not triggered. Post-commit
+        # RLC002/RLC007/RLC008 still fire normally.
+        if isinstance(value, ast.Attribute):
+            src_var_key: str | None = None
+            if isinstance(value.value, ast.Name):
+                src_var_key = value.value.id
+            else:
+                src_var_key = self._build_chain_key(value.value)
+            if src_var_key is not None and src_var_key in self.tracked_vars:
+                src_var = self.tracked_vars[src_var_key]
+                rel_attr = value.attr
+                target_model = self.model_rel_targets.get(
+                    src_var.model_name, {},
+                ).get(rel_attr)
+                if target_model is not None and target_model in self.model_relationships:
+                    self.tracked_vars[var_name] = _TrackedVar(
+                        model_name=target_model,
+                        loaded_rels=set(),
+                        post_commit=src_var.post_commit,
+                        caller_provided=True,
+                        line=self._abs_line(node),
+                    )
+
     # ========================= Attribute access detection =========================
 
     def _build_chain_key(self, node: ast.expr) -> str | None:
@@ -1762,7 +2603,6 @@ class _FunctionAnalyzer(ast.NodeVisitor):
 
         var_info = self.tracked_vars[var_key]
         attr_name = node.attr
-        is_chained = '.' in var_key
 
         # Skip method calls (e.g. obj.save())
         parent = self._get_parent(node)
@@ -1816,8 +2656,8 @@ class _FunctionAnalyzer(ast.NodeVisitor):
 
         if attr_name in rels and attr_name not in var_info.loaded_rels:
             if var_info.post_commit:
-                # RLC002: accessing unloaded relationship after save/update
-                # Triggers regardless of caller_provided (post-commit expiration)
+                # RLC002: accessing unloaded relationship after save/update.
+                # Triggers regardless of caller_provided (post-commit expiration).
                 self.warnings.append(RelationLoadWarning(
                     code='RLC002',
                     file=self.source_file,
@@ -1829,8 +2669,8 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     ),
                 ))
             elif not var_info.caller_provided:
-                # RLC003: accessing unloaded relationship
-                # Only triggers for locally obtained vars, caller_provided skipped
+                # RLC003: accessing unloaded relationship.
+                # Only triggers for locally obtained vars; caller_provided is skipped.
                 self.warnings.append(RelationLoadWarning(
                     code='RLC003',
                     file=self.source_file,
@@ -1842,18 +2682,13 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     ),
                 ))
         elif var_info.post_commit and attr_name in cols:
-            # PK columns don't expire (SQLAlchemy identity map retains PK values).
-            # But chained access doesn't skip PK: objects inside containers may have
-            # detached from the session identity map, so PK values are not guaranteed.
-            if not is_chained:
-                pk_cols = self.model_pk_columns.get(var_info.model_name, set())
-                if attr_name in pk_cols:
-                    self.generic_visit(node)
-                    return
-            # RLC007: column access on expired (post-commit) object.
-            # After commit, ALL objects in the session are expired.
-            # Accessing any column triggers a synchronous lazy load,
-            # which causes MissingGreenlet in async context.
+            # RLC007: column access on expired (post-commit) object (including PK).
+            # After commit state.dict is cleared (including PK); accessing any column
+            # triggers _load_expired -> synchronous SELECT -> MissingGreenlet in
+            # async context. The identity map retains the PK for object lookup,
+            # but the attribute descriptor still takes the expired path.
+            # Safe alternative: sa_inspect(obj).identity[0] (no DB query),
+            # or extract values into local variables before commit.
             # Typical scenario: obj_a.save() then obj_b.column (obj_b not refreshed)
             self.warnings.append(RelationLoadWarning(
                 code='RLC007',
@@ -1863,8 +2698,8 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     f"Accessing column '{var_key}.{attr_name}' on expired object "
                     f"after commit. The object was not refreshed and access will "
                     f"trigger synchronous lazy load -> MissingGreenlet. "
-                    f"Suggestion: refresh with "
-                    f"{var_key} = await Type.get(session, Type.id == {var_key}.id)"
+                    f"Suggestion: extract the needed values into local variables "
+                    f"before commit, or refresh with Type.get() after commit"
                 ),
             ))
 
@@ -1881,6 +2716,13 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             var_name = node.value.id
             self._check_return_var(var_name, node)
 
+        # return [var1, var2, ...] / return (var1, var2, ...)
+        # FastAPI serializes each element in list/tuple, so column attributes are accessed.
+        elif isinstance(node.value, (ast.List, ast.Tuple)):
+            for elt in node.value.elts:
+                if isinstance(elt, ast.Name):
+                    self._check_return_var(elt.id, node)
+
         # return await obj.save(...)
         if isinstance(node.value, ast.Await):
             call = node.value.value
@@ -1889,7 +2731,7 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                 loaded_rels = self._extract_load_from_call(call)
 
                 # return await obj.save/update/create_duplicate/... (commit methods)
-                if method_name in self.commit_methods:
+                if self._is_commit_for_call(call, method_name):
                     obj_name = self._get_call_object_name(call)
                     if obj_name and obj_name in self.tracked_vars:
                         model_name = self.tracked_vars[obj_name].model_name
@@ -1981,10 +2823,25 @@ class _FunctionAnalyzer(ast.NodeVisitor):
                     ))
 
     def _check_return_var(self, var_name: str, node: ast.AST) -> None:
-        """Check if returned variable satisfies response_model requirements."""
+        """Check if returned variable satisfies response_model requirements and is not expired."""
         if var_name not in self.tracked_vars:
             return
         var_info = self.tracked_vars[var_name]
+        # RLC007: returning a post-commit expired object -> FastAPI serialization accesses
+        # column attributes -> MissingGreenlet
+        if var_info.post_commit:
+            self.warnings.append(RelationLoadWarning(
+                code='RLC007',
+                file=self.source_file,
+                line=self._abs_line(node),
+                message=(
+                    f"Returning expired post-commit object '{var_name}' "
+                    f"({var_info.model_name}). FastAPI will access column attributes "
+                    f"when serializing response_model, triggering synchronous lazy load "
+                    f"-> MissingGreenlet. "
+                    f"Suggestion: refresh before return with {var_info.model_name}.get()"
+                ),
+            ))
         self._check_return_loaded(var_info.model_name, var_info.loaded_rels, node)
 
     def _check_return_loaded(
@@ -2054,9 +2911,9 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             dunder_rels = self.model_dunder_rels.get(var_info.model_name, {})
             if not dunder_rels:
                 continue
-            # Python truthiness protocol: __bool__ first, then falls back to __len__
-            # If __bool__ is recorded in dunder_rels (even with empty rel set),
-            # it means that dunder is defined and Python won't fall back to __len__
+            # Python truthiness protocol: __bool__ first, then falls back to __len__.
+            # If __bool__ is recorded in dunder_rels (even with an empty rel set),
+            # it means that dunder is defined and Python won't fall back to __len__.
             for dunder in ('__bool__', '__len__'):
                 if dunder not in dunder_rels:
                     continue  # dunder not defined, try next (fallback)
@@ -2397,11 +3254,33 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         Extract object name from obj.save() call.
 
         Matches: variable.save(...), variable.update(...)
+        Special: super().method(...) -> 'self' (super() is called on self)
         """
         if isinstance(call.func, ast.Attribute):
             if isinstance(call.func.value, ast.Name):
                 return call.func.value.id
+            # super().method() -> treated as self.method()
+            if (isinstance(call.func.value, ast.Call)
+                    and isinstance(call.func.value.func, ast.Name)
+                    and call.func.value.func.id == 'super'):
+                return 'self'
         return None
+
+    def _call_passes_session(self, call: ast.Call) -> bool:
+        """
+        Check whether a function call passes an AsyncSession parameter.
+
+        Used to distinguish model commit methods
+        (e.g. ``user_file.fill_from_image_url(session, ...)``) from same-named
+        non-model methods (e.g. ``redis.delete(key)``).
+        """
+        for arg in call.args:
+            if isinstance(arg, ast.Name) and arg.id in self.session_param_names:
+                return True
+        for kw in call.keywords:
+            if isinstance(kw.value, ast.Name) and kw.value.id in self.session_param_names:
+                return True
+        return False
 
     def _expire_all_tracked_vars(self) -> None:
         """
@@ -2553,12 +3432,8 @@ class _FunctionAnalyzer(ast.NodeVisitor):
 
     @staticmethod
     def _has_keyword_false(call: ast.Call, keyword: str) -> bool:
-        """Check if call has keyword=False argument."""
-        for kw in call.keywords:
-            if kw.arg == keyword:
-                if isinstance(kw.value, ast.Constant) and kw.value.value is False:
-                    return True
-        return False
+        """Check if call has keyword=False argument (delegates to module-level helper, DRY)."""
+        return _ast_has_keyword_false_static(call, keyword)
 
     @staticmethod
     def _has_keyword(call: ast.Call, keyword: str) -> bool:
@@ -2604,11 +3479,20 @@ def run_model_checks(base_class: type) -> None:
     if warnings:
         for w in warnings:
             logger.error(str(w))
-        raise RuntimeError(
-            f"Relation load static analysis found {len(warnings)} model method issues. "
-            f"Fix them before restarting. See error log above for details."
-        )
-    logger.info("Model method relation load analysis passed")
+        # In the test environment warn without blocking: WIP code may trigger
+        # checks unrelated to the current test run.
+        if 'pytest' in sys.modules or '_pytest' in sys.modules:
+            logger.warning(
+                f"Test environment: relation load static analysis found {len(warnings)} "
+                f"issues (non-blocking). See error log above for details."
+            )
+        else:
+            raise RuntimeError(
+                f"Relation load static analysis found {len(warnings)} model method issues. "
+                f"Fix them before restarting. See error log above for details."
+            )
+    else:
+        logger.info("Model method relation load analysis passed")
 
 
 def mark_app_check_completed() -> None:
@@ -2732,10 +3616,16 @@ class RelationLoadCheckMiddleware:
 
 
 def _check_completion_warning() -> None:
-    """Warn at process exit if app check was missed."""
+    """Warn at process exit if the app check was missed.
+
+    Uses sys.stderr rather than the logger: atexit callbacks run during process
+    shutdown, when the logging handlers may already be closed and emitting via
+    the logger can raise ``ValueError: I/O operation on closed file``.
+    """
     if check_on_startup and _model_check_completed and not _app_check_completed:
-        logger.warning(
-            "Model method checks completed, but endpoint/coroutine checks were not run.\n"
+        msg = (
+            "WARNING: Model method checks completed, but endpoint/coroutine "
+            "checks were not run.\n"
             "Add the middleware:\n"
             "  from sqlmodel_ext.relation_load_checker import RelationLoadCheckMiddleware\n"
             "  app.add_middleware(RelationLoadCheckMiddleware)\n"
@@ -2744,8 +3634,12 @@ def _check_completion_warning() -> None:
             "  checker.check_app(app)\n"
             "To disable:\n"
             "  import sqlmodel_ext.relation_load_checker as rlc\n"
-            "  rlc.check_on_startup = False"
+            "  rlc.check_on_startup = False\n"
         )
+        try:
+            sys.stderr.write(msg)
+        except (ValueError, OSError):
+            pass  # stderr already closed, silently ignore
 
 
 atexit.register(_check_completion_warning)

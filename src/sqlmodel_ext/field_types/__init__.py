@@ -48,6 +48,9 @@ _NO_NULL_BYTE = StringConstraints(pattern=r'^[^\x00]*$')
 """PostgreSQL rejects null bytes in text columns. pydantic-core compiles the regex once with zero Python overhead."""
 
 # String length constraints
+Str16: TypeAlias = Annotated[str, Field(max_length=16), _NO_NULL_BYTE]
+"""16-character string field (trigger words, short tokens)"""
+
 Str24: TypeAlias = Annotated[str, Field(max_length=24), _NO_NULL_BYTE]
 """24-character string field"""
 
@@ -105,6 +108,9 @@ Text5K: TypeAlias = Annotated[str, Field(max_length=5000), _NO_NULL_BYTE]
 Text10K: TypeAlias = Annotated[str, Field(max_length=10000), _NO_NULL_BYTE]
 """10000-character text field"""
 
+Text32K: TypeAlias = Annotated[str, Field(max_length=32000), _NO_NULL_BYTE]
+"""32000-character text field"""
+
 Text60K: TypeAlias = Annotated[str, Field(max_length=60000), _NO_NULL_BYTE]
 """60000-character text field"""
 
@@ -127,17 +133,40 @@ Percentage: TypeAlias = Annotated[int, Field(ge=0, le=100)]
 INT32_MAX = 2147483647
 """Maximum value for PostgreSQL INTEGER column (2^31-1)"""
 
+INT64_MAX = 9223372036854775807
+"""Maximum value for PostgreSQL BIGINT column (2^63-1)"""
+
+JS_MAX_SAFE_INTEGER = 9007199254740991
+"""JavaScript ``Number.MAX_SAFE_INTEGER`` (2^53-1).
+
+Integers larger than this value lose precision when parsed by JavaScript
+clients. Use this as the upper bound for BigInt fields that cross the API
+boundary into a JSON body consumed by browsers.
+"""
+
 PositiveInt: TypeAlias = Annotated[int, Field(ge=1, le=INT32_MAX)]
 """Positive integer (1 to 2147483647, fits PostgreSQL INTEGER)"""
 
 NonNegativeInt: TypeAlias = Annotated[int, Field(ge=0, le=INT32_MAX)]
 """Non-negative integer (0 to 2147483647, fits PostgreSQL INTEGER)"""
 
-PositiveBigInt: TypeAlias = Annotated[int, Field(ge=1, sa_type=BigInteger)]
-"""Positive big integer (>=1, BigInteger storage)"""
+PositiveBigInt: TypeAlias = Annotated[int, Field(ge=1, le=JS_MAX_SAFE_INTEGER, sa_type=BigInteger)]
+"""Positive big integer (1 to JS_MAX_SAFE_INTEGER, stored as PostgreSQL BIGINT).
 
-NonNegativeBigInt: TypeAlias = Annotated[int, Field(ge=0, sa_type=BigInteger)]
-"""Non-negative big integer (>=0, BigInteger storage)"""
+The upper bound is JS_MAX_SAFE_INTEGER (2^53-1) rather than INT64_MAX so
+values serialized to JSON remain exact in JavaScript clients. Raise the
+bound to ``INT64_MAX`` explicitly in a custom alias if the field is never
+consumed by a browser.
+"""
+
+NonNegativeBigInt: TypeAlias = Annotated[int, Field(ge=0, le=JS_MAX_SAFE_INTEGER, sa_type=BigInteger)]
+"""Non-negative big integer (0 to JS_MAX_SAFE_INTEGER, stored as PostgreSQL BIGINT).
+
+See :data:`PositiveBigInt` for the rationale behind the JS_MAX_SAFE_INTEGER bound.
+"""
 
 PositiveFloat: TypeAlias = Annotated[float, Field(gt=0.0)]
 """Positive float (>0)"""
+
+NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0.0)]
+"""Non-negative float (>=0)"""

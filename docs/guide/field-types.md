@@ -8,6 +8,7 @@ sqlmodel-ext 提供了一系列预定义的字段类型，同时满足 Pydantic 
 
 | 类型 | 最大长度 | 典型用途 |
 |------|----------|---------|
+| `Str16` | 16 | 触发词、短 token |
 | `Str24` | 24 | 短编码 |
 | `Str32` | 32 | Token、哈希 |
 | `Str36` | 36 | UUID 字符串格式 |
@@ -34,11 +35,15 @@ class Article(SQLModelBase):
 |------|------|---------|
 | `Port` | 1 ~ 65535 | 网络端口 |
 | `Percentage` | 0 ~ 100 | 百分比 |
-| `PositiveInt` | >= 1 | 计数、数量 |
-| `NonNegativeInt` | >= 0 | 索引、计数器 |
+| `PositiveInt` | 1 ~ INT32_MAX（2³¹−1） | 计数、数量（对应 PostgreSQL INTEGER） |
+| `NonNegativeInt` | 0 ~ INT32_MAX | 索引、计数器 |
 | `PositiveFloat` | > 0.0 | 价格、重量 |
-| `PositiveBigInt` | >= 1（BigInteger） | 大整数 ID、时间戳 |
-| `NonNegativeBigInt` | >= 0（BigInteger） | 大整数计数器 |
+| `PositiveBigInt` | 1 ~ JS_MAX_SAFE_INTEGER（2⁵³−1） | 大整数 ID、时间戳（BigInteger 存储） |
+| `NonNegativeBigInt` | 0 ~ JS_MAX_SAFE_INTEGER | 大整数计数器（BigInteger 存储） |
+
+::: tip BigInt 的 JS_MAX_SAFE_INTEGER 上界
+`PositiveBigInt` / `NonNegativeBigInt` 的上界是 `JS_MAX_SAFE_INTEGER = 2⁵³ − 1`，而非数据库 BIGINT 的 `INT64_MAX = 2⁶³ − 1`。超过此值的整数会在 JavaScript 客户端解析 JSON 时丢失精度。如果你的 API 只面向非浏览器客户端，可自定义别名将上界改为 `INT64_MAX`。两个常量都从 `sqlmodel_ext` 导出。
+:::
 
 ```python
 from sqlmodel_ext import Port, Percentage

@@ -140,32 +140,48 @@ def _register_strenum_coercion_for_subclass(cls: type) -> None:
     Register SQLAlchemy load/refresh event listeners for StrEnum auto-coercion.
 
     STI subclass StrEnum columns may be stored as ``String()`` (or ``INTEGER`` etc.)
-    in the shared table. SQLAlchemy loads them as raw ``str`` (or ``int``) instead of
-    the declared StrEnum type. This registers event listeners that automatically coerce
-    raw values to the correct StrEnum type after loading.
+    in the shared table because ``_register_sti_columns`` downcasts mixed-type
+    columns to ``String`` when different subclasses share the same column name.
+    SQLAlchemy then loads those columns as raw ``str`` (or ``int``) rather than
+    the declared StrEnum type. This function ensures every StrEnum field always
+    carries the correct runtime type via two mechanisms:
 
-    Fields defined on the STI root class (the one that owns ``__tablename__``) use native
-    SQLAlchemy Enum columns and are loaded correctly — they are excluded from coercion.
+    1. SQLAlchemy load/refresh events -- applied whenever SA loads or refreshes
+       an instance from the database.
+    2. ``__init__`` wrapping -- SQLModel's ``table=True`` generated ``__init__``
+       bypasses Pydantic validation, so raw ``str`` values land in ``__dict__``
+       and must be coerced immediately after construction. Without this,
+       Pydantic emits ``PydanticSerializationUnexpectedValue`` warnings on
+       the first serialization.
+
+    Fields backed by a native ``SAEnum`` column are skipped: SQLAlchemy already
+    converts those values for us. Detection is done by inspecting the actual
+    column type via ``cls.__table__.columns[field_name].type``, NOT by the
+    older ``__tablename__`` heuristic. Column introspection is required for
+    multi-level STI hierarchies (e.g. ``LLM -> OpenAICompatibleLLM -> DouBaoLLM``)
+    where a mid-chain class introduces StrEnum fields stored as ``String()``
+    that must be coerced in every descendant.
     """
     model_fields = getattr(cls, 'model_fields', None)
     if not model_fields:
         return
 
-    # Find root class fields (use native SAEnum columns, no coercion needed)
-    root_fields: set[str] = set()
-    for base in cls.__mro__[1:]:
-        if '__tablename__' in base.__dict__ and hasattr(base, 'model_fields'):
-            root_fields = set(base.model_fields.keys())
-            break
+    # Fetch the table so we can introspect actual column storage types.
+    table: Table | None = getattr(cls, '__table__', None)
 
-    # Collect non-root StrEnum fields
+    # Collect StrEnum fields that need runtime coercion. Fields backed by a
+    # native SAEnum column are skipped because SQLAlchemy already handles the
+    # str <-> StrEnum conversion for them.
     strenum_fields: dict[str, type[StrEnum]] = {}
     for field_name, field_info in model_fields.items():
-        if field_name in root_fields:
-            continue
         enum_type = _extract_strenum_type(field_info.annotation)
-        if enum_type is not None:
-            strenum_fields[field_name] = enum_type
+        if enum_type is None:
+            continue
+        if table is not None:
+            col = table.columns.get(field_name)
+            if col is not None and isinstance(col.type, SAEnum):
+                continue
+        strenum_fields[field_name] = enum_type
 
     if not strenum_fields:
         return

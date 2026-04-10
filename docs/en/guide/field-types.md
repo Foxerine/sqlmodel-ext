@@ -8,6 +8,7 @@ Writing `name: Str64` simultaneously tells Pydantic to validate `max_length=64` 
 
 | Type | Max Length | Typical Use |
 |------|-----------|-------------|
+| `Str16` | 16 | Trigger words, short tokens |
 | `Str24` | 24 | Short codes |
 | `Str32` | 32 | Tokens, hashes |
 | `Str36` | 36 | UUID string format |
@@ -34,11 +35,19 @@ class Article(SQLModelBase):
 |------|-------|-------------|
 | `Port` | 1 ~ 65535 | Network ports |
 | `Percentage` | 0 ~ 100 | Percentages |
-| `PositiveInt` | >= 1 | Counts, quantities |
-| `NonNegativeInt` | >= 0 | Indices, counters |
+| `PositiveInt` | 1 ~ `INT32_MAX` (2³¹−1) | Counts, quantities (fits PostgreSQL INTEGER) |
+| `NonNegativeInt` | 0 ~ `INT32_MAX` | Indices, counters |
 | `PositiveFloat` | > 0.0 | Prices, weights |
-| `PositiveBigInt` | >= 1 (BigInteger) | Large integer IDs, timestamps |
-| `NonNegativeBigInt` | >= 0 (BigInteger) | Large integer counters |
+| `PositiveBigInt` | 1 ~ `JS_MAX_SAFE_INTEGER` (2⁵³−1) | Large integer IDs, timestamps (BigInteger storage) |
+| `NonNegativeBigInt` | 0 ~ `JS_MAX_SAFE_INTEGER` | Large integer counters (BigInteger storage) |
+
+::: tip BigInt is capped at `JS_MAX_SAFE_INTEGER`
+`PositiveBigInt` / `NonNegativeBigInt` use `JS_MAX_SAFE_INTEGER = 2⁵³ − 1`
+as their upper bound instead of `INT64_MAX = 2⁶³ − 1`. Integers larger
+than `JS_MAX_SAFE_INTEGER` lose precision when parsed by JavaScript
+clients. Define a custom alias with `le=INT64_MAX` if the field is never
+consumed by a browser. Both constants are exported from `sqlmodel_ext`.
+:::
 
 ```python
 from sqlmodel_ext import Port, Percentage

@@ -103,6 +103,36 @@ await Character.invalidate_by_id(id1, id2, id3)  # Multiple
 await Character.invalidate_all()
 ```
 
+## Cache invalidation on cascade deletes
+
+When a parent row is deleted, ``CachedTableBaseMixin`` follows one of two
+paths depending on the relationship's ``passive_deletes`` flag, and both paths
+correctly clean up the child model's cache.
+
+| `passive_deletes` | Who removes the children | How the cache is invalidated |
+|-------------------|--------------------------|------------------------------|
+| `False` (default) | SA issues one `DELETE` per child during flush | `persistent_to_deleted` event fires automatically |
+| `True` | The database `ON DELETE CASCADE` removes them silently | `delete()` pre-queries child IDs, then explicitly invalidates after `DELETE` |
+
+```python
+class User(CachedTableBaseMixin, UserBase, UUIDTableBaseMixin, table=True):
+    # passive_deletes=True: rely on the DB CASCADE; SA will not load children
+    files: list['UserFile'] = Relationship(
+        back_populates='user',
+        cascade_delete=True,
+        passive_deletes=True,
+    )
+```
+
+``passive_deletes=True`` is especially useful under high write pressure
+because it keeps SA from pulling thousands of child rows into memory. Older
+releases rejected this combination outright. Starting with 0.3.0, ``delete()``
+pre-queries the child IDs before the DB CASCADE runs, then explicitly calls
+``_invalidate_id_cache`` + ``_invalidate_query_caches`` on the target class,
+so the child model's Redis cache can never serve stale data. Condition-based
+deletes (``delete(condition=...)``) cannot enumerate parent IDs and therefore
+perform a model-level full invalidation on the target.
+
 ## Polymorphic Inheritance Support
 
 STI subclass caches automatically cascade to ancestor classes: when subclass data changes, ancestor class query caches are also cleaned.

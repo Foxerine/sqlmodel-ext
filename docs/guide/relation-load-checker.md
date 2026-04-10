@@ -1,5 +1,18 @@
 # 静态分析器
 
+::: warning 实验性功能（默认关闭）
+关系加载静态分析器从 0.3.0 起被视为**实验性功能**，默认 `check_on_startup = False`，所有自动检查入口（`run_model_checks`、`RelationLoadCheckMiddleware`、`atexit` 警告）都会立即短路、不会影响应用启动。
+
+分析器的 AST 规则是针对特定项目结构（FastAPI 端点、STI 继承约定、`save`/`update`/`delete` 命名等）调优的，在不同项目上**可能产生误报或解析失败**。只有在你确认项目结构与下面文档描述的假设一致后，才应显式启用：
+
+```python
+import sqlmodel_ext.relation_load_checker as rlc
+rlc.check_on_startup = True  # 显式启用，实验性
+```
+
+此模块的 API 不在 semver 稳定承诺范围内，后续版本可能调整规则或签名。
+:::
+
 静态分析器在**应用启动时**通过 AST 分析源码，提前发现可能导致 `MissingGreenlet` 错误的代码。
 
 ## 定位
@@ -20,25 +33,31 @@ flowchart LR
 | **RLC002** | `save()`/`update()` 之后访问关系但没用 `load=` |
 | **RLC003** | 访问关系但之前没有用 `load=` 加载（仅本地变量） |
 | **RLC005** | 依赖函数未预加载 `response_model` 需要的关系 |
-| **RLC007** | commit 后访问过期对象的列属性 |
-| **RLC008** | commit 后在过期对象上调用方法 |
-| **RLC009** | 类型注解解析错误（混用已解析类型和字符串前向引用） |
+| **RLC007** | commit 后访问过期对象的列属性（同步懒加载 → MissingGreenlet） |
+| **RLC008** | commit 后在过期对象上调用业务方法（方法内部可能访问过期列） |
+| **RLC010** | commit 后将过期 ORM 对象作为参数传给其他函数/方法 |
+| **RLC011** | 隐式 dunder（`if not obj:` → `__len__`、`for x in obj:` → `__iter__`）触发关系访问 |
+| **RLC012** | `response_model` 含 STI 子类专属列但端点返回基类查询结果（异构序列化访问缺失列） |
 
 ## 使用方式
 
-### 自动检查（推荐）
+### 自动检查（需显式启用）
 
 ```python
-# 在 models/__init__.py 中，configure_mappers() 之后：
+# 1. 在应用最早的入口（如 settings / bootstrap）显式启用
+import sqlmodel_ext.relation_load_checker as rlc
+rlc.check_on_startup = True  # 实验性，默认关闭
+
+# 2. 在 models/__init__.py 中，configure_mappers() 之后：
 from sqlmodel_ext import run_model_checks, SQLModelBase
 run_model_checks(SQLModelBase)
 
-# 在 main.py 中：
+# 3. 在 main.py 中：
 from sqlmodel_ext import RelationLoadCheckMiddleware
 app.add_middleware(RelationLoadCheckMiddleware)
 ```
 
-`run_model_checks` 扫描所有模型类的方法。`RelationLoadCheckMiddleware` 在第一个请求到来时扫描所有 FastAPI 路由函数。
+`run_model_checks` 扫描所有模型类的方法，`RelationLoadCheckMiddleware` 在 lifespan startup 完成时扫描 FastAPI 路由。若没有设置 `check_on_startup = True`，两个入口都会立即返回，不会做任何事情。
 
 ### 手动检查
 

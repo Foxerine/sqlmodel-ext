@@ -102,6 +102,27 @@ await Character.invalidate_by_id(id1, id2, id3)  # 多个
 await Character.invalidate_all()
 ```
 
+## 级联删除的缓存失效
+
+当父模型被删除时，``CachedTableBaseMixin`` 会按 SQLAlchemy 关系的 ``passive_deletes`` 设置走两条不同的路径，两种都能正确清理子模型的缓存。
+
+| `passive_deletes` | 子行谁删除 | 缓存怎么失效 |
+|-------------------|-----------|-------------|
+| `False`（默认） | SA 在 flush 时逐行 `DELETE` | `persistent_to_deleted` 事件自动触发 |
+| `True` | 数据库 `ON DELETE CASCADE` 静默删除 | `delete()` 在 DELETE 前预查 child ID，DELETE 后显式失效 |
+
+```python
+class User(CachedTableBaseMixin, UserBase, UUIDTableBaseMixin, table=True):
+    # passive_deletes=True：依赖 DB CASCADE，SA 不会加载子行
+    files: list['UserFile'] = Relationship(
+        back_populates='user',
+        cascade_delete=True,
+        passive_deletes=True,
+    )
+```
+
+``passive_deletes=True`` 在高并发环境下尤其有用，可以避免 SA 把几千行子记录拉进内存。旧版本会拒绝这个组合（要求 ``passive_deletes=False``）；新版本在 ``delete()`` 中预查 child ID 后再交给 DB CASCADE，之后显式 ``_invalidate_id_cache`` + ``_invalidate_query_caches``，保证子模型的 Redis 缓存不会出现陈旧数据。条件删除（``delete(condition=...)``）下无法枚举父 ID，会对子模型执行模型级全量失效。
+
 ## 多态继承支持
 
 STI 子类的缓存会自动联动祖先类：子类数据变更时，祖先类的查询缓存也会被清理。

@@ -65,7 +65,25 @@ if sys.version_info >= (3, 14):
                 non_none_args = [a for a in args if a is not type(None)]
                 if non_none_args:
                     first_arg = non_none_args[0]
+                    # Check for Annotated SA type metadata first (e.g. Array[T] | None).
+                    # Array[T] desugars to Annotated[list[T], _ArrayTypeHandler(T)];
+                    # wrapping with | None produces Union[Annotated[...], None],
+                    # so the SA type must be extracted from the inner Annotated.
+                    first_arg_type_name = type(first_arg).__name__
+                    if first_arg_type_name in ('AnnotatedAlias', '_AnnotatedAlias'):
+                        inner_args = get_args(first_arg)
+                        for md in inner_args[1:]:
+                            if hasattr(md, '__get_pydantic_core_schema__'):
+                                try:
+                                    schema = md.__get_pydantic_core_schema__(None, None)
+                                    if isinstance(schema, dict) and 'metadata' in schema:
+                                        sa_type = schema['metadata'].get('sa_type')
+                                        if sa_type is not None:
+                                            return sa_type
+                                except (TypeError, AttributeError, KeyError):
+                                    pass
                     first_origin = get_origin(first_arg)
+                    # Plain list/dict/tuple/set (no Annotated SA type) -> JSONB
                     if first_origin in (list, dict, tuple, set):
                         return JSONB
 
