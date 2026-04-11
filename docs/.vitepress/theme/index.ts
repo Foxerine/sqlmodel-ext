@@ -1,6 +1,13 @@
 // .vitepress/theme/index.ts
 import DefaultTheme from 'vitepress/theme'
+import type { Theme } from 'vitepress'
+import CopyOrDownloadAsMarkdownButtons from 'vitepress-plugin-llms/vitepress-components/CopyOrDownloadAsMarkdownButtons.vue'
 import '@fontsource/maple-mono';
 import './style/custom.css'
 
-export default DefaultTheme
+export default {
+    extends: DefaultTheme,
+    enhanceApp({ app }) {
+      app.component('CopyOrDownloadAsMarkdownButtons', CopyOrDownloadAsMarkdownButtons)
+    },
+  } satisfies Theme
