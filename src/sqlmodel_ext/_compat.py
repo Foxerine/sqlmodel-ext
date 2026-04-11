@@ -14,6 +14,7 @@ if sys.version_info >= (3, 14):
     from enum import StrEnum
     from typing import Literal, Union, get_args, get_origin
 
+    from pydantic_core import PydanticUndefined
     from sqlalchemy import String
     from sqlalchemy.orm.attributes import InstrumentedAttribute
 
@@ -27,6 +28,24 @@ if sys.version_info >= (3, 14):
     import sqlmodel.main
     _original_get_sqlalchemy_type = sqlmodel.main.get_sqlalchemy_type
 
+    def _get_explicit_sa_type(field):
+        """
+        Extract an explicit ``sa_type`` from a SQLModel/Pydantic FieldInfo.
+
+        Matches upstream ``sqlmodel.main._get_sqlmodel_field_value`` semantics:
+        prefers ``FieldInfoMetadata.sa_type`` then falls back to the direct
+        ``field.sa_type`` attribute. Returns ``PydanticUndefined`` when unset.
+        """
+        # Prefer FieldInfoMetadata.sa_type (set via Field(sa_type=...))
+        metadata = getattr(field, 'metadata', None)
+        if metadata:
+            for item in metadata:
+                sa_type = getattr(item, 'sa_type', PydanticUndefined)
+                if sa_type is not PydanticUndefined:
+                    return sa_type
+        # Fallback to direct attribute
+        return getattr(field, 'sa_type', PydanticUndefined)
+
     def _patched_get_sqlalchemy_type(field):
         """
         Fix SQLModel's get_sqlalchemy_type for Python 3.14 type issues.
@@ -34,6 +53,17 @@ if sys.version_info >= (3, 14):
         Handles ForwardRef, ClassVar, Literal, Mapped, and custom types
         that cause issubclass errors under PEP 649.
         """
+        # Respect explicit sa_type from Field(sa_type=...) — must take
+        # precedence over annotation-based auto-detection, matching upstream
+        # SQLModel behavior (sqlmodel/main.py::get_sqlalchemy_type checks
+        # sa_type before everything else). Without this, fields like
+        # ``options: list[str] | None = Field(sa_type=JSON)`` incorrectly
+        # get JSONB from the Union[list, None] -> JSONB branch below,
+        # breaking non-PostgreSQL dialects (e.g., SQLite in tests).
+        explicit_sa_type = _get_explicit_sa_type(field)
+        if explicit_sa_type is not PydanticUndefined:
+            return explicit_sa_type
+
         # Check field.metadata (Pydantic-processed Annotated types)
         metadata = getattr(field, 'metadata', None)
         if metadata:
