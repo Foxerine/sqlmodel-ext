@@ -97,8 +97,8 @@ class PaginationRequest(SQLModelBase):
     offset: int | None = Field(default=0, ge=0)
     """Offset (skip first N records), must be non-negative"""
 
-    limit: int | None = Field(default=50, le=100)
-    """Page size (return at most N records), default 50, max 100"""
+    limit: int | None = Field(ge=1, default=50, le=100)
+    """Page size (return at most N records), min 1, default 50, max 100"""
 
     desc: bool | None = True
     """Sort descending (True: descending, False: ascending)"""

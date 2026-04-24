@@ -15,7 +15,7 @@ import re
 import sys
 import types
 import typing
-from typing import Any, get_args, get_origin
+from typing import Any, Self, Sequence, get_args, get_origin
 
 from pydantic import ConfigDict, model_validator
 from pydantic.fields import FieldInfo
@@ -974,6 +974,11 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
                     if finfo and finfo.description:
                         prop['description'] = finfo.description
         return json_schema
+
+    @classmethod
+    def validate_list(cls, items: Sequence[Any]) -> list[Self]:
+        """Batch-convert a sequence of ORM instances (or dicts) to this model type."""
+        return [cls.model_validate(item, from_attributes=True) for item in items]
 
     @classmethod
     def get_computed_field_names(cls) -> set[str]:
