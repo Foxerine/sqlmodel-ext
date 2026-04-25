@@ -1093,8 +1093,15 @@ class RelationLoadChecker:
         """
         Check a model method (with self tracking and @requires_relations parsing).
 
-        self is marked as caller_provided; pre-commit access skips RLC003.
-        But self.save() followed by relationship access still triggers RLC002.
+        All method parameters (``self`` plus other model-typed arguments) are marked
+        as caller_provided — these objects are passed in by the caller, preloading
+        is the caller's contract (typically declared via a docstring "preload before
+        calling: ..." note), so the method body must not be flagged with RLC003 for
+        "missing load=". This matches ``_check_coroutine``'s policy of marking all
+        params as caller_provided.
+
+        Post-commit relation access still triggers RLC002 / RLC007 / RLC008
+        (caller_provided does not exempt those checks).
         """
         # Parse AST to extract @requires_relations
         source_file, tree, line_offset = self._parse_function_source(func)
@@ -1114,16 +1121,18 @@ class RelationLoadChecker:
         # Detect instance method or classmethod
         sig = python_inspect.signature(func)
         first_param = next(iter(sig.parameters), None)
-        caller_provided_params: set[str] = set()
 
         # cls -> class alias (classmethod's cls parameter doesn't enter tracked_vars,
         # only used for resolving class-level calls)
         class_aliases: dict[str, str] = {}
         if first_param == 'self':
             param_models['self'] = cls_name
-            caller_provided_params.add('self')
         elif first_param == 'cls':
             class_aliases['cls'] = cls_name
+
+        # All method params are caller-provided (self + other model-typed args
+        # are the caller's preload responsibility).
+        caller_provided_params: set[str] = set(param_models.keys())
 
         # @requires_relations declared rels as self's dep_loads
         dep_loads: dict[str, set[str]] = {}
@@ -1287,20 +1296,32 @@ class RelationLoadChecker:
         (e.g. TYPE_CHECKING forward references), falls back to per-parameter
         ``__annotations__`` parsing to ensure resolvable params aren't missed.
 
+        TYPE_CHECKING forward reference handling: passes ``self.model_classes``
+        (all mapped ORM classes) as ``localns`` to ``get_type_hints()`` so that
+        string annotations like ``llm: 'LLM'`` (where ``LLM`` is imported only
+        under ``if TYPE_CHECKING:``) resolve to actual classes instead of being
+        silently dropped — silent drops cause RLC007/RLC013 false negatives.
+
         :returns: param_name -> model_class_name
         """
         param_models: dict[str, str] = {}
 
+        # Provide model_classes as localns so TYPE_CHECKING forward references resolve.
+        localns: dict[str, Any] = dict(self.model_classes)
         try:
-            hints = typing.get_type_hints(func, include_extras=True)
+            hints = typing.get_type_hints(func, include_extras=True, localns=localns)
         except Exception:
-            # get_type_hints may fail due to TYPE_CHECKING forward references.
-            # Fall back to per-parameter __annotations__ (skip unresolvable string annotations)
+            # Even with model_classes in scope, get_type_hints may still fail on
+            # nested third-party ForwardRefs. Fall back to per-parameter __annotations__:
+            # try to eval string annotations against globals + model_classes.
             hints = {}
             annotations: dict[str, Any] = getattr(func, '__annotations__', {})
             for param_name, annotation in annotations.items():
                 if isinstance(annotation, str):
-                    continue  # Skip unresolvable string annotations
+                    resolved = self._eval_string_annotation(annotation, func)
+                    if resolved is not None:
+                        hints[param_name] = resolved
+                    continue
                 hints[param_name] = annotation
 
         for param_name, hint in hints.items():
@@ -1332,6 +1353,24 @@ class RelationLoadChecker:
                     param_models[f"{param_name}.{attr_name}"] = attr_model
 
         return param_models
+
+    def _eval_string_annotation(self, annotation: str, func: Any) -> Any:
+        """
+        Evaluate a string annotation that ``typing.get_type_hints`` couldn't resolve.
+
+        Typical case: a TYPE_CHECKING-only import is referenced as a forward reference
+        (e.g. ``llm: 'LLM'`` where ``LLM`` is imported only under ``if TYPE_CHECKING:``).
+        Evaluates against ``func.__globals__`` merged with the known ORM model classes.
+
+        Supported forms: ``'LLM'``, ``'LLM | None'``, ``'list[LLM]'`` etc.
+        Returns ``None`` on failure (silent skip, matches the original fallback).
+        """
+        globalns: dict[str, Any] = getattr(func, '__globals__', {}) or {}
+        localns: dict[str, Any] = dict(self.model_classes)
+        try:
+            return eval(annotation, globalns, localns)  # noqa: S307 — source-code literal, scoped namespace
+        except Exception:
+            return None
 
     def _extract_model_from_hint(self, hint: Any) -> str | None:
         """
