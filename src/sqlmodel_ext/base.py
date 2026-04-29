@@ -102,6 +102,47 @@ def _merge_field_info_attrs(target: SQLModelFieldInfo, source: SQLModelFieldInfo
         target.metadata = list(target_meta) + list(source_meta)
 
 
+def _find_field_info_in_annotated(annotation: Any) -> SQLModelFieldInfo | None:
+    """
+    Extract SQLModel ``FieldInfo`` embedded in ``Annotated[T, Field(...)]`` metadata.
+
+    Used by the metaclass sa_type injection loop. When a field is declared
+    ``Annotated[X, Field(default_factory=list, ...)]`` *without* an explicit
+    ``= ...`` assignment, ``attrs[field_name]`` is ``Undefined``. Replacing
+    it with a fresh ``Field(sa_type=sa_type)`` would discard the user's
+    Field metadata (``default_factory``, ``max_length``, validators, ...)
+    that lives inside the Annotated args. This helper recovers that
+    FieldInfo so the caller can attach ``sa_type`` to the user's Field
+    instead of clobbering it. The bug only surfaces after 2+ levels of
+    inheritance: single-class instantiation goes through Pydantic's native
+    Annotated path and works, but child classes rebuild ``model_fields``
+    from the clobbered ``attrs`` and the field becomes silently
+    ``is_required=True``.
+
+    Multiple FieldInfo args (e.g. ``Annotated[Str64, Field(unique=True)]``
+    expands to ``Annotated[str, Field(max_length=64), Field(unique=True)]``)
+    are merged into a single shallow copy so the shared Annotated metadata
+    singletons are never mutated.
+
+    :param annotation: Field type annotation
+    :returns: Merged SQLModelFieldInfo (shallow copy, safe to mutate), or None
+    """
+    if get_origin(annotation) is not typing.Annotated:
+        return None
+    args = get_args(annotation)
+    if len(args) < 2:
+        return None
+    sqlmodel_fis: list[SQLModelFieldInfo] = [
+        arg for arg in args[1:] if isinstance(arg, SQLModelFieldInfo)
+    ]
+    if not sqlmodel_fis:
+        return None
+    merged = copy.copy(sqlmodel_fis[0])
+    for extra_fi in sqlmodel_fis[1:]:
+        _merge_field_info_attrs(merged, extra_fi)
+    return merged
+
+
 def _make_annotation_optional(annotation: typing.Any) -> typing.Any:
     """
     Convert type annotation to optional: ``T → T | None``
@@ -495,7 +536,19 @@ class __DeclarativeMeta(SQLModelMetaclass):
                 field_value = attrs.get(field_name, Undefined)
 
                 if field_value is Undefined:
-                    attrs[field_name] = Field(sa_type=sa_type)
+                    # No explicit ``= Field(...)`` assignment. Prefer recovering
+                    # FieldInfo from inside Annotated[X, Field(default_factory=..., ...)]
+                    # so user-supplied default_factory / max_length / constraints
+                    # survive — clobbering with a fresh Field(sa_type=sa_type)
+                    # would silently make the field required after multi-level
+                    # inheritance.
+                    annotated_fi = _find_field_info_in_annotated(field_type)
+                    if annotated_fi is not None:
+                        if getattr(annotated_fi, 'sa_type', Undefined) is Undefined:
+                            setattr(annotated_fi, 'sa_type', sa_type)
+                        attrs[field_name] = annotated_fi
+                    else:
+                        attrs[field_name] = Field(sa_type=sa_type)
                 elif isinstance(field_value, FieldInfo):
                     if getattr(field_value, 'sa_type', Undefined) is Undefined:
                         setattr(field_value, 'sa_type', sa_type)
