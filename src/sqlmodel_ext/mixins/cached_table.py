@@ -1709,35 +1709,53 @@ class CachedTableBaseMixin(TableBaseMixin):
         # SA does not load children and persistent_to_deleted does not fire,
         # so we must query child IDs ourselves before DELETE and invalidate
         # their caches afterwards.
+        #
+        # The walk is BFS over the entire passive_deletes chain — a single
+        # level is not enough. Example: A -[passive=True]-> B -[passive=True]-> C
+        # all use DB CASCADE, SA never loads B or C, persistent_to_deleted
+        # only fires for A. Stale rows of both B and C linger in Redis until
+        # TTL. The BFS prefetches every cached level before issuing DELETE.
         passive_targets: dict[type[CachedTableBaseMixin], list[Any]] = {}
-        try:
-            mapper = sa_inspect(cls)
-            if mapper is None:
-                raise TypeError(f"sa_inspect({cls.__name__}) returned None")
-            for rel in mapper.relationships:
-                if not rel.cascade.delete or not rel.passive_deletes:
+        # Queue items: (current_cls, IDs from the previous level, or None for
+        # full-model propagation when the upstream delete used a condition).
+        passive_queue: list[tuple[type, list[Any] | None]] = [
+            (cls, list(instance_ids) if instance_ids else None)
+        ]
+        while passive_queue:
+            current_cls, current_ids = passive_queue.pop(0)
+            try:
+                current_mapper = sa_inspect(current_cls)
+                if current_mapper is None:
                     continue
-                target = rel.mapper.class_
-                if not (isinstance(target, type) and issubclass(target, CachedTableBaseMixin)):
-                    continue
-                if instance_ids:
+                for rel in current_mapper.relationships:
+                    if not rel.cascade.delete or not rel.passive_deletes:
+                        continue
+                    target = rel.mapper.class_
+                    if not (isinstance(target, type) and issubclass(target, CachedTableBaseMixin)):
+                        continue
+                    if current_ids is None:
+                        # Condition delete or already-full propagation.
+                        if _FULL_MODEL_INVALIDATION not in passive_targets.get(target, []):
+                            passive_targets.setdefault(target, []).append(_FULL_MODEL_INVALIDATION)
+                            passive_queue.append((target, None))
+                        continue
                     remote_cols = list(rel.remote_side)
-                    if len(remote_cols) == 1:
-                        target_mapper = sa_inspect(target)
-                        if target_mapper is None:
-                            continue
-                        target_pk = target_mapper.primary_key[0]
-                        stmt = sa_select(target_pk).where(remote_cols[0].in_(instance_ids))
-                        rows = await session.execute(stmt)
-                        child_ids = [row[0] for row in rows]
-                        if child_ids:
-                            passive_targets[target] = child_ids
-                else:
-                    # Condition deletes cannot enumerate parent IDs; use the
-                    # sentinel to request a model-level full invalidation.
-                    passive_targets[target] = [_FULL_MODEL_INVALIDATION]
-        except Exception as e:
-            logger.warning(f"passive_deletes pre-query failed ({cls.__name__}): {e}")
+                    if len(remote_cols) != 1:
+                        # Composite FK is not supported (matches the original
+                        # single-level behaviour).
+                        continue
+                    target_mapper = sa_inspect(target)
+                    if target_mapper is None:
+                        continue
+                    target_pk = target_mapper.primary_key[0]
+                    stmt = sa_select(target_pk).where(remote_cols[0].in_(current_ids))
+                    rows = await session.execute(stmt)
+                    child_ids = [row[0] for row in rows]
+                    if child_ids:
+                        passive_targets.setdefault(target, []).extend(child_ids)
+                        passive_queue.append((target, child_ids))
+            except Exception as e:
+                logger.warning(f"passive_deletes pre-query failed ({current_cls.__name__}): {e}")
 
         # Clear any leftover cascade data from a previous run (defensive;
         # normal flows never leave residue).
