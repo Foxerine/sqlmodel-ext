@@ -3422,6 +3422,33 @@ class _FunctionAnalyzer(ast.NodeVisitor):
         if self.has_session_param:
             self._expire_all_tracked_vars_for_yield()
 
+    @override
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """
+        Do not recurse into nested function definitions.
+
+        AST default DFS would descend into nested ``def`` bodies and count
+        their yield/await statements as part of the outer function's flow,
+        producing false positives. Nested function bodies execute in their
+        own scope when invoked, not as part of the outer flow.
+
+        Typical false positive:
+            ``async def outer(...):
+                async def _inner():
+                    yield chunk``
+        The outer function has no yield, but ``_inner``'s yield was being
+        counted as the outer's, triggering RLC013.
+
+        Trade-off: nested closures are not analyzed under the current
+        scope. Independently scanning them would require a second pass
+        with closure capture analysis; in practice nested closures rarely
+        access ORM directly, so we accept the gap.
+        """
+
+    @override
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Do not recurse into nested async function definitions (same as visit_FunctionDef)."""
+
     # ========================= Branch-aware state management =========================
 
     def _snapshot_tracked_vars(self) -> dict[str, _TrackedVar]:
