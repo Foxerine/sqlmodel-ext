@@ -141,34 +141,170 @@ class TableBaseMixin(AsyncAttrs):
         default_factory=now
     )
 
+    # ==================== IntegrityError friendly-message registry ====================
+    #
+    # Each application module declares its own constraint-name → user-facing message
+    # at the same site as the ``UniqueConstraint`` / ``ForeignKey`` / ``CheckConstraint``
+    # declaration, by calling ``TableBaseMixin.register_*_violation_message(...)``.
+    # Both ``sanitize_integrity_error`` and any global FastAPI integrity-error handler
+    # look up the registry; on hit they return the registered message, otherwise they
+    # fall through to a generic fallback. No code path leaks table/column names or SQL.
+    #
+    # Design:
+    # - The registry hangs off ``TableBaseMixin`` (the root mixin for all table models),
+    #   so it is shared across subclasses.
+    # - ``setdefault`` semantics (first registration wins) protect against duplicate
+    #   registration from re-imports.
+    # - The ``CheckConstraint`` registry only serves ORM-declared CHECKs. Trigger
+    #   ``RAISE EXCEPTION`` errors typically don't carry ``constraint_name``; those
+    #   are surfaced via ``extract_trigger_message`` instead.
+
+    _UNIQUE_VIOLATION_MESSAGES: ClassVar[dict[str, str]] = {}
+    """UNIQUE constraint name -> user-facing message"""
+
+    _FOREIGN_KEY_VIOLATION_MESSAGES: ClassVar[dict[str, str]] = {}
+    """FK constraint name -> user-facing message"""
+
+    _CHECK_VIOLATION_MESSAGES: ClassVar[dict[str, str]] = {}
+    """Declared CHECK constraint name -> user-facing message (trigger-raised check_violation does not go through here)"""
+
+    @staticmethod
+    def register_unique_violation_message(constraint_name: str, friendly_message: str) -> None:
+        """
+        Declare the user-facing message shown when a UNIQUE constraint is violated.
+
+        Call this at module top-level next to the matching ``UniqueConstraint(..., name='xxx')``
+        declaration. SQLModel modules are import-eager (loaded during FastAPI startup),
+        so registration completes before any request runs.
+
+        :param constraint_name: Constraint name, must exactly match the ``name=`` kwarg
+            of the ``UniqueConstraint`` declaration.
+        :param friendly_message: Message returned to the user when the constraint fires.
+            Should not contain table/column names.
+        """
+        _ = TableBaseMixin._UNIQUE_VIOLATION_MESSAGES.setdefault(constraint_name, friendly_message)
+
+    @staticmethod
+    def register_foreign_key_violation_message(constraint_name: str, friendly_message: str) -> None:
+        """
+        Declare the user-facing message shown when a FK constraint is violated
+        (typically for "referenced resource missing" semantics).
+
+        :param constraint_name: FK constraint name (PostgreSQL default is ``<table>_<col>_fkey``)
+        :param friendly_message: User-facing message
+        """
+        _ = TableBaseMixin._FOREIGN_KEY_VIOLATION_MESSAGES.setdefault(constraint_name, friendly_message)
+
+    @staticmethod
+    def register_check_violation_message(constraint_name: str, friendly_message: str) -> None:
+        """
+        Declare the user-facing message shown when a declared ``CheckConstraint`` is violated.
+
+        Only applies to ORM-level ``CheckConstraint(..., name='ck_xxx')``. Database trigger
+        ``RAISE EXCEPTION`` that produces a check_violation typically lacks a
+        ``constraint_name``; those are surfaced by ``extract_trigger_message`` directly
+        and bypass this registry.
+
+        :param constraint_name: CHECK constraint name
+        :param friendly_message: User-facing message
+        """
+        _ = TableBaseMixin._CHECK_VIOLATION_MESSAGES.setdefault(constraint_name, friendly_message)
+
+    @staticmethod
+    def lookup_unique_violation_message(constraint_name: str | None) -> str | None:
+        """Look up the friendly message for a UNIQUE constraint; returns None if missing/unregistered."""
+        if not constraint_name:
+            return None
+        return TableBaseMixin._UNIQUE_VIOLATION_MESSAGES.get(constraint_name)
+
+    @staticmethod
+    def lookup_foreign_key_violation_message(constraint_name: str | None) -> str | None:
+        """Look up the friendly message for a FK constraint; returns None if missing/unregistered."""
+        if not constraint_name:
+            return None
+        return TableBaseMixin._FOREIGN_KEY_VIOLATION_MESSAGES.get(constraint_name)
+
+    @staticmethod
+    def lookup_check_violation_message(constraint_name: str | None) -> str | None:
+        """Look up the friendly message for a declared CHECK constraint; returns None if missing/unregistered."""
+        if not constraint_name:
+            return None
+        return TableBaseMixin._CHECK_VIOLATION_MESSAGES.get(constraint_name)
+
+    @staticmethod
+    def extract_trigger_message(orig: BaseException) -> str:
+        """
+        Extract the first-line business message from an asyncpg ``CheckViolationError``
+        raised by a trigger ``RAISE EXCEPTION`` (strips ``ERROR:`` prefix and ``DETAIL:`` /
+        ``CONTEXT:`` trailing lines).
+
+        Shared between ``sanitize_integrity_error`` and any global integrity-error
+        handler (hence exposed). Other callers should not consume raw trigger
+        messages directly.
+        """
+        message = str(orig)
+        if '\n' in message:
+            message = message.split('\n')[0]
+        if message.startswith('ERROR:'):
+            message = message[6:].strip()
+        return message
+
     @staticmethod
     def sanitize_integrity_error(e: IntegrityError, default_message: str = "Data integrity constraint violation") -> str:
         """
         Extract a safe, user-friendly error message from an IntegrityError.
 
-        PostgreSQL triggers (``RAISE EXCEPTION ... USING ERRCODE = 'check_violation'``)
-        produce SQLSTATE 23514 errors with business-semantic messages that can be
-        shown directly to users. Other constraint errors (FK, unique, etc.) may leak
-        table structure information and need sanitizing.
+        Priority:
 
-        Note: This method is PostgreSQL-specific. For other databases, only the
-        default_message will be returned for non-trigger constraint errors.
+        1. ``UniqueViolationError`` (SQLSTATE 23505) / ``ForeignKeyViolationError``
+           (23503) / declared ``CheckConstraint`` (23514 *with* ``constraint_name``):
+           look up the registry, return the registered message on hit, else
+           ``default_message``.
+        2. Trigger ``RAISE EXCEPTION`` check_violation (23514 *without* ``constraint_name``):
+           the message itself is a developer-authored user-facing string; surface
+           it directly via ``extract_trigger_message``.
+        3. Fallback: log the raw error and return ``default_message``.
 
-        :param e: SQLAlchemy IntegrityError
-        :param default_message: Fallback message for non-trigger constraint errors
+        Note: SQLSTATE values are PostgreSQL-specific. For other databases, only
+        ``default_message`` will be returned for non-trigger constraint errors.
+
+        :param e: SQLAlchemy ``IntegrityError``
+        :param default_message: Fallback message when registry misses and the error
+            is not a trigger-raised check_violation
         :returns: A user-safe error description
         """
         orig = e.orig
-        # check_violation (SQLSTATE 23514): produced by trigger RAISE EXCEPTION
-        if orig is not None and getattr(orig, 'sqlstate', None) == '23514':
-            error_msg = str(orig)
-            # PostgreSQL format: "ERROR: message\nDETAIL: ...\nCONTEXT: ..."
-            if '\n' in error_msg:
-                error_msg = error_msg.split('\n')[0]
-            if error_msg.startswith('ERROR:'):
-                error_msg = error_msg[6:].strip()
-            return error_msg
-        logger.warning(f"Data integrity constraint error: {e}")
+        if orig is None:
+            logger.warning(f"Data integrity constraint error (no orig): {e}")
+            return default_message
+
+        sqlstate = getattr(orig, 'sqlstate', None)
+        constraint = getattr(orig, 'constraint_name', None)
+
+        if sqlstate == '23505':  # UniqueViolation
+            friendly = TableBaseMixin.lookup_unique_violation_message(constraint)
+            if friendly is not None:
+                return friendly
+        elif sqlstate == '23503':  # ForeignKeyViolation
+            friendly = TableBaseMixin.lookup_foreign_key_violation_message(constraint)
+            if friendly is not None:
+                return friendly
+        elif sqlstate == '23514':  # CheckViolation
+            if constraint:
+                # Declared CheckConstraint: only return a registered friendly message;
+                # do not surface the raw message (CheckConstraint expressions may
+                # contain column names).
+                friendly = TableBaseMixin.lookup_check_violation_message(constraint)
+                if friendly is not None:
+                    return friendly
+            else:
+                # Trigger RAISE EXCEPTION: the message is already a user-facing string,
+                # surface it directly.
+                trigger_msg = TableBaseMixin.extract_trigger_message(orig)
+                if trigger_msg:
+                    return trigger_msg
+
+        logger.warning(f"Data integrity constraint error: constraint={constraint}, sqlstate={sqlstate}, orig={e}")
         return default_message
 
     @classmethod
@@ -204,16 +340,20 @@ class TableBaseMixin(AsyncAttrs):
                     # After commit objects expire; use sa_inspect to safely read id
                     _insp = cast(InstanceState[Any], inspect(instance))
                     _inst_id = _insp.identity[0] if _insp.identity else None
-                    assert _inst_id is not None, f"{cls.__name__} id is None after add"
+                    if _inst_id is None:
+                        raise RuntimeError(f"{cls.__name__} id is None after add")
                     result = await cls.get(session, cls.id == _inst_id)
-                    assert result is not None, f"{cls.__name__} record not found (id={_inst_id})"
+                    if result is None:
+                        raise RuntimeError(f"{cls.__name__} record not found (id={_inst_id})")
                     instances[i] = result
             else:
                 _insp = cast(InstanceState[Any], inspect(instances))
                 _inst_id = _insp.identity[0] if _insp.identity else None
-                assert _inst_id is not None, f"{cls.__name__} id is None after add"
+                if _inst_id is None:
+                    raise RuntimeError(f"{cls.__name__} id is None after add")
                 result = await cls.get(session, cls.id == _inst_id)
-                assert result is not None, f"{cls.__name__} record not found (id={_inst_id})"
+                if result is None:
+                    raise RuntimeError(f"{cls.__name__} record not found (id={_inst_id})")
                 instances = result
 
         return instances
@@ -294,9 +434,11 @@ class TableBaseMixin(AsyncAttrs):
         # After commit objects expire; use sa_inspect to safely read id from identity map
         _insp = cast(InstanceState[Any], inspect(instance))
         _instance_id = _insp.identity[0] if _insp.identity else None
-        assert _instance_id is not None, f"{cls.__name__} id is None after save"
+        if _instance_id is None:
+            raise RuntimeError(f"{cls.__name__} id is None after save")
         result = await cls.get(session, cls.id == _instance_id, load=load, jti_subclasses=jti_subclasses)
-        assert result is not None, f"{cls.__name__} record not found (id={_instance_id})"
+        if result is None:
+            raise RuntimeError(f"{cls.__name__} record not found (id={_instance_id})")
         return result
 
     async def update(
@@ -375,9 +517,11 @@ class TableBaseMixin(AsyncAttrs):
         # After commit objects expire; use sa_inspect to safely read id from identity map
         _insp = cast(InstanceState[Any], inspect(instance))
         _instance_id = _insp.identity[0] if _insp.identity else None
-        assert _instance_id is not None, f"{cls.__name__} id is None after update"
+        if _instance_id is None:
+            raise RuntimeError(f"{cls.__name__} id is None after update")
         result = await cls.get(session, cls.id == _instance_id, load=load, jti_subclasses=jti_subclasses)
-        assert result is not None, f"{cls.__name__} record not found (id={_instance_id})"
+        if result is None:
+            raise RuntimeError(f"{cls.__name__} record not found (id={_instance_id})")
         return result
 
     @classmethod
@@ -1025,14 +1169,14 @@ class TableBaseMixin(AsyncAttrs):
 
     @overload
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: int, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None) -> T: ...
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: int, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T: ...
 
     @overload
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None) -> T: ...
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T: ...
 
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: int | uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None) -> T:
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: int | uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T:
         """
         Get a record by primary key ID, raising 404 if not found.
 
@@ -1042,6 +1186,10 @@ class TableBaseMixin(AsyncAttrs):
         :param session: Async database session
         :param id: Primary key ID
         :param load: Relationship(s) to eagerly load
+        :param detail: 404 response detail text (default ``"Not found"``).
+            Callers may supply a localized / context-specific message
+            (e.g. ``"Bundle not found"``) without falling back to manual
+            ``get(...) + null check + raise`` boilerplate.
         :returns: The found instance
         :raises HTTPException: (FastAPI) If not found
         :raises RecordNotFoundError: (no FastAPI) If not found
@@ -1049,8 +1197,8 @@ class TableBaseMixin(AsyncAttrs):
         instance = await cls.get(session, col(cls.id) == id, load=load)
         if instance is None:
             if _HAS_FASTAPI:
-                raise _FastAPIHTTPException(status_code=404, detail="Not found")
-            raise RecordNotFoundError("Not found")
+                raise _FastAPIHTTPException(status_code=404, detail=detail)
+            raise RecordNotFoundError(detail)
         return instance
 
 
@@ -1090,15 +1238,16 @@ class UUIDTableBaseMixin(TableBaseMixin):
 
     @override
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None) -> T:
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T:
         """
         Get a record by UUID primary key, raising 404 if not found.
 
         :param session: Async database session
         :param id: UUID primary key
         :param load: Relationship(s) to eagerly load
+        :param detail: 404 response detail text (default ``"Not found"``)
         :returns: The found instance
         :raises HTTPException: (FastAPI) If not found
         :raises RecordNotFoundError: (no FastAPI) If not found
         """
-        return await super().get_exist_one(session, id, load)
+        return await super().get_exist_one(session, id, load, detail=detail)

@@ -1234,7 +1234,15 @@ class RelationLoadChecker:
             model_rel_targets=self.model_rel_targets,
             refreshing_commit_methods=self.refreshing_commit_methods,
         )
-        analyzer.visit(func_node)
+        # Manually iterate ``func_node.body`` instead of ``analyzer.visit(func_node)``:
+        # ``visit_FunctionDef`` / ``visit_AsyncFunctionDef`` are no-ops (used to skip
+        # nested function bodies — see their docstrings). Calling ``visit(func_node)``
+        # on the top-level entry would also hit that no-op and swallow the entire
+        # function body. Manual iteration dispatches each top-level statement (Return /
+        # Assign / Expr / ...) to its visit_* handler, while nested ``def`` statements
+        # in the body still hit the no-op and are correctly skipped.
+        for stmt in func_node.body:
+            analyzer.visit(stmt)
 
         return list(analyzer.warnings), analyzer
 
@@ -2803,6 +2811,20 @@ class _FunctionAnalyzer(ast.NodeVisitor):
             if isinstance(call, ast.Call):
                 method_name = self._get_method_name(call)
                 loaded_rels = self._extract_load_from_call(call)
+
+                # RLC010: check whether ``return await Call(..., expired_arg)`` carries
+                # post-commit expired objects as call args. Previously visit_Return only
+                # checked relationship preloading (_check_return_loaded), leaving
+                # ``return await callee(..., expired_var)`` paths uncovered. Mirrors the
+                # symmetric checks in visit_Expr and _check_assign.
+                # Example scenario:
+                #     user_file = await cls._unchecked(...)  # commits → tracked vars expire
+                #     return await user_file._moderate(session, config=config)
+                #                                              ^^^^^^^^^^^^^
+                #                                              ``config`` expired; callee's
+                #                                              ``config.attr`` triggers
+                #                                              MissingGreenlet.
+                self._check_expired_call_args(call, node)
 
                 # return await obj.save/update/create_duplicate/... (commit methods)
                 if self._is_commit_for_call(call, method_name):

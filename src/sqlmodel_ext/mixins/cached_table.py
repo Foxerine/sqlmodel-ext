@@ -91,6 +91,7 @@ logger = logging.getLogger(__name__)
 
 from pydantic import ValidationError
 from sqlalchemy import ColumnElement, event, inspect as sa_inspect, select as sa_select
+from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import InstanceState, QueryableAttribute, Session as _SyncSession, make_transient_to_detached
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.orm.relationships import MANYTOONE  # pyright: ignore[reportPrivateImportUsage]
@@ -1319,6 +1320,15 @@ class CachedTableBaseMixin(TableBaseMixin):
                         if cached is not _LOAD_CACHE_MISS:
                             if cls.on_cache_hit is not None:
                                 cls.on_cache_hit(cls.__name__)
+                            if cached is None and fetch_mode == 'one':
+                                # ``fetch_mode='one'`` type contract guarantees raise (not None);
+                                # when the cache hit is None we must raise, matching the SQL
+                                # path's ``result.one()`` behavior. Otherwise downstream
+                                # ``try/except NoResultFound`` callers (e.g. dep injection that
+                                # maps "missing" to 503) would silently see None and fail later.
+                                raise NoResultFound(
+                                    f"No row was found when one was required: {cls.__name__}(id={id_value})"
+                                )
                             return cached
                         # Redis was actually queried and missed.
 
@@ -1394,18 +1404,25 @@ class CachedTableBaseMixin(TableBaseMixin):
                 else:
                     # Phase 2: merge into the session identity map to preserve
                     # the same semantics as a DB query.
-                    if result is not None:
-                        if isinstance(result, list):
-                            merged_list: list[Self] = []
-                            for item in result:
-                                make_transient_to_detached(item)
-                                merged_list.append(await session.merge(item, load=False))
-                            return merged_list
-                        else:
-                            make_transient_to_detached(result)
-                            result = await session.merge(result, load=False)
                     if cls.on_cache_hit is not None:
                         cls.on_cache_hit(cls.__name__)
+                    if result is None:
+                        if fetch_mode == 'one':
+                            # ``fetch_mode='one'`` type contract guarantees raise (not None);
+                            # raise on cache hit to mirror the SQL path's ``result.one()`` behavior.
+                            raise NoResultFound(
+                                f"No row was found when one was required: {cls.__name__}"
+                            )
+                        return result
+                    if isinstance(result, list):
+                        merged_list: list[Self] = []
+                        for item in result:
+                            make_transient_to_detached(item)
+                            merged_list.append(await session.merge(item, load=False))
+                        return merged_list
+                    else:
+                        make_transient_to_detached(result)
+                        result = await session.merge(result, load=False)
                     return result
 
         # Cache miss callback (only when Redis was actually queried, not skip_cache path)

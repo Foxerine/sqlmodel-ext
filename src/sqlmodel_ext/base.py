@@ -220,6 +220,27 @@ def _apply_all_fields_optional(
         if original_ann is None:
             continue
 
+        # Bug fix: when a field is declared as ``field: T = Field(gt=..., le=...)`` (non-Annotated form),
+        # MRO ``__annotations__`` only stores the bare ``T``. The ``Field(...)`` constraint metadata
+        # lives on the right-hand-side assignment, so all_fields_optional-derived UpdateRequest classes
+        # lose those constraints (e.g. UFT-style "missing range" warnings fire on derived fields that
+        # had constraints in the source class). Patch: when ``original_ann`` is not already Annotated,
+        # pull constraints from the base class's resolved ``model_fields[name].metadata`` (Pydantic
+        # stores them there as ``[Gt(0), Le(600), ...]``) and re-wrap into ``Annotated[T, *metadata]``,
+        # letting downstream ``_make_annotation_optional`` preserve the constraints when converting
+        # to ``T | None``. The root recommended fix is still to declare fields in Annotated form at
+        # the source; this patch is defense-in-depth for legacy ``field: T = Field(...)`` declarations.
+        if get_origin(original_ann) is not typing.Annotated:
+            for base in bases:
+                base_model_fields = getattr(base, 'model_fields', None)
+                if not base_model_fields:
+                    continue
+                base_field_info = base_model_fields.get(field_name)
+                if base_field_info is None or not base_field_info.metadata:
+                    continue
+                original_ann = typing.Annotated[original_ann, *base_field_info.metadata]
+                break
+
         # Skip Literal type fields (e.g. discriminator):
         # Literal['text'] | None breaks Pydantic discriminated union
         raw_type = original_ann
@@ -309,10 +330,33 @@ def _recover_annotated_sqlmodel_fields(
     all_annotated.update(annotations)
 
     for field_name, field_type in all_annotated.items():
-        if get_origin(field_type) is not typing.Annotated:
+        # Unwrap Optional/Union wrappers: forms like ``Annotated[X, Field(sa_type=BigInteger)] | None``
+        # have ``get_origin() == Union`` (or ``types.UnionType`` for PEP 604 ``|``); we must
+        # peel back to find the inner Annotated to extract the SQLModel FieldInfo. Otherwise
+        # nullable aliases like ``PositiveBigInt | None`` lose ``sa_type`` and the SA column
+        # silently degrades (e.g. BigInteger → Integer → asyncpg int32 overflow on large defaults).
+        annotated_type = field_type
+        union_args: list[typing.Any] | None = None
+        union_origin = get_origin(field_type)
+        # ``X | None`` (PEP 604) has origin ``types.UnionType``; ``Union[X, None]`` is ``typing.Union``.
+        # Match both without depending on ``types`` import inside any version block.
+        is_union = union_origin is typing.Union or (
+            union_origin is not None and getattr(union_origin, '__name__', '') == 'UnionType'
+        )
+        if is_union:
+            union_args = list(get_args(field_type))
+            annotated_in_union = next(
+                (arg for arg in union_args if get_origin(arg) is typing.Annotated),
+                None,
+            )
+            if annotated_in_union is None:
+                continue
+            annotated_type = annotated_in_union
+
+        if get_origin(annotated_type) is not typing.Annotated:
             continue
 
-        args = get_args(field_type)
+        args = get_args(annotated_type)
         if len(args) < 2:
             continue
 
@@ -354,10 +398,24 @@ def _recover_annotated_sqlmodel_fields(
         base_type = args[0]
         remaining_metadata = [a for a in args[1:] if not isinstance(a, SQLModelFieldInfo)]
         if remaining_metadata:
-            new_ann = typing.Annotated[tuple([base_type] + remaining_metadata)]
+            new_inner: typing.Any = typing.Annotated[tuple([base_type] + remaining_metadata)]
         else:
-            new_ann = base_type
-        annotations[field_name] = new_ann
+            new_inner = base_type
+
+        if union_args is not None:
+            # Rebuild Union: replace the inner Annotated with the stripped version, keeping
+            # the other Union members (e.g. ``| None``) intact. Use PEP 604 ``|`` to accumulate
+            # so we don't trip the deprecated-typing.Union warning.
+            new_union_args = [
+                new_inner if get_origin(arg) is typing.Annotated else arg
+                for arg in union_args
+            ]
+            rebuilt: typing.Any = new_union_args[0]
+            for extra in new_union_args[1:]:
+                rebuilt = rebuilt | extra
+            annotations[field_name] = rebuilt
+        else:
+            annotations[field_name] = new_inner
 
 
 def _make_sti_fk_resolver(

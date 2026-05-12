@@ -108,6 +108,9 @@ Text5K: TypeAlias = Annotated[str, Field(max_length=5000), _NO_NULL_BYTE]
 Text10K: TypeAlias = Annotated[str, Field(max_length=10000), _NO_NULL_BYTE]
 """10000-character text field"""
 
+Text16K: TypeAlias = Annotated[str, Field(max_length=16000), _NO_NULL_BYTE]
+"""16000-character text field (long-form descriptions, tool docs)"""
+
 Text32K: TypeAlias = Annotated[str, Field(max_length=32000), _NO_NULL_BYTE]
 """32000-character text field"""
 
@@ -120,8 +123,28 @@ Text64K: TypeAlias = Annotated[str, Field(max_length=65536), _NO_NULL_BYTE]
 Text100K: TypeAlias = Annotated[str, Field(max_length=100000), _NO_NULL_BYTE]
 """100000-character text field"""
 
+Text128K: TypeAlias = Annotated[str, Field(max_length=131072), _NO_NULL_BYTE]
+"""131072-character (128 * 1024) text field (large markdown documents etc.)"""
+
 Text1M: TypeAlias = Annotated[str, Field(max_length=1000000), _NO_NULL_BYTE]
 """1000000-character text field (tool call parameters, tool responses, etc.)"""
+
+# NonEmptyStr* — same as Str* but also requires ``min_length=1``, rejecting empty
+# ``""`` strings with a 422 ValidationError. Use for naming fields where the empty
+# string is semantically invalid (e.g. UserFolder.name).
+NonEmptyStr64: TypeAlias = Annotated[str, Field(min_length=1, max_length=64), _NO_NULL_BYTE]
+"""1-64 character non-empty string field"""
+
+NonEmptyStr128: TypeAlias = Annotated[str, Field(min_length=1, max_length=128), _NO_NULL_BYTE]
+"""1-128 character non-empty string field"""
+
+NonEmptyStr256: TypeAlias = Annotated[str, Field(min_length=1, max_length=256), _NO_NULL_BYTE]
+"""1-256 character non-empty string field"""
+
+# Sha256Hex — exactly 64 lowercase hex characters, the canonical SHA-256 hex digest form.
+# The strict regex also implicitly rejects NUL bytes, so no separate _NO_NULL_BYTE is needed.
+Sha256Hex: TypeAlias = Annotated[str, StringConstraints(min_length=64, max_length=64, pattern=r'^[0-9a-f]{64}$')]
+"""64-char lowercase-hex SHA-256 digest (e.g. content hashes)"""
 
 # Numeric range constraints
 Port: TypeAlias = Annotated[int, Field(ge=1, le=65535)]

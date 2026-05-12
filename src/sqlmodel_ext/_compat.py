@@ -67,10 +67,15 @@ if sys.version_info >= (3, 14):
         # Check field.metadata (Pydantic-processed Annotated types)
         metadata = getattr(field, 'metadata', None)
         if metadata:
+            # Pass field.annotation as source_type so handlers that need the element type
+            # (e.g. _PendingArrayHandler extracting T from list[T] to compute ARRAY(T))
+            # can resolve. handler=None is fine because the sa_type extraction path only
+            # reads metadata['sa_type'] and never invokes the schema itself.
+            field_annotation = getattr(field, 'annotation', None)
             for metadata_item in metadata:
                 if hasattr(metadata_item, '__get_pydantic_core_schema__'):
                     try:
-                        schema = metadata_item.__get_pydantic_core_schema__(None, None)
+                        schema = metadata_item.__get_pydantic_core_schema__(field_annotation, None)
                         if isinstance(schema, dict) and 'metadata' in schema:
                             sa_type = schema['metadata'].get('sa_type')
                             if sa_type is not None:
@@ -105,7 +110,9 @@ if sys.version_info >= (3, 14):
                         for md in inner_args[1:]:
                             if hasattr(md, '__get_pydantic_core_schema__'):
                                 try:
-                                    schema = md.__get_pydantic_core_schema__(None, None)
+                                    # Pass first_arg (the full Annotated alias) as source_type so
+                                    # handlers like _PendingArrayHandler can extract the element type.
+                                    schema = md.__get_pydantic_core_schema__(first_arg, None)
                                     if isinstance(schema, dict) and 'metadata' in schema:
                                         sa_type = schema['metadata'].get('sa_type')
                                         if sa_type is not None:
@@ -153,7 +160,10 @@ if sys.version_info >= (3, 14):
                 for md in args[1:]:
                     if hasattr(md, '__get_pydantic_core_schema__'):
                         try:
-                            schema = md.__get_pydantic_core_schema__(None, None)
+                            # Pass annotation (the full Annotated form) as source_type so
+                            # handlers needing the element type (_PendingArrayHandler etc.)
+                            # can extract T from list[T].
+                            schema = md.__get_pydantic_core_schema__(annotation, None)
                             if isinstance(schema, dict) and 'metadata' in schema:
                                 sa_type = schema['metadata'].get('sa_type')
                                 if sa_type is not None:
