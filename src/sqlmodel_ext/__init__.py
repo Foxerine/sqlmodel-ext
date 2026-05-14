@@ -94,10 +94,12 @@ from sqlmodel_ext.field_types import (
     Text3K,
     Text5K,
     Text10K,
+    Text16K,
     Text32K,
     Text60K,
     Text64K,
     Text100K,
+    Text128K,
     Text1M,
     # Numeric constraints
     INT32_MAX,
