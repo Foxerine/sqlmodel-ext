@@ -40,7 +40,10 @@ jobs:
           uv pip install -e ".[dev,fastapi,cache,pgvector]"
 
       - name: Run basedpyright
-        run: uv run basedpyright --level error
+        run: |
+          output=$(uv run basedpyright 2>&1) || true
+          echo "$output"
+          echo "$output" | tail -1 | grep -q '^0 errors'
 
   # -------------------------------------------------------------------
   # Job 1: source-tree tests across supported Python versions.
