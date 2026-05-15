@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from numpy import floating
 from pgvector.sqlalchemy import Vector
 from pydantic_core import core_schema
 from sqlalchemy import TypeDecorator
@@ -138,7 +139,7 @@ class _NumpyVectorTypeHandler:
             dtype=dtype
         )
 
-    def _validate_and_convert(self, value: Any) -> npt.NDArray:
+    def _validate_and_convert(self, value: Any) -> npt.NDArray[floating[Any]]:
         """
         Validate and convert the input value to a numpy array.
 
@@ -253,11 +254,11 @@ class _NumpyVectorTypeHandler:
     def __get_pydantic_core_schema__(self, source_type, handler):
         """Pydantic v2 core schema definition."""
 
-        def validate_from_any(value: Any) -> npt.NDArray:
+        def validate_from_any(value: Any) -> npt.NDArray[floating[Any]]:
             """Pydantic validation function."""
             return self._validate_and_convert(value)
 
-        def serialize_to_json(value: npt.NDArray) -> dict[str, Any]:
+        def serialize_to_json(value: npt.NDArray[floating[Any]]) -> dict[str, Any]:
             """
             Serialize to a JSON-safe base64 format.
 
@@ -293,7 +294,7 @@ class _NumpyVectorTypeHandler:
 
 
 # --- SQLAlchemy TypeDecorator ---
-class _NumpyVectorSQLAlchemyType(TypeDecorator):
+class _NumpyVectorSQLAlchemyType(TypeDecorator[list[float]]):
     """
     SQLAlchemy type decorator mapping ``numpy.ndarray`` to ``pgvector.Vector``.
 
@@ -326,7 +327,7 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator):
         """
         return Vector(dim=self.dimensions)
 
-    def process_bind_param(self, value: npt.NDArray | None, dialect) -> list[float] | None:
+    def process_bind_param(self, value: npt.NDArray[floating[Any]] | None, dialect: Any) -> list[float] | None:  # pyright: ignore[reportIncompatibleMethodOverride]
         """
         Python -> Database: convert ``numpy.ndarray`` to ``list[float]``.
         """
@@ -338,7 +339,7 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator):
 
         return value.tolist()
 
-    def process_result_value(self, value: Any, dialect) -> npt.NDArray | None:
+    def process_result_value(self, value: Any, dialect: Any) -> npt.NDArray[floating[Any]] | None:  # pyright: ignore[reportIncompatibleMethodOverride]
         """
         Database -> Python: convert ``pgvector.Vector`` to ``numpy.ndarray``.
         """

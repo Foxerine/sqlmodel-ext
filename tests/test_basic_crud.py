@@ -48,7 +48,13 @@ class TestBasicCRUD:
         deleted_count = await Widget.delete(session, widget)
         assert deleted_count == 1
 
-        with pytest.raises(RecordNotFoundError):
+        expected_exc: type[Exception] = RecordNotFoundError
+        try:
+            from fastapi import HTTPException
+            expected_exc = HTTPException
+        except ImportError:
+            pass
+        with pytest.raises(expected_exc):
             await Widget.get_exist_one(session, widget.id)
 
     async def test_fetch_all_returns_list(self, session: AsyncSession) -> None:

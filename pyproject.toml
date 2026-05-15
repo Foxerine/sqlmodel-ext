@@ -47,6 +47,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "aiosqlite>=0.20",
     "ruff>=0.4",
+    "basedpyright>=1.39",
+    "pre-commit>=4.0",
 ]
 
 [project.urls]

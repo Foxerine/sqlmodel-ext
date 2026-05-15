@@ -34,11 +34,12 @@ from sqlmodel_ext.pagination import (
 )
 
 # Conditional FastAPI import
+_has_fastapi = False
 try:
     from fastapi import HTTPException as _FastAPIHTTPException
-    _HAS_FASTAPI = True
+    _has_fastapi = True
 except ImportError:
-    _HAS_FASTAPI = False
+    _FastAPIHTTPException = None
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +135,9 @@ class TableBaseMixin(AsyncAttrs):
 
     id: int | None = Field(default=None, primary_key=True)
 
-    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))
+    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))  # pyright: ignore[reportArgumentType]
     updated_at: datetime = Field(
-        sa_type=DateTime(timezone=True),
+        sa_type=DateTime(timezone=True),  # pyright: ignore[reportArgumentType]
         sa_column_kwargs={'default': now, 'onupdate': now},
         default_factory=now
     )
@@ -412,7 +413,7 @@ class TableBaseMixin(AsyncAttrs):
                 retries_remaining -= 1
                 if current_data is None:
                     # TableBaseMixin is always used with SQLModelBase; model_dump provided by Pydantic
-                    current_data = cast(SQLModelBase, self).model_dump(exclude={'id', 'version', 'created_at', 'updated_at'})
+                    current_data = cast(SQLModelBase, cast(object, self)).model_dump(exclude={'id', 'version', 'created_at', 'updated_at'})
 
                 fresh = await cls.get(session, cls.id == self.id)
                 if fresh is None:
@@ -480,7 +481,7 @@ class TableBaseMixin(AsyncAttrs):
 
         while True:
             # TableBaseMixin is always used with SQLModelBase; sqlmodel_update provided by SQLModel
-            _ = cast(SQLModelBase, instance).sqlmodel_update(update_data, update=extra_data)
+            _ = cast(SQLModelBase, cast(object, instance)).sqlmodel_update(update_data, update=extra_data)
             session.add(instance)
 
             try:
@@ -1196,7 +1197,7 @@ class TableBaseMixin(AsyncAttrs):
         """
         instance = await cls.get(session, col(cls.id) == id, load=load)
         if instance is None:
-            if _HAS_FASTAPI:
+            if _has_fastapi and _FastAPIHTTPException is not None:
                 raise _FastAPIHTTPException(status_code=404, detail=detail)
             raise RecordNotFoundError(detail)
         return instance
@@ -1212,12 +1213,12 @@ class UUIDTableBaseMixin(TableBaseMixin):
     Attributes:
         id: UUID primary key, auto-generated.
     """
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)  # pyright: ignore[reportIncompatibleVariableOverride]
     """UUID primary key, auto-generated."""
 
     @override
     @classmethod
-    async def get_one(
+    async def get_one(  # pyright: ignore[reportIncompatibleMethodOverride]
             cls: type[T],
             session: AsyncSession,
             id: uuid.UUID,
@@ -1238,7 +1239,7 @@ class UUIDTableBaseMixin(TableBaseMixin):
 
     @override
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T:
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T:  # pyright: ignore[reportIncompatibleMethodOverride]
         """
         Get a record by UUID primary key, raising 404 if not found.
 

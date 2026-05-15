@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: basedpyright
+        name: basedpyright
+        entry: basedpyright --level error
+        language: system
+        types: [python]
+        pass_filenames: false

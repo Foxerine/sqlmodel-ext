@@ -261,9 +261,9 @@ def _fix_polluted_model_fields(cls: type) -> None:
             continue
 
         if hasattr(current_field, 'foreign_key'):
-            new_field.foreign_key = current_field.foreign_key
+            new_field.foreign_key = current_field.foreign_key  # pyright: ignore[reportAttributeAccessIssue]
         if hasattr(current_field, 'primary_key'):
-            new_field.primary_key = current_field.primary_key
+            new_field.primary_key = current_field.primary_key  # pyright: ignore[reportAttributeAccessIssue]
 
         cls.model_fields[field_name] = new_field
 
@@ -381,7 +381,7 @@ class AutoPolymorphicIdentityMixin:
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         if hasattr(super(), '__pydantic_init_subclass__'):
-            super().__pydantic_init_subclass__(**kwargs)
+            super().__pydantic_init_subclass__(**kwargs)  # pyright: ignore[reportAttributeAccessIssue]
         _fix_polluted_model_fields(cls)
 
     @classmethod
@@ -405,8 +405,8 @@ class AutoPolymorphicIdentityMixin:
             return
 
         # JTI detection
-        if hasattr(cls, '__table__') and cls.__table__ is not None:
-            if cls.__table__.name != parent_table.name:
+        if hasattr(cls, '__table__') and cls.__table__ is not None:  # pyright: ignore[reportAttributeAccessIssue]
+            if cls.__table__.name != parent_table.name:  # pyright: ignore[reportAttributeAccessIssue]
                 return
 
         if not hasattr(cls, 'model_fields'):
@@ -414,7 +414,7 @@ class AutoPolymorphicIdentityMixin:
 
         existing_columns = {col.name for col in parent_table.columns}
 
-        for field_name, field_info in cls.model_fields.items():
+        for field_name, field_info in cls.model_fields.items():  # pyright: ignore[reportAttributeAccessIssue]
             if field_name in parent_fields:
                 continue
             if field_name.startswith('_'):
@@ -511,8 +511,8 @@ class AutoPolymorphicIdentityMixin:
             return
 
         # JTI detection: skip if this class has its own distinct table
-        if hasattr(cls, '__table__') and cls.__table__ is not None:
-            if cls.__table__.name != sti_table.name:
+        if hasattr(cls, '__table__') and cls.__table__ is not None:  # pyright: ignore[reportAttributeAccessIssue]
+            if cls.__table__.name != sti_table.name:  # pyright: ignore[reportAttributeAccessIssue]
                 return
 
         child_mapper = class_mapper(cls)
@@ -529,7 +529,7 @@ class AutoPolymorphicIdentityMixin:
 
         child_existing_props = {p.key for p in child_mapper.column_attrs}
 
-        for field_name in cls.model_fields:
+        for field_name in cls.model_fields:  # pyright: ignore[reportAttributeAccessIssue]
             if field_name in root_fields:
                 continue
             if field_name.startswith('_'):

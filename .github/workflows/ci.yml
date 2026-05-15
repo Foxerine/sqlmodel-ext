@@ -16,6 +16,33 @@ concurrency:
 
 jobs:
   # -------------------------------------------------------------------
+  # Job 0: static type checking with basedpyright (must stay at 0 errors)
+  # -------------------------------------------------------------------
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Create venv and install all extras
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e ".[dev,fastapi,cache,pgvector]"
+
+      - name: Run basedpyright
+        run: .venv/bin/basedpyright --level error
+
+  # -------------------------------------------------------------------
   # Job 1: source-tree tests across supported Python versions.
   # Uses uv sync so the lockfile is honoured and runs are reproducible.
   # -------------------------------------------------------------------

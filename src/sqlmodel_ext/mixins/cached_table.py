@@ -71,15 +71,14 @@ import logging
 from collections.abc import Callable
 
 try:
-    import orjson as _json_lib
+    import orjson
 
     def _json_dumps(obj: Any) -> bytes:
-        return _json_lib.dumps(obj)
+        return orjson.dumps(obj)
 
     def _json_loads(data: bytes | str) -> Any:
-        return _json_lib.loads(data)
+        return orjson.loads(data)
 except ImportError:
-    _json_lib = None  # type: ignore[assignment]
 
     def _json_dumps(obj: Any) -> bytes:
         return json.dumps(obj, separators=(",", ":"), default=str).encode("utf-8")
@@ -1691,7 +1690,7 @@ class CachedTableBaseMixin(TableBaseMixin):
     # ================================================================
 
     @classmethod  # MRO override TableBaseMixin.delete()
-    async def delete(
+    async def delete(  # pyright: ignore[reportIncompatibleMethodOverride]
             cls,
             session: AsyncSession,
             instances: Self | list[Self] | None = None,
@@ -1853,7 +1852,7 @@ class CachedTableBaseMixin(TableBaseMixin):
     # ================================================================
 
     @classmethod  # MRO override TableBaseMixin.add()
-    async def add(
+    async def add(  # pyright: ignore[reportIncompatibleMethodOverride]
             cls,
             session: AsyncSession,
             instances: Self | list[Self],

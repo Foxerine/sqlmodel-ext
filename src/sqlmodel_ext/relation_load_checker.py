@@ -76,12 +76,12 @@ logger = logging.getLogger(__name__)
 UNKNOWN_LABEL = '<unknown>'
 
 # Conditional FastAPI import: the library must be usable without FastAPI installed.
+_has_fastapi = False
 try:
     from fastapi.params import Depends as _FastAPIDependsClass
-    _HAS_FASTAPI = True
+    _has_fastapi = True
 except ImportError:
-    _FastAPIDependsClass = None  # type: ignore
-    _HAS_FASTAPI = False
+    _FastAPIDependsClass = None  # type: ignore[assignment]
 
 
 # ========================= Auto-check configuration =========================
@@ -1673,7 +1673,7 @@ class RelationLoadChecker:
         """
         dep_loads: dict[str, set[str]] = {}
 
-        if not _HAS_FASTAPI:
+        if not _has_fastapi:
             return dep_loads
 
         try:
