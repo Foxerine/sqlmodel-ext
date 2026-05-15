@@ -34,13 +34,11 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
-      - name: Create venv and install all extras
-        run: |
-          uv venv --python 3.12 .venv
-          uv pip install --python .venv/bin/python -e ".[dev,fastapi,cache,pgvector]"
+      - name: Install dependencies
+        run: uv pip install -e ".[dev,fastapi,cache,pgvector]"
 
       - name: Run basedpyright
-        run: .venv/bin/basedpyright --level error
+        run: uv run basedpyright --level error
 
   # -------------------------------------------------------------------
   # Job 1: source-tree tests across supported Python versions.
