@@ -8,7 +8,7 @@ This is your first conversation with sqlmodel-ext. In 15 minutes you'll have:
 - A clear mental model for "model + Mixin = table"
 
 ::: tip You don't need prior SQLAlchemy or SQLModel experience
-This tutorial introduces those concepts on demand. You only need Python 3.10+ and basic `async` / `await` knowledge. If you've never touched an ORM, skim [Prerequisites](/en/explanation/prerequisites) first.
+This tutorial introduces those concepts on demand. You only need Python 3.12+ and basic `async` / `await` knowledge. If you've never touched an ORM, skim [Prerequisites](/en/explanation/prerequisites) first.
 :::
 
 ## 0. Set up the environment

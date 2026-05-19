@@ -34,3 +34,12 @@ features:
   - title: Safe & Reliable
     details: Optimistic locking for concurrency control, @requires_relations to prevent MissingGreenlet, and AST static analysis at startup
 ---
+
+## Design orientation
+
+sqlmodel-ext is not a new ORM. It is a set of **opt-in Mixins** layered on top of SQLModel / Pydantic v2 / SQLAlchemy 2.0. The library only introduces two kinds of machinery:
+
+- **Metaclass enhancements** — automatic SQLAlchemy column setup driven by `Annotated` type hints, `mapper_args` merging, on-demand `*UpdateRequest` DTO generation, attribute-docstring inheritance, and a Python 3.14 (PEP 649) compatibility patch.
+- **Composable Mixins** — `TableBaseMixin` (async CRUD), `PolymorphicBaseMixin` (JTI/STI), `OptimisticLockMixin` (version-column concurrency), `RelationPreloadMixin` (eager loading), `CachedTableBaseMixin` (Redis two-tier cache). Each Mixin stands alone and has no hard dependency on the others.
+
+The underlying `Session`, `select()`, query construction, and migration tooling remain native SQLAlchemy — there is no custom DSL, and the library does not take over `engine` / `session` lifecycle. In practice that means you can drop a single Mixin into an existing SQLModel/SQLAlchemy project without rewriting your data-access layer.

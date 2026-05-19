@@ -25,7 +25,7 @@ Tutorials don't **exhaustively cover the API**. If a feature you need is missing
 
 All tutorials assume you know:
 
-- Python 3.10+
+- Python 3.12+ (3.12 / 3.13 / 3.14 are all exercised in CI)
 - Basic `async` / `await` syntax
 - What SELECT / INSERT / UPDATE / DELETE do in SQL
 

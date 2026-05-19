@@ -8,7 +8,7 @@
 - 理解"模型 + Mixin = 表"这个核心范式
 
 ::: tip 不需要事先懂 SQLAlchemy 或 SQLModel
-本教程会按需引入这些概念。你只需要 Python 3.10+ 和基本的 `async` / `await` 知识。如果你完全没接触过 ORM，建议在开始之前先扫一眼 [前置知识](/explanation/prerequisites)。
+本教程会按需引入这些概念。你只需要 Python 3.12+ 和基本的 `async` / `await` 知识。如果你完全没接触过 ORM，建议在开始之前先扫一眼 [前置知识](/explanation/prerequisites)。
 :::
 
 ## 0. 准备环境

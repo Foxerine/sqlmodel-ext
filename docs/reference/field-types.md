@@ -33,7 +33,7 @@ from sqlmodel_ext import Str16, Str24, Str32, Str36, Str48, Str64, Str100, Str12
 ## 文本约束
 
 ```python
-from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Text10K, Text32K, Text60K, Text64K, Text100K, Text1M
+from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Text10K, Text16K, Text32K, Text60K, Text64K, Text100K, Text128K, Text1M
 ```
 
 | 类型 | `max_length` |
@@ -45,10 +45,12 @@ from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Tex
 | `Text3K` | 3000 |
 | `Text5K` | 5000 |
 | `Text10K` | 10000 |
+| `Text16K` | 16000 |
 | `Text32K` | 32000 |
 | `Text60K` | 60000 |
 | `Text64K` | 65536 |
 | `Text100K` | 100000 |
+| `Text128K` | 131072（= 128 × 1024） |
 | `Text1M` | 1000000 |
 
 ## 数值约束

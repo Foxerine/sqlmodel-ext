@@ -34,3 +34,12 @@ features:
   - title: 安全与可靠
     details: 乐观锁并发控制、@requires_relations 防止 MissingGreenlet、启动时 AST 静态分析
 ---
+
+## 设计取向
+
+sqlmodel-ext 不是新的 ORM，而是构建在 SQLModel / Pydantic v2 / SQLAlchemy 2.0 之上的一组**可单独取用的 Mixin**。库本身只引入两类东西：
+
+- **元类增强**——根据 `Annotated` 类型注解自动设置 SQLAlchemy 列、合并 `mapper_args`、按需生成 `*UpdateRequest` DTO、保留属性 docstring，并打上 Python 3.14 (PEP 649) 兼容补丁。
+- **可插拔 Mixin**——`TableBaseMixin`（异步 CRUD）、`PolymorphicBaseMixin`（JTI/STI）、`OptimisticLockMixin`（版本号并发）、`RelationPreloadMixin`（关系预加载）、`CachedTableBaseMixin`（Redis 双层缓存）。每个 Mixin 都可以独立使用，不互相依赖。
+
+底层 `Session`、`select()`、查询构造、迁移工具仍是原生 SQLAlchemy，没有自创 DSL，也不接管 `engine`/`session` 的生命周期。换句话说：在已有 SQLModel/SQLAlchemy 项目里，可以单独引入需要的 Mixin，而不必重写既有数据访问层。

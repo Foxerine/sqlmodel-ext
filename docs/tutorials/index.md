@@ -25,7 +25,7 @@
 
 所有教程假设你具备：
 
-- Python 3.10+
+- Python 3.12+（3.12 / 3.13 / 3.14 均在 CI 中受测）
 - 基本的 `async` / `await` 语法
 - 知道 SQL 的 SELECT / INSERT / UPDATE / DELETE 是什么
 
