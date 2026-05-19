@@ -35,8 +35,9 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+import pytest
 import sqlalchemy as sa
-from sqlmodel import Field
+from sqlmodel import Field, SQLModel
 
 from sqlmodel_ext import SQLModelBase, TableBaseMixin, UUIDTableBaseMixin
 from sqlmodel_ext.field_types.dialects.postgresql import Array
@@ -55,6 +56,20 @@ DynScopeEnum = StrEnum(
     "DynScopeEnum",
     {f"r{i}_{a}": f"r{i}:{a}" for i in range(3) for a in ("read", "write")},
 )
+
+
+@pytest.fixture(autouse=True)
+def _drop_array_tables_from_shared_metadata():
+    # Each test in this file declares ``table=True`` models with PostgreSQL
+    # ``ARRAY`` columns. SQLModel auto-registers them on the shared
+    # ``SQLModel.metadata``; left there, conftest's SQLite ``create_all``
+    # in later tests trips on ``visit_ARRAY``. Snapshot the table names
+    # before each test and drop anything new on teardown. The leftover
+    # mapper class is harmless — only the Table entry blocks create_all.
+    tables_before = set(SQLModel.metadata.tables)
+    yield
+    for name in set(SQLModel.metadata.tables) - tables_before:
+        SQLModel.metadata.remove(SQLModel.metadata.tables[name])
 
 
 class TestExplicitFieldArraySaType:
