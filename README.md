@@ -125,10 +125,12 @@ async def demo(session: AsyncSession):
 A complete REST API -- models, DTOs, and five endpoints:
 
 ```python
+from collections.abc import AsyncGenerator
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import Field
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel_ext import (
@@ -136,17 +138,37 @@ from sqlmodel_ext import (
     ListResponse, TableViewRequest, UUIDIdDatetimeInfoMixin,
 )
 
-# ── Dependencies (defined once, reused everywhere) ────────────────
+# ── Dependency-injection layer: declare once (e.g. in a shared
+#    deps module), every router imports the type aliases ────────────
+
+_engine = create_async_engine("postgresql+asyncpg://localhost/app")
+_Session = async_sessionmaker(_engine, expire_on_commit=True)
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    async with _Session() as session:
+        yield session
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
-TableViewDep = Annotated[TableViewRequest, Depends()]
+"""Request-scoped AsyncSession. The single way endpoints touch the DB."""
 
-# ── Models ────────────────────────────────────────────────────────
+# TableViewRequest is a Pydantic model → FastAPI binds its fields as
+# query params automatically. No hand-written offset/limit/order plumbing.
+TableViewRequestDep = Annotated[TableViewRequest, Depends()]
+
+async def get_current_user(session: SessionDep) -> "User":
+    ...  # decode the bearer token, load the user — your auth, unchanged
+
+CurrentUserDep = Annotated["User", Depends(get_current_user)]
+
+# ── Models: the DTO ladder (Base → Create → Update → Response) ─────
 
 class ArticleBase(SQLModelBase):
     title: Str64
+    """Article title"""
     body: Text10K
+    """Article body (max 10k chars)"""
     is_published: bool = False
+    """Whether the article is publicly visible"""
 
 class Article(ArticleBase, UUIDTableBaseMixin, table=True):
     author_id: UUID = Field(foreign_key='user.id')
@@ -154,13 +176,23 @@ class Article(ArticleBase, UUIDTableBaseMixin, table=True):
 class ArticleCreate(ArticleBase):
     pass
 
-class ArticleUpdate(ArticleBase):
-    title: Str64 | None = None       # Override to optional,
-    body: Text10K | None = None      # preserving the original
-    is_published: bool | None = None  # type constraints from Base
+# all_fields_optional flips every inherited field to ``T | None = None``
+# while preserving its Annotated constraints AND attribute docstrings —
+# no hand-maintained per-field overrides.
+class ArticleUpdate(ArticleBase, all_fields_optional=True):
+    pass
 
 class ArticleResponse(ArticleBase, UUIDIdDatetimeInfoMixin):
     author_id: UUID
+
+# ── Resource-as-dependency: wrap "load by id or 404" once, then the
+#    fetched ORM instance is just another injected parameter ────────
+
+async def get_article(session: SessionDep, article_id: UUID) -> Article:
+    return await Article.get_exist_one(session, article_id)
+
+ArticleDep = Annotated[Article, Depends(get_article)]
+"""The Article for {article_id}, or 404 — fetched before the handler runs."""
 
 # ── Endpoints ─────────────────────────────────────────────────────
 
@@ -175,7 +207,7 @@ async def create_article(
 
 @router.get("", response_model=ListResponse[ArticleResponse])
 async def list_articles(
-        session: SessionDep, table_view: TableViewDep,
+        session: SessionDep, table_view: TableViewRequestDep,
 ) -> ListResponse[Article]:
     return await Article.get_with_count(
         session,
@@ -183,24 +215,24 @@ async def list_articles(
         table_view=table_view,
     )
 
+# article: ArticleDep — the 404 + fetch is the dependency's job, so the
+# single-resource handlers carry no lookup boilerplate at all.
 @router.get("/{article_id}", response_model=ArticleResponse)
-async def get_article(session: SessionDep, article_id: UUID) -> Article:
-    return await Article.get_exist_one(session, article_id)
+async def get_article_detail(article: ArticleDep) -> Article:
+    return article
 
 @router.patch("/{article_id}", response_model=ArticleResponse)
 async def update_article(
-        session: SessionDep, article_id: UUID, data: ArticleUpdate,
+        session: SessionDep, article: ArticleDep, data: ArticleUpdate,
 ) -> Article:
-    article = await Article.get_exist_one(session, article_id)
     return await article.update(session, data)
 
 @router.delete("/{article_id}")
-async def delete_article(session: SessionDep, article_id: UUID) -> None:
-    article = await Article.get_exist_one(session, article_id)
+async def delete_article(session: SessionDep, article: ArticleDep) -> None:
     await Article.delete(session, article)
 ```
 
-No manual SQL, no hand-written pagination logic, no boilerplate session management. The `TableViewDep` gives clients `offset`, `limit`, `desc`, `order`, and four time filters out of the box.
+No manual SQL, no hand-written pagination logic, no boilerplate session management. The `TableViewRequestDep` gives clients `offset`, `limit`, `desc`, `order`, and four time filters out of the box.
 
 **What the client gets from `GET /articles?offset=0&limit=10&desc=true`:**
 
@@ -395,7 +427,7 @@ class PushNotification(NotifSubclassId, Notification, AutoPolymorphicIdentityMix
 
 @router.get("/notifications", response_model=ListResponse[NotificationBase])
 async def list_notifications(
-        session: SessionDep, user: CurrentUserDep, table_view: TableViewDep,
+        session: SessionDep, user: CurrentUserDep, table_view: TableViewRequestDep,
 ) -> ListResponse[Notification]:
     return await Notification.get_with_count(
         session,

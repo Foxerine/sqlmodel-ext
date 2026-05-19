@@ -28,8 +28,14 @@ from sqlmodel.main import (
     is_table_model_class,
     get_relationship_to,
     FieldInfo as SQLModelFieldInfo,  # Internal API: stable since sqlmodel 0.0.22
+    FieldInfoMetadata,  # Internal API: pydantic-rebuild-safe sa_type carrier
     get_column_from_field,  # Internal API: stable since sqlmodel 0.0.22
 )
+
+# sqlmodel's FieldInfoMetadata fields default to sqlmodel's own Undefined
+# sentinel (distinct from pydantic_core PydanticUndefined imported above);
+# capture it to detect "sa_type not yet set" without importing sqlmodel internals.
+_FIM_UNSET_SA_TYPE = FieldInfoMetadata().sa_type
 
 # Import _compat for side effects (Python 3.14 monkey-patches)
 import sqlmodel_ext._compat  # noqa: F401
@@ -141,6 +147,49 @@ def _find_field_info_in_annotated(annotation: Any) -> SQLModelFieldInfo | None:
     for extra_fi in sqlmodel_fis[1:]:
         _merge_field_info_attrs(merged, extra_fi)
     return merged
+
+
+def _durably_set_sa_type(field_info: Any, sa_type: Any) -> None:
+    """
+    Inject ``sa_type`` so it survives Pydantic's model_fields rebuild.
+
+    Root cause this fixes: the metaclass extracts ``sa_type`` from
+    ``Array[T]`` / custom Annotated handlers and must hand it to SQLModel's
+    column builder. A plain ``setattr(field_info, 'sa_type', sa_type)`` is
+    LOST: ``SQLModelMetaclass.__new__`` (invoked from our ``super().__new__``)
+    runs ``get_column_from_field`` *before* step-7's SQLModelFieldInfo
+    restore, and Pydantic has by then rebuilt ``model_fields`` into fresh
+    FieldInfo objects that never saw the post-hoc attribute. The previous
+    code only fixed the no-``= Field(...)`` branch (c00696c); the explicit
+    ``Array[T] = Field(default_factory=list)`` form still raised
+    ``<class 'list'> has no matching SQLAlchemy type``.
+
+    Fix: write ``sa_type`` into a ``FieldInfoMetadata`` entry inside the
+    FieldInfo's pydantic ``metadata`` list — the exact channel SQLModel's
+    own ``Field(sa_type=...)`` uses and which ``get_sqlalchemy_type``
+    (via ``_get_sqlmodel_field_value``) reads *first*. Pydantic preserves
+    the ``metadata`` list across rebuilds, so the type survives into the
+    column build. The instance attribute is also set as a belt-and-braces
+    fallback for any direct ``getattr(field_info, 'sa_type')`` reader.
+
+    :param field_info: target FieldInfo (user's Field or recovered Annotated FI)
+    :param sa_type: SQLAlchemy type extracted from the annotation handler
+    """
+    md = list(getattr(field_info, 'metadata', None) or [])
+    existing = next(
+        (m for m in md if isinstance(m, FieldInfoMetadata)), None
+    )
+    if existing is not None:
+        if existing.sa_type is _FIM_UNSET_SA_TYPE:
+            existing.sa_type = sa_type
+    else:
+        md.append(FieldInfoMetadata(sa_type=sa_type))
+        field_info.metadata = md
+    if getattr(field_info, 'sa_type', Undefined) is Undefined:
+        try:
+            field_info.sa_type = sa_type
+        except (AttributeError, TypeError):
+            pass
 
 
 def _make_annotation_optional(annotation: typing.Any) -> typing.Any:
@@ -602,14 +651,16 @@ class __DeclarativeMeta(SQLModelMetaclass):
                     # inheritance.
                     annotated_fi = _find_field_info_in_annotated(field_type)
                     if annotated_fi is not None:
-                        if getattr(annotated_fi, 'sa_type', Undefined) is Undefined:
-                            setattr(annotated_fi, 'sa_type', sa_type)
+                        _durably_set_sa_type(annotated_fi, sa_type)
                         attrs[field_name] = annotated_fi
                     else:
                         attrs[field_name] = Field(sa_type=sa_type)
                 elif isinstance(field_value, FieldInfo):
-                    if getattr(field_value, 'sa_type', Undefined) is Undefined:
-                        setattr(field_value, 'sa_type', sa_type)
+                    # Explicit ``Array[T] = Field(default_factory=list)`` form.
+                    # Must inject sa_type via the pydantic-rebuild-safe
+                    # FieldInfoMetadata channel — plain setattr is dropped
+                    # before SQLModel's column build (see _durably_set_sa_type).
+                    _durably_set_sa_type(field_value, sa_type)
 
         # 5. Save SQLModel FieldInfo from Annotated fields before super().__new__(),
         # because Pydantic rebuilds model_fields with plain FieldInfo that lacks
