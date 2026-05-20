@@ -32,6 +32,14 @@ from sqlmodel.main import (
     get_column_from_field,  # Internal API: stable since sqlmodel 0.0.22
 )
 
+# sqlmodel 0.0.32+ FieldInfoMetadata is a @dataclass whose auto-generated
+# __eq__ causes __hash__ = None.  Annotated[T, FieldInfoMetadata(...)] then
+# becomes unhashable, breaking FastAPI's OpenAPI set-based dedup in
+# get_definitions().  Restore identity-based hashing until upstream fixes it.
+# Ref: https://github.com/fastapi/sqlmodel/pull/1889
+if getattr(FieldInfoMetadata, '__hash__') is None:
+    FieldInfoMetadata.__hash__ = object.__hash__  # type: ignore[assignment]
+
 # sqlmodel's FieldInfoMetadata fields default to sqlmodel's own Undefined
 # sentinel (distinct from pydantic_core PydanticUndefined imported above);
 # capture it to detect "sa_type not yet set" without importing sqlmodel internals.
