@@ -596,7 +596,7 @@ def _recover_annotated_sqlmodel_fields(
 def _make_sti_fk_resolver(
     fk_string: str,
     sa_registry: typing.Any,
-) -> typing.Callable:
+) -> typing.Callable[[], list[typing.Any]] | str:
     """
     Convert string-format foreign_keys to a callable for deferred resolution in STI.
 
@@ -610,7 +610,7 @@ def _make_sti_fk_resolver(
 
     :param fk_string: String-format foreign_keys, e.g. '[NanoBananaFunction.flash_llm_id]'
     :param sa_registry: SQLAlchemy registry for class-name lookup
-    :return: callable returning list of Column objects
+    :return: callable returning list of Column objects, or original string if unparseable
     """
     inner = fk_string.strip('[]')
     specs = [s.strip() for s in inner.split(',')]
@@ -619,13 +619,13 @@ def _make_sti_fk_resolver(
     for spec in specs:
         m = re.match(r'^(\w+)\.(\w+)$', spec)
         if not m:
-            return fk_string  # type: ignore  # cannot parse, return original
+            return fk_string
         parsed.append((m.group(1), m.group(2)))
 
     _registry = sa_registry
 
-    def _resolve() -> list:
-        columns = []
+    def _resolve() -> list[typing.Any]:
+        columns: list[typing.Any] = []
         for cls_name, col_name in parsed:
             for mapper in _registry.mappers:
                 if mapper.class_.__name__ == cls_name:
@@ -710,7 +710,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
         "concrete",
     }
 
-    def __new__(cls, name, bases, attrs, **kwargs):
+    def __new__(cls, name: str, bases: tuple[type, ...], attrs: dict[str, typing.Any], **kwargs: typing.Any):  # pyright: ignore[reportInconsistentConstructor]
         # 1. Convention over configuration: auto table=True
         is_intended_as_table = any(getattr(b, '_has_table_mixin', False) for b in bases)
         if is_intended_as_table and 'table' not in kwargs:
@@ -951,7 +951,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
 
         return result
 
-    def __init__(
+    def __init__(  # pyright: ignore[reportInconsistentConstructor]
         cls,
         classname: str,
         bases: tuple[type, ...],
@@ -981,10 +981,10 @@ class __DeclarativeMeta(SQLModelMetaclass):
         # Detect JTI scenario
         current_tablename = getattr(cls, '__tablename__', None)
 
-        parent_tablename = None
+        parent_tablename: str | None = None
         for base in bases:
             if is_table_model_class(base) and hasattr(base, '__tablename__'):
-                parent_tablename = base.__tablename__
+                parent_tablename = str(base.__tablename__)
                 break
 
         has_different_tablename = (
@@ -1078,7 +1078,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
                     for field_name, field_info in base.model_fields.items():
                         fk = getattr(field_info, 'foreign_key', None)
                         pk = getattr(field_info, 'primary_key', False)
-                        if fk is not None and isinstance(fk, str) and _fk_matches_parent(fk, parent_tablename):
+                        if fk is not None and isinstance(fk, str) and parent_tablename and _fk_matches_parent(fk, parent_tablename):
                             fk_field_name = field_name
                             new_col = Column(
                                 field_name,
@@ -1308,7 +1308,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
     Must be used together with TableBaseMixin or UUIDTableBaseMixin for table models.
     """
 
-    model_config = ConfigDict(use_attribute_docstrings=True, validate_by_name=True, extra='forbid')
+    model_config = ConfigDict(use_attribute_docstrings=True, validate_by_name=True, extra='forbid')  # pyright: ignore[reportAssignmentType]
 
     @classmethod
     def __get_pydantic_json_schema__(
@@ -1362,7 +1362,7 @@ class ExtraIgnoreModelBase(SQLModelBase):
     (those should keep 'forbid' to catch mistakes).
     """
 
-    model_config = ConfigDict(
+    model_config = ConfigDict(  # pyright: ignore[reportAssignmentType]
         use_attribute_docstrings=True, validate_by_name=True, extra='ignore',
     )
 

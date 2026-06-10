@@ -7,6 +7,7 @@ Provides two JSONB types that enforce a maximum JSON string length of 100K chara
 - ``JSONList100K`` -- stores a ``list[dict]`` (JSON array)
 """
 import typing
+from typing import Any
 
 import orjson
 from pydantic import GetCoreSchemaHandler
@@ -17,12 +18,12 @@ MAX_JSON_LENGTH = 100_000
 """Maximum JSON string length (100K characters)."""
 
 
-def _serialize_to_json(value: dict | list) -> str:
+def _serialize_to_json(value: dict[str, Any] | list[Any]) -> str:
     """Serialize a dict or list to a JSON string."""
     return orjson.dumps(value).decode('utf-8')
 
 
-def _parse_json_string(value: str, expected_type: type, type_name: str) -> dict | list:
+def _parse_json_string(value: str, expected_type: type, type_name: str) -> dict[str, Any] | list[Any]:
     """
     Parse a JSON string.
 
@@ -51,7 +52,7 @@ def _parse_json_string(value: str, expected_type: type, type_name: str) -> dict 
     return result
 
 
-class JSON100K(dict):
+class JSON100K(dict[str, Any]):
     """
     PostgreSQL JSONB type (object) with a 100K character input limit.
 
@@ -82,7 +83,9 @@ class JSON100K(dict):
             if isinstance(value, dict):
                 return value
             if isinstance(value, str):
-                return _parse_json_string(value, dict, "JSON100K")
+                result = _parse_json_string(value, dict, "JSON100K")
+                assert isinstance(result, dict)
+                return result
             raise TypeError(
                 f"JSON100K accepts str or dict, not {type(value).__name__}"
             )
@@ -114,7 +117,7 @@ class JSON100K(dict):
         )
 
 
-class JSONList100K(list):
+class JSONList100K(list[dict[str, Any]]):
     """
     PostgreSQL JSONB type (array) with a 100K character input limit.
 
@@ -145,7 +148,9 @@ class JSONList100K(list):
             if isinstance(value, list):
                 return value
             if isinstance(value, str):
-                return _parse_json_string(value, list, "JSONList100K")
+                result = _parse_json_string(value, list, "JSONList100K")
+                assert isinstance(result, list)
+                return result
             raise TypeError(
                 f"JSONList100K accepts str or list, not {type(value).__name__}"
             )

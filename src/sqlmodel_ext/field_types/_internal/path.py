@@ -7,17 +7,17 @@ from pydantic_core import core_schema
 from sqlalchemy.types import String, TypeDecorator
 
 
-class _PathAsSQLString(TypeDecorator):
+class _PathAsSQLString(TypeDecorator[str]):
     """(Internal) Converts Path <-> str for the database."""
     impl = String
     cache_ok = True
-    def process_bind_param(self, v, d): return str(v) if v else None
-    def process_result_value(self, v, d): return Path(v) if v else None
+    def process_bind_param(self, v: Any, d: Any) -> str | None: return str(v) if v else None  # pyright: ignore[reportIncompatibleMethodOverride]
+    def process_result_value(self, v: Any, d: Any) -> Path | None: return Path(v) if v else None  # pyright: ignore[reportIncompatibleMethodOverride]
 
 
 class _BasePathHandler(ABC):
     """(Internal) Base class for single-value type handlers like Path."""
-    sa_type: TypeDecorator = _PathAsSQLString
+    sa_type: type[TypeDecorator[str]] = _PathAsSQLString
 
     @classmethod
     @abstractmethod
