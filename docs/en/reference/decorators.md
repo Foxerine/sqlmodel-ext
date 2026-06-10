@@ -113,21 +113,23 @@ scope = cond(UserFile.user_id == current_user.id)
 condition = scope & cond(UserFile.status == FileStatusEnum.uploaded)
 ```
 
-## `safe_reset()`
+## `session.reset()` (enhanced AsyncSession) {#session-reset}
 
 ```python
-from sqlmodel_ext import safe_reset
+from sqlmodel_ext import AsyncSession
 ```
 
-**Signature**:
+**Signature** (enhanced method on `sqlmodel_ext.session.AsyncSession`):
 
 ```python
-async def safe_reset(session: AsyncSession) -> None
+async def reset(self) -> None
 ```
 
-**Purpose**: clears the FOR UPDATE lock tracking set in `session.info[SESSION_FOR_UPDATE_KEY]` before calling `session.reset()`. Safer than calling `session.reset()` directly — prevents the lock-tracking set from leaking into the next session reuse cycle.
+> Replaces the removed `safe_reset()` helper since 0.4.0. Construct sessions with `async_sessionmaker(class_=AsyncSession)` and simply `await session.reset()`.
 
-**Typical use case**: an HTTP endpoint / Taskiq task needs to do long external I/O mid-flight (S3, ffprobe, third-party HTTP polling, etc.). Call `safe_reset` first to release the DB connection, so the connection isn't blocked on network I/O and the pool isn't exhausted. See [Release the DB connection during long I/O](/en/how-to/release-connection-during-long-io).
+**Purpose**: after the upstream `reset()` (releasing the transaction and connection), automatically clears the FOR UPDATE lock-tracking set in `session.info[SESSION_FOR_UPDATE_KEY]` and the cache-invalidation tracking state — preventing tracking state from leaking into the next session reuse cycle.
+
+**Typical use case**: an HTTP endpoint / Taskiq task needs to do long external I/O mid-flight (S3, ffprobe, third-party HTTP polling, etc.). Call `session.reset()` first to release the DB connection, so the connection isn't blocked on network I/O and the pool isn't exhausted. See [Release the DB connection during long I/O](/en/how-to/release-connection-during-long-io).
 
 **Object state after the call**:
 

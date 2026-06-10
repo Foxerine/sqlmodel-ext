@@ -1288,14 +1288,27 @@ class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
 
 ---
 
-### safe_reset
+### 增强 AsyncSession（缓存感知 commit/reset/refresh）
 
-安全重置异步会话，同时清理 FOR UPDATE 锁跟踪：
+`sqlmodel_ext.AsyncSession` 是 sqlmodel `AsyncSession` 的增强子类，把缓存正确性变为自动行为。把 session 工厂指向它：
 
 ```python
-from sqlmodel_ext import safe_reset
-await safe_reset(session)
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel_ext import AsyncSession
+
+session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 ```
+
+能力：
+
+- **`commit()`** 自动登记 session 中所有 `CachedTableBaseMixin` 变更（含裸 `session.add()` / 改属性 / `session.delete()` 路径），commit 后同步失效 Redis 缓存——消除"忘记 cache-aware commit"的 stale 窗口。
+- **`reset()`** 释放连接并清理 `session.info` 中的 FOR UPDATE 锁跟踪 + 缓存失效跟踪（替代已删除的 `safe_reset()`——直接 `await session.reset()` 即可）。
+- **`refresh()`** 对缓存模型的整体刷新走 `Model.get()`（Redis 命中 + STI 多态列），而非裸查 DB。
+- **`execute()`** 对绕过缓存失效的裸 `UPDATE`/`DELETE` 打 WARNING。
+
+不使用 `CachedTableBaseMixin` 的模型完全不受影响——所有钩子退化为上游行为。
+
+> **0.4.0 Breaking change**：`safe_reset()` 与 `CachedTableBaseMixin.cache_aware_commit()` 已删除。CRUD 方法不再自行失效缓存，失效统一发生在 `AsyncSession.commit()` 内。使用 `CachedTableBaseMixin` 时**必须**以 `class_=sqlmodel_ext.AsyncSession` 构造 session（普通 session 会退化为 fire-and-forget 的 `after_commit` 补偿钩子，重新引入短暂的 stale 窗口）。
 
 ---
 
@@ -1312,7 +1325,7 @@ sqlmodel_ext/
     pagination.py            # ListResponse、TimeFilterRequest、PaginationRequest、TableViewRequest
     mixins/
         __init__.py          # Mixin 重导出
-        table.py             # TableBaseMixin、UUIDTableBaseMixin、safe_reset（异步 CRUD）
+        table.py             # TableBaseMixin、UUIDTableBaseMixin（异步 CRUD）
         cached_table.py      # CachedTableBaseMixin（双层 Redis 缓存 + 版本号失效）
         polymorphic.py       # PolymorphicBaseMixin、AutoPolymorphicIdentityMixin、create_subclass_id_mixin
         optimistic_lock.py   # OptimisticLockMixin、OptimisticLockError

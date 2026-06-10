@@ -28,7 +28,7 @@ from sqlmodel_ext import (
 | [CRUD 方法](./crud-methods) | `add` / `save` / `update` / `delete` / `get` / `get_one` / `get_exist_one` / `count` / `get_with_count` 完整签名 |
 | [字段类型](./field-types) | `Str16`–`Text1M`、`Port`、`Percentage`、`PositiveInt`、`HttpUrl`、`SafeHttpUrl`、`IPAddress`、`Array[T]`、`JSON100K`、`NumpyVector` |
 | [Mixin 类](./mixins) | `CachedTableBaseMixin`、`OptimisticLockMixin`、`PolymorphicBaseMixin`、`AutoPolymorphicIdentityMixin`、`RelationPreloadMixin`、信息响应 Mixin |
-| [装饰器与辅助函数](./decorators) | `@requires_relations`、`@requires_for_update`、`rel()`、`cond()`、`safe_reset()` |
+| [装饰器与辅助函数](./decorators) | `@requires_relations`、`@requires_for_update`、`rel()`、`cond()`、增强 `session.reset()` |
 | [分页类型](./pagination-types) | `ListResponse[T]`、`TableViewRequest`、`PaginationRequest`、`TimeFilterRequest` |
 
 ## 常量

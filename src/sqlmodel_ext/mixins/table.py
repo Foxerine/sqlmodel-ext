@@ -51,19 +51,12 @@ SESSION_FOR_UPDATE_KEY = '_for_update_locked'
 """Key in session.info storing the set of id() values for FOR UPDATE locked instances."""
 
 
-async def safe_reset(session: AsyncSession) -> None:
-    """
-    session.reset() + clear FOR UPDATE lock tracking.
-
-    reset() releases the transaction and DB connection but does not clear session.info.
-    Long-lived sessions (e.g. Taskiq tasks with multiple reset+reuse cycles) accumulate
-    stale locked id() values. If Python reuses an object id, @requires_for_update may
-    incorrectly treat an unlocked instance as locked.
-
-    :param session: The async session to reset
-    """
-    await session.reset()
-    session.info.pop(SESSION_FOR_UPDATE_KEY, None)
+# NOTE: ``safe_reset`` has been removed -- its responsibility (reset + clearing
+# the FOR UPDATE / cache-invalidation tracking keys) moved into
+# ``sqlmodel_ext.session.AsyncSession.reset()`` (the enhanced session type).
+# Callers simply ``await session.reset()``; no manual wrapper needed.
+# SESSION_FOR_UPDATE_KEY is still written by get(with_for_update=True) and
+# cleared by the enhanced reset().
 
 
 # NOTE(SQLModel typing): load parameter uses QueryableAttribute[Any] (InstrumentedAttribute at runtime).
@@ -523,6 +516,35 @@ class TableBaseMixin(AsyncAttrs):
         if result is None:
             raise RuntimeError(f"{cls.__name__} record not found (id={_instance_id})")
         return result
+
+    # The @overload stubs make the type checker report "no matching overload"
+    # when a caller passes neither instances nor condition -- promoting the
+    # "must provide instances or condition" runtime business invariant into a
+    # compile-time constraint, eliminating ``await obj.delete(session)``
+    # (missing-argument) bugs entirely.
+    @overload
+    @classmethod
+    async def delete(
+            cls: type[T],
+            session: AsyncSession,
+            instances: T | list[T],
+            *,
+            commit: bool = ...,
+    ) -> int:
+        """Instance-deletion overload: instances is required."""
+        ...
+
+    @overload
+    @classmethod
+    async def delete(
+            cls: type[T],
+            session: AsyncSession,
+            *,
+            condition: ColumnElement[bool] | bool,
+            commit: bool = ...,
+    ) -> int:
+        """Condition-deletion overload: the condition kwarg is required."""
+        ...
 
     @classmethod
     async def delete(

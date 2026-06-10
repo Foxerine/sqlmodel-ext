@@ -30,10 +30,27 @@ from sqlmodel_ext import Str16, Str24, Str32, Str36, Str48, Str64, Str100, Str12
 | `Str512` | 512 | 同上 |
 | `Str2048` | 2048 | 同上 |
 
+### 非空与专用字符串
+
+```python
+from sqlmodel_ext import (
+    NonEmptyStr64, NonEmptyStr128, NonEmptyStr256,
+    NonEmptyStrippedStr64, NonEmptyStrippedStr128, NonEmptyStrippedStr256,
+    Sha256Hex, BCP47LanguageCode,
+)
+```
+
+| 类型 | 约束 |
+|------|------|
+| `NonEmptyStr64/128/256` | `1 <= len <= N`，拒绝空字符串 `""` |
+| `NonEmptyStrippedStr64/128/256` | 同上 + `strip_whitespace`，拒绝纯空白（`"   "` / `"\t"`） |
+| `Sha256Hex` | 精确 64 位小写 hex（SHA-256 摘要） |
+| `BCP47LanguageCode` | BCP-47 语言代码语法（如 `zh-Hans-CN`），`max_length=16` |
+
 ## 文本约束
 
 ```python
-from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Text10K, Text16K, Text32K, Text60K, Text64K, Text100K, Text128K, Text1M
+from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Text8K, Text10K, Text16K, Text32K, Text48K, Text60K, Text64K, Text100K, Text128K, Text1M
 ```
 
 | 类型 | `max_length` |
@@ -44,9 +61,11 @@ from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Tex
 | `Text2500` | 2500 |
 | `Text3K` | 3000 |
 | `Text5K` | 5000 |
+| `Text8K` | 8000 |
 | `Text10K` | 10000 |
 | `Text16K` | 16000 |
 | `Text32K` | 32000 |
+| `Text48K` | 48000 |
 | `Text60K` | 60000 |
 | `Text64K` | 65536 |
 | `Text100K` | 100000 |
@@ -90,6 +109,42 @@ from sqlmodel_ext import INT32_MAX, INT64_MAX, JS_MAX_SAFE_INTEGER
 | `INT32_MAX` | `2_147_483_647`（2³¹−1） |
 | `INT64_MAX` | `9_223_372_036_854_775_807`（2⁶³−1） |
 | `JS_MAX_SAFE_INTEGER` | `9_007_199_254_740_991`（2⁵³−1） |
+
+## Decimal 约束（0.4.0 新增）
+
+```python
+from sqlmodel_ext import (
+    SignedDecimal38_18, NonNegativeDecimal38_18, PositiveDecimal38_18, OptionalNonNegativeDecimal38_18,
+    SignedDecimal20_10, NonNegativeDecimal20_10, OptionalNonNegativeDecimal20_10,
+)
+```
+
+命名约定：`[Optional][Signed|NonNegative|Positive]Decimal{precision}_{scale}`，对应数据库列 `NUMERIC(precision, scale)`。
+
+| 类型 | 符号 | 数据库列 |
+|------|------|---------|
+| `SignedDecimal38_18` | 任意 | `NUMERIC(38, 18)` |
+| `NonNegativeDecimal38_18` | `>= 0` | `NUMERIC(38, 18)` |
+| `PositiveDecimal38_18` | `> 0` | `NUMERIC(38, 18)` |
+| `OptionalNonNegativeDecimal38_18` | `>= 0` 或 `None` | `NUMERIC(38, 18)` |
+| `SignedDecimal20_10` | 任意 | `NUMERIC(20, 10)` |
+| `NonNegativeDecimal20_10` | `>= 0` | `NUMERIC(20, 10)` |
+| `OptionalNonNegativeDecimal20_10` | `>= 0` 或 `None` | `NUMERIC(20, 10)` |
+
+行为契约：
+
+- **拒绝 float / bool 输入**（IEEE 754 已丢精度）——接受 `Decimal` / `int` / `str`
+- **JSON 序列化为定点字符串**（`model_dump_json()`），永不出现科学计数法（`0E-18` → `'0'`）、剔除冗余尾零（`1200.000...0` → `'1200'`），防止 JS Number 精度损失
+- **dict 模式保留 `Decimal` 对象**（`model_dump()`）
+- `Optional*` 变体的约束嵌套在内层 `Annotated`，JSON `null` 解析安全
+
+## 有界长度 List 别名（0.4.0 新增）
+
+```python
+from sqlmodel_ext import List, List1, List2, List3, List7, List10, List16, List20, List32, List40, List50, List64, List100, List128, List200, List256, List1024
+```
+
+`List<N>[T]` 等价 `Annotated[list[T], Field(max_length=N)]`——最大长度编码在类型名中（与 `Str64` / `Text1K` 命名一致）。`List[T]`（无数字）等价 `list[T]`。用于请求 DTO / 协议层等非数据库列场景，与 PG `Array[T]` 列类型无关。
 
 ## URL 类型
 

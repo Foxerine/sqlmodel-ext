@@ -28,11 +28,11 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
     return file
 ```
 
-## 2. Use `safe_reset()` around the I/O block
+## 2. Use `session.reset()` around the I/O block
+
+> Since 0.4.0 `safe_reset()` has been removed -- its responsibility moved into the enhanced `sqlmodel_ext.AsyncSession.reset()` (construct sessions with `async_sessionmaker(class_=AsyncSession)`). `reset()` releases the connection and also clears FOR UPDATE lock tracking and cache-invalidation tracking.
 
 ```python
-from sqlmodel_ext import safe_reset
-
 @router.get("/files/{file_id}")
 async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
     file = await UserFile.get(session, UserFile.id == file_id)
@@ -42,7 +42,7 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
         key = file.key
         file_id = file.id
 
-        await safe_reset(session)  # ← release the DB connection // [!code ++]
+        await session.reset()  # ← release the DB connection // [!code ++]
 
         # ↓ This block holds NO DB connection — concurrent requests can use the pool
         data = await s3.download_file(bucket_id, key)
@@ -56,26 +56,26 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
 ```
 
 **Key points**:
-- `safe_reset` releases the current transaction and connection, but the session object itself stays alive (it's not closed)
+- `session.reset()` releases the current transaction and connection, but the session object itself stays alive (it's not closed)
 - Any subsequent `await Model.get/save` that issues SQL transparently checks out a new connection from the pool
 - During the released window all 30 connections are idle (unless other requests use them) — concurrent requests **are not stalled**
 
-## 3. Object state after `safe_reset`: detached but not expired
+## 3. Object state after `session.reset()`: detached but not expired
 
-After `safe_reset`, every ORM object in the session enters the **detached** state (no longer in `session.identity_map`), but **already-loaded scalar fields remain in `obj.__dict__`** — accessing them does not trigger a SQL query, so it does **not** raise `MissingGreenlet`.
+After `session.reset()`, every ORM object in the session enters the **detached** state (no longer in `session.identity_map`), but **already-loaded scalar fields remain in `obj.__dict__`** — accessing them does not trigger a SQL query, so it does **not** raise `MissingGreenlet`.
 
 ```python
 from sqlalchemy import inspect as sa_inspect
 
-# Before safe_reset:
+# Before reset:
 file = await UserFile.get(session, UserFile.id == fid)
 print(sa_inspect(file).detached)  # False
 print(sa_inspect(file).expired)   # False
 print(file.bucket_id)             # OK, loaded
 
-await safe_reset(session)
+await session.reset()
 
-# After safe_reset:
+# After reset:
 print(sa_inspect(file).detached)  # True  ← note // [!code highlight]
 print(sa_inspect(file).expired)   # False ← loaded fields are NOT expired // [!code highlight]
 print(file.bucket_id)             # OK! scalar field access is safe // [!code ++]
@@ -84,7 +84,7 @@ print(file.parent)                # InvalidRequestError or MissingGreenlet // [!
 
 ### Safe-access rules
 
-| Access | After safe_reset | Why |
+| Access | After session.reset() | Why |
 |--------|-----------------|-----|
 | Already-loaded scalar field | ✓ Safe | In `__dict__`, no DB query |
 | Already-loaded relation (preloaded via `load=`) | ✓ Safe | Same |
@@ -93,7 +93,7 @@ print(file.parent)                # InvalidRequestError or MissingGreenlet // [!
 
 ### Recommended style
 
-When writing the code that runs **before** `safe_reset`, extract any field you'll need later into local variables:
+When writing the code that runs **before** `session.reset()`, extract any field you'll need later into local variables:
 
 ```python
 # Recommended:
@@ -102,7 +102,7 @@ bucket_id = file.bucket_id
 key = file.key
 user_id = file.user_id
 
-await safe_reset(session)
+await session.reset()
 
 # The code below uses local variables (file_id / bucket_id / ...),
 # never touches file.X again.
@@ -112,10 +112,10 @@ This way, even if some field on the model becomes lazy-loaded in the future, the
 
 ## 4. You must re-query before writing
 
-After `safe_reset` the object is detached and **cannot be saved directly**. To write, re-query a fresh attached instance:
+After `session.reset()` the object is detached and **cannot be saved directly**. To write, re-query a fresh attached instance:
 
 ```python
-await safe_reset(session)
+await session.reset()
 
 # Long I/O...
 metadata = await fetch_external_metadata(...)
@@ -130,15 +130,15 @@ file.metadata = metadata
 await file.save(session)
 ```
 
-## 5. When to use safe_reset vs Taskiq dispatch
+## 5. When to use session.reset() vs Taskiq dispatch
 
-`safe_reset` fits when you **must** synchronously return a result to the client. If your business can tolerate async — dispatch a job, return immediately, let the client poll — use Taskiq instead and **don't do long I/O in the HTTP endpoint at all**.
+`session.reset()` fits when you **must** synchronously return a result to the client. If your business can tolerate async — dispatch a job, return immediately, let the client poll — use Taskiq instead and **don't do long I/O in the HTTP endpoint at all**.
 
 ```mermaid
 flowchart TD
     A["Need long I/O in the endpoint?"] --> B{Can the response wait until the next poll?}
     B -- Yes --> C["Dispatch a Taskiq task<br/>return status=pending immediately"]
-    B -- No --> D["safe_reset to release connection<br/>execute the long I/O synchronously"]
+    B -- No --> D["session.reset() to release connection<br/>execute the long I/O synchronously"]
     C --> E["Cleanest, holds zero connection time"]
     D --> F["Pool is usable during the released window<br/>but still occupies a worker coroutine"]
 ```
@@ -147,7 +147,7 @@ flowchart TD
 |----------|-------------|
 | Polling for upload status | Taskiq (the polling client picks up the state change) |
 | AI generation tasks (image/video) | Taskiq (the project's mainstream pattern) |
-| Synchronous response that must contain the full result (e.g. PDF export) | safe_reset |
+| Synchronous response that must contain the full result (e.g. PDF export) | session.reset() |
 | WebSocket long connections | `session.close()` + per-message short-lived sessions |
 
 ## 6. Verification: did your endpoint actually release the connection?
@@ -169,13 +169,13 @@ def _on_checkin(conn, rec):
 
 Trigger a request that hits the long-I/O path. You should see:
 1. `checkout 1/N` — endpoint starts
-2. `checkin 0/N` — safe_reset fires
+2. `checkin 0/N` — session.reset() fires
 3. 30 seconds of external I/O with no checkout log in between
 4. `checkout 1/N` — subsequent DB op
 5. `checkin 0/N` — endpoint cleanup
 
 ## 7. Related
 
-- [`safe_reset()` API reference](/en/reference/decorators#safe-reset)
+- [`session.reset()` API reference](/en/reference/decorators#session-reset)
 - [Integrate with FastAPI](./integrate-with-fastapi)
 - [Prevent MissingGreenlet](./prevent-missing-greenlet)

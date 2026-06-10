@@ -20,10 +20,13 @@ Quick start::
     user = await user.save(session)
     users = await User.get(session, fetch_mode="all")
 """
-__version__ = "0.3.5"
+__version__ = "0.4.0"
 
 # Base
-from sqlmodel_ext.base import SQLModelBase, ExtraIgnoreModelBase
+from sqlmodel_ext.base import SQLModelBase, ExtraIgnoreModelBase, CustomTableArg
+
+# Enhanced session (cache-aware commit/reset/refresh/execute)
+from sqlmodel_ext.session import AsyncSession
 
 # Exceptions
 from sqlmodel_ext._exceptions import RecordNotFoundError
@@ -44,10 +47,10 @@ from sqlmodel_ext.mixins import (
     UUIDTableBaseMixin,
     rel,
     cond,
-    safe_reset,
     # Polymorphic
     PolymorphicBaseMixin,
     AutoPolymorphicIdentityMixin,
+    DeferredIndex,
     create_subclass_id_mixin,
     register_sti_columns_for_all_subclasses,
     register_sti_column_properties_for_all_subclasses,
@@ -93,14 +96,24 @@ from sqlmodel_ext.field_types import (
     Text2500,
     Text3K,
     Text5K,
+    Text8K,
     Text10K,
     Text16K,
     Text32K,
+    Text48K,
     Text60K,
     Text64K,
     Text100K,
     Text128K,
     Text1M,
+    NonEmptyStr64,
+    NonEmptyStr128,
+    NonEmptyStr256,
+    NonEmptyStrippedStr64,
+    NonEmptyStrippedStr128,
+    NonEmptyStrippedStr256,
+    Sha256Hex,
+    BCP47LanguageCode,
     # Numeric constraints
     INT32_MAX,
     INT64_MAX,
@@ -113,6 +126,32 @@ from sqlmodel_ext.field_types import (
     NonNegativeBigInt,
     PositiveFloat,
     NonNegativeFloat,
+    # Decimal constraints (NUMERIC(p, s) + sign + JSON-string serialization)
+    SignedDecimal38_18,
+    NonNegativeDecimal38_18,
+    PositiveDecimal38_18,
+    OptionalNonNegativeDecimal38_18,
+    SignedDecimal20_10,
+    NonNegativeDecimal20_10,
+    OptionalNonNegativeDecimal20_10,
+    # Bounded-length list aliases
+    List,
+    List1,
+    List2,
+    List3,
+    List7,
+    List10,
+    List16,
+    List20,
+    List32,
+    List40,
+    List50,
+    List64,
+    List100,
+    List128,
+    List200,
+    List256,
+    List1024,
     # Custom types
     IPAddress,
     Url,

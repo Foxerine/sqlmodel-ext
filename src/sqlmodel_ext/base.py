@@ -17,6 +17,7 @@ import types
 import typing
 from typing import Any, Self, Sequence, get_args, get_origin
 
+import annotated_types as at
 from pydantic import ConfigDict, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined as Undefined
@@ -192,27 +193,133 @@ def _durably_set_sa_type(field_info: Any, sa_type: Any) -> None:
             pass
 
 
+_FIELDINFO_NON_CONSTRAINT_ATTRS = (
+    'default', 'default_factory', 'alias', 'serialization_alias', 'validation_alias',
+    'title', 'description', 'examples', 'json_schema_extra',
+    'exclude', 'repr', 'init', 'init_var', 'kw_only', 'discriminator',
+    'frozen', 'validate_default',
+    'primary_key', 'foreign_key', 'unique', 'nullable', 'index',
+    'sa_type', 'sa_column', 'sa_column_args', 'sa_column_kwargs',
+    'ondelete', 'schema_extra',
+)
+"""Non-constraint attributes on FieldInfo -- sa/orm/default/alias/docs, safe to keep in the outer Annotated.
+
+See the ``_split_metadata_for_optional`` docstring for semantics.
+Constraint-related attributes (ge/le/gt/lt/multiple_of/max_digits/decimal_places/
+min_length/max_length/pattern/strict) have already been expanded by Pydantic into
+``Ge/Le/Gt/Lt/MultipleOf/_PydanticGeneralMetadata/MinLen/MaxLen/Predicate`` markers
+inside ``FieldInfo.metadata``, so they need no re-detection on the FieldInfo attrs."""
+
+
+def _split_metadata_for_optional(
+        metadata: tuple[typing.Any, ...],
+) -> tuple[list[typing.Any], list[typing.Any]]:
+    """Split the metadata of ``Annotated[T, *metadata]`` into (inner_constraints, outer_safe).
+
+    **Why**: Pydantic constraint markers (``Ge/Le/MultipleOf/_PydanticGeneralMetadata``
+    etc.) raise ``TypeError: Unable to apply constraint ... to supplied value None`` on
+    None -- so the constraint markers of a ``T | None`` field must be wrapped inside the
+    inner ``Annotated[T, ...]`` so Pydantic only applies them when the value is not
+    None. Schema markers (``PlainSerializer/BeforeValidator`` etc.) and ORM markers
+    (``sa_type``/``default`` etc.) are None-safe and may stay in the outer layer. This
+    is the essence behind the hand-written nested-Annotated form of optional
+    constrained aliases like ``OptionalNonNegativeDecimal38_18``.
+
+    Classification rules:
+
+    - ``annotated_types.BaseMetadata`` subclasses (``Ge/Le/Gt/Lt/MultipleOf/MinLen/
+      MaxLen/Predicate`` etc.) -> inner (all constraint validators, crash on None)
+    - Pydantic ``FieldInfo`` -> split: ``fi.metadata`` (the constraint marker sequence
+      Pydantic already expanded) -> inner; the remaining schema/orm attrs are rebuilt
+      into a fresh FieldInfo -> outer
+    - objects with ``max_digits`` / ``decimal_places`` / ``pattern`` attributes that are
+      not FieldInfo (i.e. ``_PydanticGeneralMetadata``) -> inner
+    - everything else (``PlainSerializer/WrapSerializer/BeforeValidator/AfterValidator/
+      PlainValidator/WrapValidator`` etc.) -> outer (validators are expected to be
+      None-safe, like a reject-float BeforeValidator)
+    """
+    inner: list[typing.Any] = []
+    outer: list[typing.Any] = []
+    for m in metadata:
+        if isinstance(m, at.BaseMetadata):
+            inner.append(m)
+        elif isinstance(m, FieldInfo):
+            inner.extend(m.metadata)
+            outer_fi = _strip_constraint_metadata_from_field_info(m)
+            if outer_fi is not None:
+                outer.append(outer_fi)
+        elif isinstance(m, at.GroupedMetadata):
+            # GroupedMetadata protocol (``pydantic.StringConstraints`` etc.):
+            # iterating yields a sequence of _PydanticGeneralMetadata /
+            # annotated_types markers; all go inner.
+            inner.extend(list(m))
+        elif hasattr(m, 'max_digits') or hasattr(m, 'decimal_places') or hasattr(m, 'pattern'):
+            # _PydanticGeneralMetadata (private, duck-typed): max_digits/decimal_places/pattern
+            inner.append(m)
+        else:
+            outer.append(m)
+    return inner, outer
+
+
+def _strip_constraint_metadata_from_field_info(fi: FieldInfo) -> FieldInfo | None:
+    """Copy an outer-layer version of a FieldInfo: drop ``fi.metadata`` (constraint markers,
+    moved inner), keep sa_type/default/alias/description and other schema/orm attrs.
+    Returns None when no non-constraint attrs remain."""
+    new_kwargs: dict[str, typing.Any] = {}
+    for attr in _FIELDINFO_NON_CONSTRAINT_ATTRS:
+        v = getattr(fi, attr, Undefined)
+        if v is None or v is Undefined:
+            continue
+        new_kwargs[attr] = v
+    if not new_kwargs:
+        return None
+    return Field(**new_kwargs)
+
+
 def _make_annotation_optional(annotation: typing.Any) -> typing.Any:
     """
     Convert type annotation to optional: ``T → T | None``
 
     Places ``| None`` inside ``Annotated[]`` to preserve Field metadata.
 
+    **Key constraint** (isomorphic to ``OptionalNonNegativeDecimal38_18``): when ``T``
+    carries constraint validators (``Ge/Le/MultipleOf/MaxDigits/DecimalPlaces`` etc.),
+    the constraints **must** be nested into the inner ``Annotated[T, *constraints]``,
+    otherwise Pydantic crashes parsing JSON ``null`` with
+    ``TypeError: Unable to apply constraint 'ge' to supplied value None``.
+    Schema/serializer/ORM markers (``PlainSerializer/sa_type/default`` etc.) are
+    None-safe and stay outer.
+
     Examples::
 
         str → str | None
-        Annotated[float, Field(ge=0.0)] → Annotated[float | None, Field(ge=0.0)]
+        Annotated[float, Ge(0)] → Annotated[Annotated[float, Ge(0)] | None]
+        Annotated[Decimal, Field(ge=0, sa_type=...), PlainSerializer(...)]
+            → Annotated[Annotated[Decimal, Ge(0)] | None, Field(sa_type=...), PlainSerializer(...)]
         str | None → str | None  (already optional, unchanged)
     """
     origin = get_origin(annotation)
 
-    # Annotated[T, metadata...] → Annotated[T | None, metadata...]
+    # Annotated[T, metadata...]: split constraint/schema metadata, then build
+    # the nested optional annotation.
     if origin is typing.Annotated:
         args = get_args(annotation)
         inner_type = args[0]
         metadata = args[1:]
-        optional_inner = _make_annotation_optional(inner_type)
-        return typing.Annotated[tuple([optional_inner, *metadata])]
+        inner_meta, outer_meta = _split_metadata_for_optional(metadata)
+        # Recurse into inner_type: it may itself be Annotated (nested aliases).
+        recursed_inner_type = _maybe_recurse_into_annotated(inner_type)
+        if inner_meta:
+            inner_annotated = typing.Annotated[tuple([recursed_inner_type, *inner_meta])]
+        else:
+            inner_annotated = recursed_inner_type
+        # ``typing.Union[X, None]`` is equivalent to PEP 604 ``X | None``, but type
+        # checkers can correctly infer ``inner_annotated`` is ``Annotated[...]``
+        # (a dynamic type without static ``__or__`` support).
+        optional_inner = typing.Union[inner_annotated, type(None)]  # pyright: ignore[reportGeneralTypeIssues]
+        if outer_meta:
+            return typing.Annotated[tuple([optional_inner, *outer_meta])]
+        return optional_inner
 
     # Union / UnionType already contains None → unchanged
     if origin is typing.Union or isinstance(annotation, types.UnionType):
@@ -222,6 +329,25 @@ def _make_annotation_optional(annotation: typing.Any) -> typing.Any:
 
     # T → T | None
     return annotation | None
+
+
+def _maybe_recurse_into_annotated(annotation: typing.Any) -> typing.Any:
+    """For nested Annotated (``Annotated[Annotated[T, ...], ...]``), split the inner
+    layer's constraints too. Non-Annotated values are returned unchanged."""
+    if get_origin(annotation) is typing.Annotated:
+        args = get_args(annotation)
+        inner_type = args[0]
+        metadata = args[1:]
+        inner_meta, outer_meta = _split_metadata_for_optional(metadata)
+        # This layer is already at the outer position or wrapped as inner --
+        # keep its structure: the constraints are in inner_meta, reassemble
+        # into Annotated without appending | None (the parent caller does that).
+        recursed = _maybe_recurse_into_annotated(inner_type)
+        all_meta = list(inner_meta) + list(outer_meta)
+        if all_meta:
+            return typing.Annotated[tuple([recursed, *all_meta])]
+        return recursed
+    return annotation
 
 
 def _apply_all_fields_optional(
@@ -520,6 +646,52 @@ def _make_sti_fk_resolver(
     return _resolve
 
 
+# ==================== Custom table_args element interception ====================
+#
+# SQLAlchemy's ``Table.__init__`` consumes every ``__table_args__`` element
+# **immediately**; an ``Index`` referencing a column that does not exist yet
+# raises ``ConstraintColumnNotFoundError`` on the spot.
+#
+# ``CustomTableArg`` is a generic base class that lets users place
+# **non-SQLAlchemy-native** marker objects into ``table_args`` -- the
+# metaclass (``__DeclarativeMeta.__new__``) **intercepts** these markers,
+# removes them from ``table_args`` (never handing them to SQLAlchemy), and
+# pushes (target class, markers) onto the module-level queue
+# ``_classes_with_custom_table_args`` for downstream infrastructure (e.g. the
+# STI deferred index in ``mixins.polymorphic``) to scan and consume at the
+# right moment.
+#
+# The base layer only knows the generic "defer processing" mechanism and
+# **not** the concrete semantics (STI, JTI, ...) -- concrete types (e.g.
+# ``DeferredIndex``) are defined by their own submodules as ``CustomTableArg``
+# subclasses.
+
+
+class CustomTableArg:
+    """
+    Generic base class for non-SQLAlchemy-native ``table_args`` elements.
+
+    Objects inheriting this class, when placed in ``table_args``, are
+    **intercepted** by the SQLModel metaclass -- never passed to SQLAlchemy
+    ``Table.__init__`` (avoiding immediate-evaluation failures) and instead
+    stashed on the ``_classes_with_custom_table_args`` queue for downstream
+    infrastructure to consume.
+
+    Concrete subclass example: ``mixins.polymorphic.DeferredIndex``
+    (deferred indexes over STI subclass columns).
+    """
+
+
+_classes_with_custom_table_args: list[tuple[type, list[CustomTableArg]]] = []
+"""
+Queue of classes carrying custom ``table_args`` elements: ``(class, [CustomTableArg, ...])``.
+
+Appended by ``__DeclarativeMeta.__new__`` after class creation completes.
+Downstream infrastructure (e.g. ``mixins.polymorphic._create_sti_deferred_indexes()``)
+scans this queue and consumes entries as needed (dispatching on ``isinstance``).
+"""
+
+
 class __DeclarativeMeta(SQLModelMetaclass):
     """
     A smart hybrid metaclass providing flexibility and clarity:
@@ -595,7 +767,25 @@ class __DeclarativeMeta(SQLModelMetaclass):
 
         # Process other explicit args
         if 'table_args' in kwargs:
-            attrs['__table_args__'] = kwargs.pop('table_args')
+            raw_table_args = kwargs.pop('table_args')
+            # Split out CustomTableArg markers -- never handed to SQLAlchemy
+            # (avoiding immediate evaluation against not-yet-existing
+            # columns); stashed on the module-level
+            # ``_classes_with_custom_table_args`` queue for downstream
+            # infrastructure (e.g. STI deferred indexes) to consume.
+            real_table_args: list[Any] = []
+            custom_table_args: list[CustomTableArg] = []
+            for arg in raw_table_args:
+                if isinstance(arg, CustomTableArg):
+                    custom_table_args.append(arg)
+                else:
+                    real_table_args.append(arg)
+            attrs['__table_args__'] = tuple(real_table_args) if real_table_args else ()
+            if custom_table_args:
+                # Temporarily hung on attrs; appended to the module-level
+                # queue after super().__new__ (the result class is fully
+                # constructed then, so downstream can read __table__ etc.).
+                attrs['__custom_table_args__'] = custom_table_args
         if 'table_name' in kwargs:
             attrs['__tablename__'] = kwargs.pop('table_name')
         if 'abstract' in kwargs:
@@ -674,6 +864,13 @@ class __DeclarativeMeta(SQLModelMetaclass):
 
         # 6. Call parent __new__
         result = super().__new__(cls, name, bases, attrs, **kwargs)
+
+        # 6.5. Append intercepted CustomTableArg markers to the module-level
+        # queue for downstream infrastructure. The result class is fully
+        # constructed at this point, so consumers can access __table__ etc.
+        _custom_args = attrs.get('__custom_table_args__')
+        if _custom_args:
+            _classes_with_custom_table_args.append((result, _custom_args))
 
         # 7. Restore SQLModel FieldInfo attributes discarded by Pydantic and rebuild Columns.
         # Pydantic FieldInfo uses __slots__, so setattr for SQLModel extensions is silently

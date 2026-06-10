@@ -19,6 +19,7 @@ attribute is absent from the sibling's ``__dict__``.
 """
 from sqlmodel_ext import (
     AutoPolymorphicIdentityMixin,
+    DeferredIndex,
     PolymorphicBaseMixin,
     SQLModelBase,
     UUIDTableBaseMixin,
@@ -43,3 +44,24 @@ class FunctionB(Tool, AutoPolymorphicIdentityMixin, table=True):
 class FunctionC(Tool, AutoPolymorphicIdentityMixin, table=True):
     """Sibling with no additional fields - the purest victim of default leaks."""
     pass
+
+
+class Node(
+    SQLModelBase,
+    UUIDTableBaseMixin,
+    PolymorphicBaseMixin,
+    table=True,
+    table_args=(
+        # References ``payload`` which only the TextNode subclass registers --
+        # a plain Index here would raise ConstraintColumnNotFoundError at
+        # class-creation time. DeferredIndex materializes after STI phase 1.
+        DeferredIndex('ix_node_payload', 'payload'),
+    ),
+):
+    """STI root used by the DeferredIndex regression tests."""
+    title: str
+
+
+class TextNode(Node, AutoPolymorphicIdentityMixin, table=True):
+    """Subclass declaring the column targeted by the base-class DeferredIndex."""
+    payload: str | None = None

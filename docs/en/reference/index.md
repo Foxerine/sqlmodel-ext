@@ -28,7 +28,7 @@ from sqlmodel_ext import (
 | [CRUD methods](./crud-methods) | Full signatures for `add` / `save` / `update` / `delete` / `get` / `get_one` / `get_exist_one` / `count` / `get_with_count` |
 | [Field types](./field-types) | `Str16`–`Text1M`, `Port`, `Percentage`, `PositiveInt`, `HttpUrl`, `SafeHttpUrl`, `IPAddress`, `Array[T]`, `JSON100K`, `NumpyVector` |
 | [Mixins](./mixins) | `CachedTableBaseMixin`, `OptimisticLockMixin`, `PolymorphicBaseMixin`, `AutoPolymorphicIdentityMixin`, `RelationPreloadMixin`, info response mixins |
-| [Decorators & helpers](./decorators) | `@requires_relations`, `@requires_for_update`, `rel()`, `cond()`, `safe_reset()` |
+| [Decorators & helpers](./decorators) | `@requires_relations`, `@requires_for_update`, `rel()`, `cond()`, enhanced `session.reset()` |
 | [Pagination types](./pagination-types) | `ListResponse[T]`, `TableViewRequest`, `PaginationRequest`, `TimeFilterRequest` |
 
 ## Constants

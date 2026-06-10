@@ -97,7 +97,9 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.orm.relationships import MANYTOONE  # pyright: ignore[reportPrivateImportUsage]
 from sqlalchemy.sql import operators
 from sqlalchemy.sql.base import ExecutableOption
+from sqlalchemy.sql.dml import Delete, Update
 from sqlalchemy.sql.elements import BinaryExpression
+from sqlmodel import col
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from sqlalchemy.sql._typing import _OnClauseArgument  # pyright: ignore[reportPrivateUsage]
@@ -138,6 +140,10 @@ _FULL_MODEL_INVALIDATION = object()
 # Sentinel returned by _try_load_from_id_caches() for "cache miss"
 # (distinct from a cached None result).
 _LOAD_CACHE_MISS = object()
+
+# Raw DML statement types (hoisted to a module constant so
+# _warn_raw_dml_on_cached does not rebuild the tuple on every execute()).
+_DML_TYPES: tuple[type, ...] = (Update, Delete)
 
 # Cache invalidation methods that subclasses must not call directly.
 # check_cache_config() walks subclass method bodies with AST to prevent
@@ -354,7 +360,10 @@ class CachedTableBaseMixin(TableBaseMixin):
             invalidate the cache, it should use::
 
                 _register_pending_invalidation()     # record pending IDs
-                _commit_and_invalidate()             # or _sync_invalidate_after_commit()
+                await session.commit()               # enhanced AsyncSession flushes them
+
+            (the sqlmodel-ext enhanced ``AsyncSession`` synchronously
+            invalidates every registered pending entry after commit).
 
             Direct calls to ``invalidate_by_id`` and friends can touch expired
             attributes after commit, triggering ``MissingGreenlet``.
@@ -410,12 +419,19 @@ class CachedTableBaseMixin(TableBaseMixin):
                 "The following subclass methods call cache-invalidation methods "
                 "directly (risking MissingGreenlet after commit):\n"
                 f"{nl.join(violations)}\n"
-                "Use _register_pending_invalidation() together with "
-                "_commit_and_invalidate() / _sync_invalidate_after_commit() instead."
+                "Use _register_pending_invalidation() followed by "
+                "`await session.commit()` (the enhanced AsyncSession "
+                "synchronously invalidates the registered pendings) instead."
             )
 
         # Install session event hooks (idempotent).
         cls._register_session_commit_hook()
+
+        # Warmup: every model subclass is loaded by now, so pre-build the
+        # {table name: [cached classes]} index. This keeps the raw-DML warning
+        # hot path of the enhanced AsyncSession.execute() free of lazy
+        # construction (first call already hits the index).
+        cls._build_cached_tablename_index()
 
     @classmethod
     def _register_session_commit_hook(cls) -> None:
@@ -494,7 +510,9 @@ class CachedTableBaseMixin(TableBaseMixin):
                     logger.warning(
                         f"fallback compensation triggered: {model_type.__name__} "
                         f"did not go through the sync invalidation path "
-                        f"(pending_ids={len(pending_ids)}; migrate to cache_aware_commit)"
+                        f"(pending_ids={len(pending_ids)}; this commit bypassed the "
+                        f"enhanced AsyncSession.commit() -- typically a "
+                        f"begin()/savepoint path, covered by this fallback)"
                     )
                     try:
                         if needs_full:
@@ -1134,8 +1152,9 @@ class CachedTableBaseMixin(TableBaseMixin):
 
         Intended for external callers only (admin scripts, tests, non-model code).
         Raw SQL methods inside a model should use
-        ``_register_pending_invalidation()`` together with
-        ``_commit_and_invalidate()`` / ``_sync_invalidate_after_commit()``
+        ``_register_pending_invalidation()`` followed by
+        ``await session.commit()`` (the enhanced AsyncSession synchronously
+        invalidates registered pendings after commit)
         to avoid ``MissingGreenlet`` from post-commit attribute access.
 
         Each ID performs a row-level multi-key DEL on its ``id:`` cache; the
@@ -1507,8 +1526,10 @@ class CachedTableBaseMixin(TableBaseMixin):
         so that ``get()`` cannot hit stale data.
 
         Flow (``commit=True``, ``refresh=True``):
-        1. ``super().save(refresh=False)`` -- commit only, no refresh.
-        2. Sync cache invalidation -- ensures the old row leaves Redis.
+        1. ``_register_pending_invalidation()`` -- record what must be invalidated.
+        2. ``super().save(refresh=False)`` -- commit; the enhanced
+           ``AsyncSession.commit()`` synchronously flushes the registered
+           invalidations, ensuring the old row leaves Redis.
         3. ``get()`` refresh -- the cache is now empty, so ``get()`` hits the
            DB and repopulates the cache.
 
@@ -1525,20 +1546,14 @@ class CachedTableBaseMixin(TableBaseMixin):
         else:
             self._register_pending_invalidation(session, model_type, _QUERY_ONLY_INVALIDATION)
 
-        # With commit=True, snapshot every pending type (the commit handler
-        # pops the pending dict). This lets us sync-invalidate ALL pending
-        # models (not just model_type) after commit, eliminating the race
-        # where the _compensate fallback fires for another model that was
-        # also waiting for this transaction. The common case has one pending
-        # type, so the copy is effectively free.
-        _captured_pending: dict[type, set[Any]] | None = None
-        if commit:
-            _raw = session.info.get(_SESSION_PENDING_CACHE_KEY)
-            if _raw:
-                _captured_pending = {k: set(v) for k, v in _raw.items()}
-
         # refresh=False: skip super()'s internal get(); we refresh here
         # AFTER invalidation.
+        # Cache invalidation has moved up into session.commit() (the
+        # sqlmodel-ext enhanced AsyncSession): after commit it synchronously
+        # invalidates everything registered via _register_pending_invalidation
+        # above, so this method no longer invalidates on its own.
+        # With commit=False nothing is invalidated (the data is not committed
+        # yet); it is deferred to the caller's session.commit().
         result = await super().save(
             session,
             refresh=False,
@@ -1553,41 +1568,6 @@ class CachedTableBaseMixin(TableBaseMixin):
         _insp = cast(InstanceState[Any], sa_inspect(result))
         if _insp.identity:
             instance_id = _insp.identity[0]
-
-        # Sync cache invalidation to ensure no later get() hits stale data.
-        if _captured_pending:
-            # First mark ALL pending types as synced in one tight loop (no
-            # awaits) to close the race with _compensate: if we await Redis
-            # between types, the event loop may schedule _compensate which
-            # would see the later types as "never went through the sync
-            # path" and emit a fallback WARNING. Marking first eliminates
-            # the window.
-            _synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-            if isinstance(_synced, dict):
-                for _cls, _ids in _captured_pending.items():
-                    if isinstance(_cls, type) and issubclass(_cls, CachedTableBaseMixin):
-                        _synced.setdefault(_cls, set()).update(_ids)
-            # Sync-invalidate every pending type after commit (mirrors
-            # cache_aware_commit's logic).
-            for _cls, _ids in _captured_pending.items():
-                if isinstance(_cls, type) and issubclass(_cls, CachedTableBaseMixin):
-                    await _cls._do_sync_invalidation(session, _ids)
-        else:
-            pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
-            if not pending or model_type not in pending:
-                synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-                if isinstance(synced, dict):
-                    synced.setdefault(model_type, set()).add(
-                        instance_id if instance_id is not None else _QUERY_ONLY_INVALIDATION
-                    )
-                try:
-                    if instance_id is not None:
-                        await model_type._invalidate_id_cache(instance_id)
-                        await model_type._invalidate_query_caches()
-                    else:
-                        await model_type._invalidate_query_caches()
-                except Exception as e:
-                    logger.error(f"save() sync invalidation failed ({model_type.__name__}): {e}")
 
         # Write-through refresh: bypass the cache read, hit the DB, then
         # repopulate the ID cache proactively.
@@ -1607,11 +1587,15 @@ class CachedTableBaseMixin(TableBaseMixin):
             assert result is not None, f"{model_type.__name__} record not found (id={instance_id})"
 
             # Actively repopulate the ID cache (commit=True, no load).
+            # Also refill every ancestor cache key -- same rationale as the
+            # identical fix in update() below.
             if commit and load is None:
                 try:
-                    cache_key = model_type._build_id_cache_key(instance_id)
                     serialized = model_type._serialize_result(result)
-                    await model_type._cache_set(cache_key, serialized, model_type.__cache_ttl__)
+                    classes_to_refill = [model_type, *model_type._cached_ancestors()]
+                    for refill_cls in classes_to_refill:
+                        cache_key = refill_cls._build_id_cache_key(instance_id)
+                        await refill_cls._cache_set(cache_key, serialized, refill_cls.__cache_ttl__)
                 except Exception as e:
                     logger.error(f"save() post-commit cache backfill failed ({model_type.__name__}): {e}")
 
@@ -1652,18 +1636,10 @@ class CachedTableBaseMixin(TableBaseMixin):
             optimistic_retry_count=optimistic_retry_count,
         )
 
-        # Invalidate the cache first.
-        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
-        if not pending or model_type not in pending:
-            # Mark synced before issuing the Redis call (see
-            # ``_do_sync_invalidation`` docstring for the race rationale).
-            synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-            if isinstance(synced, dict):
-                synced.setdefault(model_type, set()).add(instance_id)
-            try:
-                await model_type._invalidate_for_model(instance_id)
-            except Exception as e:
-                logger.error(f"update() sync invalidation failed ({model_type.__name__}): {e}")
+        # Cache invalidation has moved up into session.commit() (the
+        # sqlmodel-ext enhanced AsyncSession): after commit it synchronously
+        # invalidates everything registered via _register_pending_invalidation
+        # above, so this method no longer invalidates on its own.
 
         # Write-through refresh: bypass cache read, hit the DB, then backfill.
         if refresh:
@@ -1676,11 +1652,28 @@ class CachedTableBaseMixin(TableBaseMixin):
             assert result is not None, f"{model_type.__name__} record not found (id={instance_id})"
 
             # Actively repopulate the ID cache (commit=True, no load).
+            # **Refill ancestor caches too**: under STI / inheritance,
+            # invalidation clears the `id:<Class>:<id>` key for self *and*
+            # every cached ancestor (see _invalidate_id_cache +
+            # _cached_ancestors), but the historical implementation only
+            # refilled self's key. Callers querying through an ancestor class
+            # (e.g. a polymorphic root) would hit a MISS -> DB query ->
+            # repopulate -- theoretically correct, but within that window the
+            # same-session identity_map can intercept the merge and hand back
+            # a stale Python instance.
+            #
+            # Fix: write the same fresh result to self + every ancestor cache
+            # key, symmetric with _invalidate_id_cache -- refill exactly the
+            # keys that were invalidated. Deserialization routes through
+            # _polymorphic_name to the concrete subclass, so reading a parent
+            # key still yields the correct subclass instance.
             if commit and load is None:
                 try:
-                    cache_key = model_type._build_id_cache_key(instance_id)
                     serialized = model_type._serialize_result(result)
-                    await model_type._cache_set(cache_key, serialized, model_type.__cache_ttl__)
+                    classes_to_refill = [model_type, *model_type._cached_ancestors()]
+                    for refill_cls in classes_to_refill:
+                        cache_key = refill_cls._build_id_cache_key(instance_id)
+                        await refill_cls._cache_set(cache_key, serialized, refill_cls.__cache_ttl__)
                 except Exception as e:
                     logger.error(f"update() post-commit cache backfill failed ({model_type.__name__}): {e}")
 
@@ -1706,10 +1699,11 @@ class CachedTableBaseMixin(TableBaseMixin):
         - With ``condition`` (or no args): model-level SCAN+DEL (``id:`` + ``query:``).
         - Cascade delete (``passive_deletes=False``): SA handles children
           during flush; the ``persistent_to_deleted`` event registers
-          child-model invalidations which are awaited here in the sync path.
+          child-model invalidations, flushed after commit by the enhanced
+          ``AsyncSession`` via ``_flush_invalidations``.
         - Cascade delete (``passive_deletes=True``): SA skips loading
           children. This method pre-queries child IDs before DELETE and
-          explicitly invalidates the target cache after DELETE.
+          registers them as pending so the post-commit flush invalidates them.
         """
         # Extract instance IDs before super().delete() because the object
         # may become inaccessible after deletion.
@@ -1792,60 +1786,17 @@ class CachedTableBaseMixin(TableBaseMixin):
                 cls._register_pending_invalidation(session, target_cls, child_id)
 
         result = await super().delete(session, instances, condition=condition, commit=commit)
-        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
-        if not pending or cls not in pending:
-            # Mark synced before issuing Redis calls (see ``_do_sync_invalidation``).
-            synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-            if isinstance(synced, dict):
-                if instance_ids:
-                    synced.setdefault(cls, set()).update(instance_ids)
-                else:
-                    synced.setdefault(cls, set()).add(_FULL_MODEL_INVALIDATION)
-            try:
-                if instance_ids:
-                    for _id in instance_ids:
-                        await cls._invalidate_id_cache(_id)
-                    await cls._invalidate_query_caches()
-                else:
-                    await cls._invalidate_for_model()
-            except Exception as e:
-                logger.error(f"delete() sync invalidation failed ({cls.__name__}): {e}")
-
-        # Cascade cache invalidation (sync path) -- passive_deletes=False.
-        # During flush, ``persistent_to_deleted`` pushes cascaded children into this key.
-        cascade_deleted: dict[type, set[Any]] = session.info.pop(_SESSION_CASCADE_DELETED_KEY, {})
-        cascade_deleted.pop(cls, None)  # cls was already handled by the sync path above
-        for target_cls, child_ids in cascade_deleted.items():
-            if not child_ids:
-                continue
-            # Mark synced before issuing Redis calls (see ``_do_sync_invalidation``).
-            synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-            if isinstance(synced, dict):
-                synced.setdefault(target_cls, set()).update(child_ids)
-            try:
-                for child_id in child_ids:
-                    await target_cls._invalidate_id_cache(child_id)
-                await target_cls._invalidate_query_caches()
-            except Exception as e:
-                logger.error(f"delete() cascade invalidation failed ({target_cls.__name__}): {e}")
-
-        # Cascade cache invalidation (pre-query path) -- passive_deletes=True.
-        # Children were physically removed by DB CASCADE, SA events never
-        # fired, so we must explicitly invalidate their Redis caches here.
-        for target_cls, child_ids in passive_targets.items():
-            synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-            if isinstance(synced, dict):
-                synced.setdefault(target_cls, set()).update(child_ids)
-            try:
-                if _FULL_MODEL_INVALIDATION in child_ids:
-                    await target_cls._invalidate_for_model()
-                else:
-                    for child_id in child_ids:
-                        await target_cls._invalidate_id_cache(child_id)
-                    await target_cls._invalidate_query_caches()
-            except Exception as e:
-                logger.error(f"delete() passive_deletes invalidation failed ({target_cls.__name__}): {e}")
-
+        # Cache invalidation has moved up into session.commit() (the
+        # sqlmodel-ext enhanced AsyncSession):
+        # - cls itself + the pre-queried passive_deletes=True targets were
+        #   registered via _register_pending_invalidation before
+        #   super().delete(), so they land in the pre-commit pending snapshot;
+        # - passive_deletes=False cascade children are pushed into
+        #   _SESSION_CASCADE_DELETED_KEY by the persistent_to_deleted event
+        #   during super().delete()'s flush and are handled by
+        #   _flush_invalidations after commit (overlap between the two
+        #   sources is deduplicated by the set union).
+        # This method no longer invalidates on its own.
         return result
 
     # ================================================================
@@ -1884,21 +1835,10 @@ class CachedTableBaseMixin(TableBaseMixin):
         # the refresh after invalidation.
         result = await super().add(session, instances, refresh=False, commit=commit)
 
-        # Invalidate the cache first.
-        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
-        if not pending or cls not in pending:
-            # Mark synced before issuing Redis calls (see ``_do_sync_invalidation``).
-            synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-            if isinstance(synced, dict):
-                s = synced.setdefault(cls, set())
-                s.add(_QUERY_ONLY_INVALIDATION)
-                s.update(explicit_ids)
-            try:
-                for _id in explicit_ids:
-                    await cls._invalidate_id_cache(_id)
-                await cls._invalidate_query_caches()
-            except Exception as e:
-                logger.error(f"add() sync invalidation failed ({cls.__name__}): {e}")
+        # Cache invalidation has moved up into session.commit() (the
+        # sqlmodel-ext enhanced AsyncSession): after commit it synchronously
+        # invalidates everything registered via _register_pending_invalidation
+        # above, so this method no longer invalidates on its own.
 
         # Write-through refresh: bypass cache read, hit the DB, then
         # actively repopulate the ID cache. Only backfill when commit=True;
@@ -1942,62 +1882,8 @@ class CachedTableBaseMixin(TableBaseMixin):
         return result
 
     # ================================================================
-    #  Raw-SQL helpers -- commit + sync invalidation
+    #  Post-commit sync invalidation (invoked by _flush_invalidations)
     # ================================================================
-
-    async def _commit_and_invalidate(self, session: AsyncSession) -> None:
-        """Raw-SQL helper -- commit + sync cache invalidation.
-
-        Snapshots the pending IDs for ``type(self)`` from ``session.info``
-        (``after_commit`` pops the entire pending dict), then after commit
-        invokes sync invalidation using the snapshot. Accessing ``self.id``
-        after commit would touch an expired attribute and trigger
-        ``MissingGreenlet``, so it must be snapshotted beforehand.
-
-        Callers must register the pending IDs first via
-        ``_register_pending_invalidation()``.
-
-        Usage::
-
-            self._register_pending_invalidation(session, type(self), self.id)
-            if commit:
-                await self._commit_and_invalidate(session)
-        """
-        model_type = type(self)
-        # Snapshot pending IDs; after_commit will pop the entire pending dict.
-        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
-        captured_ids: set[Any] = set(pending.get(model_type, ())) if pending else set()
-
-        await session.commit()
-
-        await model_type._do_sync_invalidation(session, captured_ids)
-
-    @classmethod
-    async def _sync_invalidate_after_commit(
-            cls,
-            session: AsyncSession,
-            instance_id: Any,
-    ) -> None:
-        """Sync-invalidate this class's cache after another CRUD call committed.
-
-        Use this when ``cls`` has pending invalidations but the actual
-        ``commit()`` is issued by a different model's CRUD (e.g. a User
-        pending entry registered before a ``Transaction.save(commit=True)``
-        triggers the commit).
-
-        Safe no-op if no commit happened yet (pending still present).
-
-        ``instance_id`` must be captured before commit, because after commit
-        ``self`` attributes are expired.
-
-        Usage::
-
-            user_id = self.id  # capture before commit
-            self._register_pending_invalidation(session, type(self), user_id)
-            transaction = await Transaction(...).save(session, commit=commit)
-            await type(self)._sync_invalidate_after_commit(session, user_id)
-        """
-        await cls._do_sync_invalidation(session, {instance_id})
 
     @classmethod
     async def _do_sync_invalidation(
@@ -2054,56 +1940,207 @@ class CachedTableBaseMixin(TableBaseMixin):
             logger.error(f"sync cache invalidation failed ({cls.__name__}): {e}")
 
     # ================================================================
-    #  Session-level cache-aware commit
+    #  Session-level invalidation helpers
+    #  (delegated to by sqlmodel_ext.session.AsyncSession)
     # ================================================================
 
     @staticmethod
-    async def cache_aware_commit(session: AsyncSession) -> None:
-        """Session-level cache-aware commit: commit + sync cache invalidation.
+    def _capture_session_pending(session: AsyncSession) -> dict[type, set[Any]]:
+        """Snapshot the pending invalidations accumulated in ``session.info`` before commit.
 
-        Replacement for bare ``session.commit()`` when the session has
-        ``commit=False`` CRUD operations on ``CachedTableBaseMixin`` models:
-        after commit it synchronously bumps query versions and deletes ID
-        caches, eliminating the fire-and-forget window that ``after_commit``
-        compensation would otherwise leave.
-
-        When there are no pending invalidations this degrades to a plain
-        ``session.commit()`` with zero overhead.
-
-        Differences vs. the existing helpers:
-
-        - ``_commit_and_invalidate()``: instance method, handles only ``type(self)``.
-        - ``_sync_invalidate_after_commit()``: classmethod, handles one ID for one class.
-        - ``cache_aware_commit()``: session-level, iterates every pending
-          model type in a single pass.
-
-        Usage::
-
-            # several commit=False operations
-            await tool_set.save(session, commit=False)
-            await ToolSetToolLink.delete(session, condition=..., commit=False)
-            # unified commit + sync invalidation
-            await CachedTableBaseMixin.cache_aware_commit(session)
+        The ``after_commit`` event pops the whole pending dict during commit,
+        so it must be snapshotted beforehand for the post-commit sync
+        invalidation. Returns an empty dict when nothing is pending.
         """
-        pending: dict[type, set[Any]] | None = session.info.get(_SESSION_PENDING_CACHE_KEY)
+        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
         if not pending:
-            await session.commit()
+            return {}
+        return {k: set(v) for k, v in pending.items()}
+
+    @staticmethod
+    async def _flush_invalidations(
+            session: AsyncSession,
+            captured: dict[type, set[Any]],
+    ) -> None:
+        """Post-commit sync invalidation: ``captured`` (pre-commit pendings) + cascade children.
+
+        Covers two invalidation sources:
+
+        1. ``captured`` -- entries registered by CRUD methods via
+           ``_register_pending_invalidation`` before commit (explicit IDs, the
+           ``_QUERY_ONLY_INVALIDATION`` sentinel for new rows, the
+           ``_FULL_MODEL_INVALIDATION`` sentinel for condition deletes, and
+           ``delete()``'s pre-queried ``passive_deletes=True`` targets).
+        2. ``_SESSION_CASCADE_DELETED_KEY`` -- ``passive_deletes=False``
+           cascade children, pushed by the ``persistent_to_deleted`` event
+           during ``super().commit()``'s flush (i.e. after the ``captured``
+           snapshot point). ``after_commit`` does not pop this key, so it is
+           drained here to keep cascades on the sync path (otherwise they
+           would fall back to fire-and-forget compensation, reopening the
+           stale window).
+
+        Race with the fire-and-forget ``_compensate`` task: first mark ALL
+        types as synced in one awaitless pass, then await
+        ``_do_sync_invalidation`` per type -- otherwise an await point could
+        let ``_compensate`` misclassify a not-yet-marked type as "did not go
+        through the sync path" and emit a fallback WARNING (same rationale as
+        ``_do_sync_invalidation``).
+
+        Zero-cost return when nothing is pending and no cascade occurred
+        (equivalent to a plain commit).
+        """
+        cascade: dict[type, set[Any]] | None = session.info.pop(_SESSION_CASCADE_DELETED_KEY, None)
+        if not captured and not cascade:
             return
 
-        # Snapshot the pending dict (after_commit will pop it whole).
-        captured: dict[type, set[Any]] = {k: set(v) for k, v in pending.items()}
+        # Merge both sources. captured's passive=True targets and cascade's
+        # passive=False children never overlap by construction, but the set
+        # union deduplicates harmlessly anyway.
+        merged: dict[type, set[Any]] = {k: set(v) for k, v in captured.items()}
+        if cascade:
+            for mt, ids in cascade.items():
+                merged.setdefault(mt, set()).update(ids)
 
-        await session.commit()
+        # Mark synced first in one awaitless pass to close the _compensate
+        # race. Pending dict keys are always model types, so issubclass is
+        # enough to decide whether a type is cached.
+        synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
+        if isinstance(synced, dict):
+            for mt, ids in merged.items():
+                if issubclass(mt, CachedTableBaseMixin):
+                    synced.setdefault(mt, set()).update(ids)
 
-        # Mark ALL types as synced in one awaitless loop to prevent the
-        # _compensate race.
-        _synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-        if isinstance(_synced, dict):
-            for model_type, ids in captured.items():
-                if isinstance(model_type, type) and issubclass(model_type, CachedTableBaseMixin):
-                    _synced.setdefault(model_type, set()).update(ids)
-        # Sync-invalidate every captured model type.
-        for model_type, ids in captured.items():
-            if not (isinstance(model_type, type) and issubclass(model_type, CachedTableBaseMixin)):
-                continue
-            await model_type._do_sync_invalidation(session, ids)
+        # Sync-invalidate every type that inherits CachedTableBaseMixin.
+        for mt, ids in merged.items():
+            if issubclass(mt, CachedTableBaseMixin):
+                await mt._do_sync_invalidation(session, ids)
+
+    @staticmethod
+    def _clear_session_cache_state(session: AsyncSession) -> None:
+        """Clear cache-invalidation tracking state from ``session.info`` (called by ``reset()``).
+
+        The ``after_rollback`` triggered by ``reset()``'s internal rollback
+        already clears these three keys; this is an idempotent second pass
+        covering edges where ``after_rollback`` never fires (reset without an
+        active transaction, the startup window before event registration).
+        """
+        session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
+        session.info.pop(_SESSION_SYNCED_CACHE_KEY, None)
+        session.info.pop(_SESSION_CASCADE_DELETED_KEY, None)
+
+    # ================================================================
+    #  Misuse hardening
+    #  (invoked by sqlmodel_ext.session.AsyncSession commit/refresh/execute)
+    # ================================================================
+
+    @staticmethod
+    def _autoregister_session_mutations(session: AsyncSession) -> None:
+        """Auto-register pending invalidations for every ``CachedTableBaseMixin`` instance in the session before commit.
+
+        Covers the bare paths that bypass CRUD methods -- ``session.add(x)`` /
+        direct attribute mutation / ``session.delete(x)`` followed by a plain
+        ``session.commit()`` (without ``Model.save()/delete()``). Forms a set
+        union with the CRUD methods' explicit registrations, so there is no
+        double invalidation; deletes are additionally registered by the
+        ``persistent_to_deleted`` event -- this is belt-and-suspenders.
+
+        - new (pending INSERT; int PKs may still have id=None) -> query-cache
+          invalidation only (``_QUERY_ONLY_INVALIDATION``)
+        - dirty (pending UPDATE) / deleted -> row-level ID + query cache
+        """
+        # Iterate directly (no list() copy): _register_pending_invalidation
+        # only writes session.info and never mutates the new/dirty/deleted
+        # sets, so there is no mutation-during-iteration risk. dirty is
+        # computed from SA's incrementally-maintained _modified set
+        # (O(modified objects), not a full-table scan), so the cost scales
+        # with the commit workload.
+        sync = session.sync_session
+        for inst in sync.new:
+            if isinstance(inst, CachedTableBaseMixin):
+                CachedTableBaseMixin._register_pending_invalidation(
+                    session, type(inst), _QUERY_ONLY_INVALIDATION,
+                )
+        for inst in sync.dirty:
+            if isinstance(inst, CachedTableBaseMixin):
+                _id = getattr(inst, 'id', None)
+                CachedTableBaseMixin._register_pending_invalidation(
+                    session, type(inst), _id if _id is not None else _QUERY_ONLY_INVALIDATION,
+                )
+        for inst in sync.deleted:
+            if isinstance(inst, CachedTableBaseMixin):
+                _id = getattr(inst, 'id', None)
+                if _id is not None:
+                    CachedTableBaseMixin._register_pending_invalidation(session, type(inst), _id)
+
+    @staticmethod
+    async def _refresh_via_cache(session: AsyncSession, instance: Any) -> bool:
+        """Cache-aware refresh: reload ``instance`` through ``Model.get()`` (Redis cache + STI polymorphic loading).
+
+        When the instance is in the identity map, ``get()``'s internal
+        ``session.merge(load=False)`` updates its column values in place --
+        avoiding a bare ``session.refresh()`` that bypasses the Redis cache
+        (always hits the DB) and skips STI subclass columns.
+
+        :return: True = refreshed via the cache path; False = not possible
+            (transient / no PK), caller falls back to the native refresh.
+        """
+        insp = cast(InstanceState[Any], sa_inspect(instance))
+        if insp.identity is None:
+            return False
+        cls = type(instance)
+        # get() with a Redis hit is O(0) DB work; a miss queries the DB and
+        # backfills the cache. The return value is discarded -- merge already
+        # updated the identity-map instance in place.
+        await cls.get(session, col(cls.id) == insp.identity[0])
+        return True
+
+    _cached_tablename_index: ClassVar[dict[str, list[type['CachedTableBaseMixin']]] | None] = None
+    """Lazily-built {SQL table name: [cached model classes mapped to it]} index for _warn_raw_dml_on_cached."""
+
+    @classmethod
+    def _build_cached_tablename_index(cls) -> dict[str, list[type['CachedTableBaseMixin']]]:
+        """Build {SQL table name: [cached model classes]} (STI maps several classes to one table). Cached in a ClassVar after the first call."""
+        if CachedTableBaseMixin._cached_tablename_index is None:
+            index: dict[str, list[type[CachedTableBaseMixin]]] = {}
+            stack: list[type] = list(CachedTableBaseMixin.__subclasses__())
+            seen: set[type] = set()
+            while stack:
+                sub = stack.pop()
+                if sub in seen:
+                    continue
+                seen.add(sub)
+                stack.extend(sub.__subclasses__())
+                tablename = getattr(sub, '__tablename__', None)
+                if isinstance(tablename, str):
+                    index.setdefault(tablename, []).append(sub)
+            CachedTableBaseMixin._cached_tablename_index = index
+        return CachedTableBaseMixin._cached_tablename_index
+
+    @staticmethod
+    def _warn_raw_dml_on_cached(session: AsyncSession, statement: Any) -> None:
+        """Warn when a bare ``execute(UPDATE/DELETE)`` hits a cached table without registered invalidation.
+
+        CRUD's ``delete(condition=...)`` also goes through ``execute(Delete)``,
+        but it calls ``_register_pending_invalidation`` before executing -- so
+        the warning only fires when **none** of the cached classes mapped to
+        the table has a pending registration, avoiding false positives on
+        legitimate CRUD paths. Non-DML statements (SELECT etc.) early-return
+        with negligible overhead.
+        """
+        if not isinstance(statement, _DML_TYPES):
+            return
+        tablename = getattr(getattr(statement, 'table', None), 'name', None)
+        if not isinstance(tablename, str):
+            return
+        classes = CachedTableBaseMixin._build_cached_tablename_index().get(tablename)
+        if not classes:
+            return  # not a cached table
+        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
+        if pending and any(c in pending for c in classes):
+            return  # registered by a CRUD path, not a bare statement
+        logger.warning(
+            f"raw execute({statement.__class__.__name__}) hits cached table {tablename!r} "
+            f"without registered invalidation -- this bypasses cache invalidation. "
+            f"Use {classes[0].__name__}.save()/delete() (auto-invalidates), or call "
+            f"await {classes[0].__name__}.invalidate_by_id(...) explicitly after raw DML."
+        )

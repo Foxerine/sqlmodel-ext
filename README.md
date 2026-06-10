@@ -1357,18 +1357,42 @@ class UserUpdateRequest(UserBase, all_fields_optional=True):
 
 ---
 
-### safe_reset
+### Enhanced AsyncSession (cache-aware commit/reset/refresh)
 
-Safely reset an async session, clearing both the DB connection and FOR UPDATE lock tracking:
+`sqlmodel_ext.AsyncSession` subclasses sqlmodel's `AsyncSession` and makes cache
+correctness automatic. Point your session factory at it:
 
 ```python
-from sqlmodel_ext import safe_reset
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel_ext import AsyncSession
 
-# In long-lived tasks (e.g. background workers) between operations:
-await safe_reset(session)
+session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 ```
 
-This prevents stale `FOR UPDATE` lock tracking in `session.info` when Python reuses object IDs across `reset()` cycles.
+What it does:
+
+- **`commit()`** auto-registers every `CachedTableBaseMixin` mutation in the
+  session (including bare `session.add()` / attribute mutation /
+  `session.delete()` paths) and synchronously invalidates the Redis cache after
+  commit — no more "forgot the cache-aware commit" stale windows.
+- **`reset()`** releases the connection and clears FOR UPDATE lock tracking +
+  cache-invalidation tracking from `session.info` (replaces the removed
+  `safe_reset()` helper — just call `await session.reset()`).
+- **`refresh()`** routes whole-object refreshes of cached models through
+  `Model.get()` (Redis hit + STI polymorphic columns) instead of a raw DB query.
+- **`execute()`** warns when a bare `UPDATE`/`DELETE` hits a cached table
+  without registered invalidation.
+
+Models that don't use `CachedTableBaseMixin` are unaffected — every hook
+degrades to upstream behavior.
+
+> **Breaking change in 0.4.0**: `safe_reset()` and
+> `CachedTableBaseMixin.cache_aware_commit()` were removed. CRUD methods no
+> longer invalidate the cache themselves; invalidation now happens inside
+> `AsyncSession.commit()`. If you use `CachedTableBaseMixin`, you **must**
+> construct sessions with `class_=sqlmodel_ext.AsyncSession` (plain sessions
+> fall back to the fire-and-forget `after_commit` compensation hook, which
+> reintroduces a brief stale-cache window).
 
 ---
 
@@ -1385,7 +1409,7 @@ sqlmodel_ext/
     pagination.py            # ListResponse, TimeFilterRequest, PaginationRequest, TableViewRequest
     mixins/
         __init__.py          # Mixin re-exports
-        table.py             # TableBaseMixin, UUIDTableBaseMixin, safe_reset (async CRUD)
+        table.py             # TableBaseMixin, UUIDTableBaseMixin (async CRUD)
         cached_table.py      # CachedTableBaseMixin (two-tier Redis cache with version invalidation)
         polymorphic.py       # PolymorphicBaseMixin, AutoPolymorphicIdentityMixin, create_subclass_id_mixin
         optimistic_lock.py   # OptimisticLockMixin, OptimisticLockError

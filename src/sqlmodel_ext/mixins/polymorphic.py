@@ -40,19 +40,129 @@ from uuid import UUID
 
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
-from sqlalchemy import Column, Enum as SAEnum, Integer, String, Table, event
+from sqlalchemy import Column, Enum as SAEnum, Index, Integer, String, Table, event
 from sqlalchemy.orm import ColumnProperty, Mapped, class_mapper, mapped_column
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlmodel import Field
 from sqlmodel.main import get_column_from_field
 
-from sqlmodel_ext.base import SQLModelBase
+from sqlmodel_ext.base import (
+    CustomTableArg,
+    SQLModelBase,
+    _classes_with_custom_table_args,
+)
 
 logger = logging.getLogger(__name__)
 
 # Queue for deferred STI subclass column registration
 # After all models are loaded, call register_sti_columns_for_all_subclasses()
 _sti_subclasses_to_register: list[type] = []
+
+
+# ==================== STI deferred indexes (DeferredIndex) ====================
+#
+# If an STI base class declares ``Index('name', 'col')`` in ``table_args``
+# referencing a column that only an STI subclass registers, SQLAlchemy
+# resolves the string column name immediately in ``Index._set_parent`` -- the
+# subclass is not loaded yet -> ``ConstraintColumnNotFoundError``.
+#
+# ``DeferredIndex`` inherits ``base.CustomTableArg`` -- the SQLModel metaclass
+# intercepts every ``CustomTableArg`` instance out of ``table_args`` and
+# pushes it onto the module-level ``_classes_with_custom_table_args`` queue.
+# This module's ``_create_sti_deferred_indexes()`` scans the queue at the end
+# of ``register_sti_columns_for_all_subclasses()``, filters by
+# ``isinstance(arg, DeferredIndex)``, and converts the stashed markers into
+# real SQLAlchemy ``Index`` objects -- by then every STI subclass column is
+# registered on the parent table's metadata, so ``table.c[col_name]``
+# resolves correctly.
+#
+# Usage (on the STI base class)::
+#
+#     class CanvasNode(
+#         ...,
+#         table_args=(
+#             DeferredIndex('ix_canvasnode_file_ids_gin', 'file_ids', postgresql_using='gin'),
+#         ),
+#     ):
+#         ...
+#
+# Single source of truth: the index declaration stays in the STI base model's
+# ``table_args`` next to ordinary ``Index`` objects. Both
+# ``metadata.create_all()`` (tests) and production migrations derive from this
+# declaration (a production migration must still be written explicitly, but
+# the model layer remains the single logical truth).
+
+
+class DeferredIndex(CustomTableArg):
+    """
+    Deferred-index marker for STI base classes.
+
+    STI subclass columns (registered dynamically by ``_register_sti_columns()``)
+    do not exist yet when the base class's ``__table_args__`` is evaluated, so
+    creating an ``Index`` immediately would fail. This marker class inherits
+    ``base.CustomTableArg`` -- the SQLModel metaclass intercepts it (never
+    passing it to SQLAlchemy) and ``_create_sti_deferred_indexes()`` converts
+    it into a real ``Index`` once the STI subclass columns are registered.
+
+    :param name: index name (unique per database)
+    :param column_names: column names to index (strings; columns that STI
+        subclasses register onto the parent table)
+    :param kwargs: extra arguments passed through to SQLAlchemy ``Index``
+        (e.g. ``postgresql_using='gin'``)
+    """
+
+    __slots__ = ('name', 'column_names', 'kwargs')
+
+    def __init__(self, name: str, *column_names: str, **kwargs: Any) -> None:
+        self.name: str = name
+        self.column_names: tuple[str, ...] = column_names
+        self.kwargs: dict[str, Any] = kwargs
+
+    def __repr__(self) -> str:
+        return (
+            f"DeferredIndex({self.name!r}, "
+            f"{', '.join(repr(c) for c in self.column_names)}, **{self.kwargs!r})"
+        )
+
+
+def _create_sti_deferred_indexes() -> None:
+    """
+    Scan the ``_classes_with_custom_table_args`` queue and convert
+    ``DeferredIndex`` markers into real SQLAlchemy ``Index`` objects.
+
+    Called at the end of ``register_sti_columns_for_all_subclasses()`` --
+    every STI subclass column is registered on the parent table's metadata by
+    then, so ``table.c[col_name]`` resolves correctly.
+
+    Other ``CustomTableArg`` subtypes (future extensions) are ignored
+    (``isinstance`` filter) and consumed by their own handlers -- the queue is
+    shared but dispatch is per-semantics.
+    """
+    for cls, custom_args in _classes_with_custom_table_args:
+        for arg in custom_args:
+            if not isinstance(arg, DeferredIndex):
+                continue  # other CustomTableArg subtypes are consumed by their own handlers
+            table: Table | None = getattr(cls, '__table__', None)
+            if table is None:
+                raise RuntimeError(
+                    f"DeferredIndex {arg.name}: target class {cls.__name__} has no __table__"
+                )
+            if any(ix.name == arg.name for ix in table.indexes):
+                # Idempotency guard: register_sti_columns_for_all_subclasses()
+                # may be invoked more than once (e.g. test harnesses);
+                # constructing a same-named Index twice would emit a duplicate
+                # CREATE INDEX in create_all().
+                continue
+            try:
+                cols = [table.c[cn] for cn in arg.column_names]
+            except KeyError as e:
+                raise RuntimeError(
+                    f"DeferredIndex {arg.name} references column {e} which is not on "
+                    f"table {table.name} -- confirm an STI subclass declares the field "
+                    f"and _register_sti_columns() has run"
+                ) from e
+            # Constructing the Index automatically attaches it to the columns' Table.
+            _ = Index(arg.name, *cols, **arg.kwargs)
 
 
 def register_sti_columns_for_all_subclasses() -> None:
@@ -62,6 +172,8 @@ def register_sti_columns_for_all_subclasses() -> None:
     Call this before ``configure_mappers()``.
     Adds STI subclass fields to the parent table's metadata and
     fixes model_fields polluted by Column objects.
+    Finally creates every ``DeferredIndex``-marked deferred index (resolvable
+    only after STI subclass columns are loaded).
     """
     for cls in _sti_subclasses_to_register:
         try:
@@ -82,6 +194,10 @@ def register_sti_columns_for_all_subclasses() -> None:
             cls.model_rebuild(force=True)
         except Exception as e:
             logger.warning(f"Error rebuilding Pydantic schema for STI subclass {cls.__name__}: {e}")
+
+    # Create deferred indexes -- every STI subclass column is registered on
+    # the parent table now, so table.c[col_name] resolves correctly.
+    _create_sti_deferred_indexes()
 
 
 def register_sti_column_properties_for_all_subclasses() -> None:

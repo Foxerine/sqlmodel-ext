@@ -20,7 +20,7 @@
 
 - [处理并发更新](./handle-concurrent-updates) — 用 `OptimisticLockMixin` 防止丢失更新
 - [防止 MissingGreenlet 错误](./prevent-missing-greenlet) — `@requires_relations` + `lazy='raise_on_sql'` + 静态分析三道防线
-- [长 I/O 期间释放数据库连接](./release-connection-during-long-io) — 用 `safe_reset()` 防连接池被外部 I/O 拖死
+- [长 I/O 期间释放数据库连接](./release-connection-during-long-io) — 用 `session.reset()` 防连接池被外部 I/O 拖死
 
 ### 性能优化
 

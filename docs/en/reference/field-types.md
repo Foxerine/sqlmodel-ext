@@ -30,10 +30,27 @@ from sqlmodel_ext import Str16, Str24, Str32, Str36, Str48, Str64, Str100, Str12
 | `Str512` | 512 | same form |
 | `Str2048` | 2048 | same form |
 
+### Non-empty & special-purpose strings
+
+```python
+from sqlmodel_ext import (
+    NonEmptyStr64, NonEmptyStr128, NonEmptyStr256,
+    NonEmptyStrippedStr64, NonEmptyStrippedStr128, NonEmptyStrippedStr256,
+    Sha256Hex, BCP47LanguageCode,
+)
+```
+
+| Type | Constraint |
+|------|-----------|
+| `NonEmptyStr64/128/256` | `1 <= len <= N`, rejects empty `""` |
+| `NonEmptyStrippedStr64/128/256` | same + `strip_whitespace`, rejects whitespace-only (`"   "` / `"\t"`) |
+| `Sha256Hex` | exactly 64 lowercase hex chars (SHA-256 digest) |
+| `BCP47LanguageCode` | BCP-47 language tag syntax (e.g. `zh-Hans-CN`), `max_length=16` |
+
 ## Text constraints
 
 ```python
-from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Text10K, Text16K, Text32K, Text60K, Text64K, Text100K, Text128K, Text1M
+from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Text8K, Text10K, Text16K, Text32K, Text48K, Text60K, Text64K, Text100K, Text128K, Text1M
 ```
 
 | Type | `max_length` |
@@ -44,9 +61,11 @@ from sqlmodel_ext import Text1K, Text1024, Text2K, Text2500, Text3K, Text5K, Tex
 | `Text2500` | 2500 |
 | `Text3K` | 3000 |
 | `Text5K` | 5000 |
+| `Text8K` | 8000 |
 | `Text10K` | 10000 |
 | `Text16K` | 16000 |
 | `Text32K` | 32000 |
+| `Text48K` | 48000 |
 | `Text60K` | 60000 |
 | `Text64K` | 65536 |
 | `Text100K` | 100000 |
@@ -90,6 +109,42 @@ from sqlmodel_ext import INT32_MAX, INT64_MAX, JS_MAX_SAFE_INTEGER
 | `INT32_MAX` | `2_147_483_647` (2³¹−1) |
 | `INT64_MAX` | `9_223_372_036_854_775_807` (2⁶³−1) |
 | `JS_MAX_SAFE_INTEGER` | `9_007_199_254_740_991` (2⁵³−1) |
+
+## Decimal constraints (new in 0.4.0)
+
+```python
+from sqlmodel_ext import (
+    SignedDecimal38_18, NonNegativeDecimal38_18, PositiveDecimal38_18, OptionalNonNegativeDecimal38_18,
+    SignedDecimal20_10, NonNegativeDecimal20_10, OptionalNonNegativeDecimal20_10,
+)
+```
+
+Naming convention: `[Optional][Signed|NonNegative|Positive]Decimal{precision}_{scale}`, mapping to a `NUMERIC(precision, scale)` database column.
+
+| Type | Sign | Database column |
+|------|------|------------------|
+| `SignedDecimal38_18` | any | `NUMERIC(38, 18)` |
+| `NonNegativeDecimal38_18` | `>= 0` | `NUMERIC(38, 18)` |
+| `PositiveDecimal38_18` | `> 0` | `NUMERIC(38, 18)` |
+| `OptionalNonNegativeDecimal38_18` | `>= 0` or `None` | `NUMERIC(38, 18)` |
+| `SignedDecimal20_10` | any | `NUMERIC(20, 10)` |
+| `NonNegativeDecimal20_10` | `>= 0` | `NUMERIC(20, 10)` |
+| `OptionalNonNegativeDecimal20_10` | `>= 0` or `None` | `NUMERIC(20, 10)` |
+
+Behavioral contract:
+
+- **Rejects float / bool input** (precision already lost via IEEE 754) — accepts `Decimal` / `int` / `str`
+- **Serializes to a fixed-point JSON string** (`model_dump_json()`): never scientific notation (`0E-18` → `'0'`), trailing zeros stripped (`1200.000...0` → `'1200'`) — protects JS clients from Number precision loss
+- **dict mode keeps the `Decimal` object** (`model_dump()`)
+- The `Optional*` variants nest their constraints in the inner `Annotated`, so JSON `null` parses safely
+
+## Bounded-length list aliases (new in 0.4.0)
+
+```python
+from sqlmodel_ext import List, List1, List2, List3, List7, List10, List16, List20, List32, List40, List50, List64, List100, List128, List200, List256, List1024
+```
+
+`List<N>[T]` is equivalent to `Annotated[list[T], Field(max_length=N)]` — the max length is encoded in the type name (consistent with `Str64` / `Text1K`). `List[T]` (no number) is equivalent to `list[T]`. Intended for request DTOs / protocol layers, unrelated to the PG `Array[T]` column type.
 
 ## URL types
 

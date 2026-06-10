@@ -20,7 +20,7 @@
 
 - [Handle concurrent updates](./handle-concurrent-updates) — Use `OptimisticLockMixin` to prevent lost updates
 - [Prevent MissingGreenlet errors](./prevent-missing-greenlet) — `@requires_relations` + `lazy='raise_on_sql'` + static analysis: three layers of defense
-- [Release the DB connection during long I/O](./release-connection-during-long-io) — Use `safe_reset()` to keep external I/O from exhausting the pool
+- [Release the DB connection during long I/O](./release-connection-during-long-io) — Use `session.reset()` to keep external I/O from exhausting the pool
 
 ### Performance
 

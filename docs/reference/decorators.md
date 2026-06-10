@@ -113,21 +113,23 @@ scope = cond(UserFile.user_id == current_user.id)
 condition = scope & cond(UserFile.status == FileStatusEnum.uploaded)
 ```
 
-## `safe_reset()`
+## `session.reset()`（增强 AsyncSession）{#session-reset}
 
 ```python
-from sqlmodel_ext import safe_reset
+from sqlmodel_ext import AsyncSession
 ```
 
-**签名**：
+**签名**（增强方法，定义于 `sqlmodel_ext.session.AsyncSession`）：
 
 ```python
-async def safe_reset(session: AsyncSession) -> None
+async def reset(self) -> None
 ```
 
-**用途**：清理 `session.info[SESSION_FOR_UPDATE_KEY]` 中跟踪的 FOR UPDATE 锁后调用 `session.reset()`。比直接 `session.reset()` 更安全——避免锁跟踪集合泄漏到下一次 session 复用周期。
+> 0.4.0 起替代已删除的 `safe_reset()` 辅助函数。用 `async_sessionmaker(class_=AsyncSession)` 构造 session 后直接 `await session.reset()` 即可。
 
-**典型场景**：HTTP 端点 / Taskiq 任务在中途需要做长时间外部 I/O（S3、ffprobe、第三方 HTTP 轮询等），调用前先 `safe_reset` 释放 DB 连接，避免连接被外部网络阻塞拖死池。详见 [长 I/O 期间释放数据库连接](/how-to/release-connection-during-long-io)。
+**用途**：调用上游 `reset()`（释放事务与连接）后，自动清理 `session.info[SESSION_FOR_UPDATE_KEY]` 中跟踪的 FOR UPDATE 锁以及缓存失效跟踪状态——避免跟踪集合泄漏到下一次 session 复用周期。
+
+**典型场景**：HTTP 端点 / Taskiq 任务在中途需要做长时间外部 I/O（S3、ffprobe、第三方 HTTP 轮询等），调用前先 `session.reset()` 释放 DB 连接，避免连接被外部网络阻塞拖死池。详见 [长 I/O 期间释放数据库连接](/how-to/release-connection-during-long-io)。
 
 **调用后对象状态**：
 

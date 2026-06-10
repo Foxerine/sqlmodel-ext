@@ -6,6 +6,7 @@ Re-exports all mixins for convenient access.
 from .polymorphic import (
     PolymorphicBaseMixin,
     AutoPolymorphicIdentityMixin,
+    DeferredIndex,
     create_subclass_id_mixin,
     register_sti_columns_for_all_subclasses,
     register_sti_column_properties_for_all_subclasses,
@@ -20,7 +21,6 @@ from .table import (
     UUIDTableBaseMixin,
     rel,
     cond,
-    safe_reset,
 )
 from .relation_preload import (
     RelationPreloadMixin,
