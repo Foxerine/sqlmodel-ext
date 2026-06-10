@@ -6,6 +6,7 @@
 
 - You have a Redis instance (`redis://localhost:6379` works for development)
 - Your model inherits `UUIDTableBaseMixin` or `TableBaseMixin`
+- Your session factory uses the enhanced session type: `async_sessionmaker(engine, class_=sqlmodel_ext.AsyncSession)` — since 0.4.0 cache invalidation is orchestrated by its `commit()`; plain sessions degrade to fire-and-forget compensation (a brief stale window)
 
 ## 1. Add `CachedTableBaseMixin` to the model
 

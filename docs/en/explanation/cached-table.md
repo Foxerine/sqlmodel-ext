@@ -141,23 +141,32 @@ Optional orjson support for faster serialization.
 
 ## Cache invalidation
 
-### Invalidation in CRUD methods
+### CRUD registers, commit invalidates (since 0.4.0)
 
-Each CRUD method is overridden to perform invalidation around commit:
+The CRUD overrides **no longer invalidate on their own** — they only register
+pending invalidations into `session.info`; the actual invalidation is executed
+synchronously after commit by the enhanced `sqlmodel_ext.AsyncSession.commit()`:
 
 ```python
 async def save(self, session, ...):
+    # 1. Register pending invalidation
+    self._register_pending_invalidation(session, model_type, instance_id) # [!code focus]
+
+    # 2. super().save() awaits session.commit() internally --
+    #    the enhanced AsyncSession sync-invalidates every registered pending after commit # [!code focus]
     result = await super().save(session, ...)
 
-    # Immediately invalidate when commit=True
-    await self._invalidate_for_model(instance_id) # [!code focus]
-
-    # Write-through refresh: write latest data to ID cache
+    # 3. Write-through refresh: refill the ID cache of self + every cached ancestor
     serialized = cls._serialize_result(result)
-    await cls._cache_set(id_cache_key, serialized, cls.__cache_ttl__) # [!code focus]
+    for refill_cls in [model_type, *model_type._cached_ancestors()]: # [!code focus]
+        await refill_cls._cache_set(refill_cls._build_id_cache_key(instance_id), serialized, ...)
 
     return result
 ```
+
+With `commit=False` nothing is invalidated (the data is not committed yet);
+the pendings wait for the caller's `await session.commit()` — which is exactly
+why "several `commit=False` operations + one commit" is naturally correct.
 
 ### Invalidation granularity
 
@@ -180,11 +189,9 @@ async def _invalidate_id_cache(cls, instance_id):
         await ancestor._cache_delete(f"id:{ancestor.__name__}:{instance_id}")
 ```
 
-`_cached_ancestors()` caches all ancestors in the MRO that also inherit `CachedTableBaseMixin`.
+`_cached_ancestors()` caches all ancestors in the MRO that also inherit `CachedTableBaseMixin`. **Refill mirrors invalidation**: write-through refresh refills exactly the keys invalidation cleared — otherwise callers querying through an ancestor class could observe a stale instance inside the race window.
 
 ## Invalidation compensation mechanism
-
-Handles `commit=False` scenarios (deferred commit):
 
 ### `session.info` state tracking
 
@@ -195,11 +202,8 @@ session.info['_cache_synced']   # Already synced: dict[type, set[id]]
 
 ### Two paths
 
-1. **Synchronous path** (CRUD method with `commit=True`): directly `await` invalidation
-2. **Async compensation path** (`commit=False`):
-   - Record pending invalidation types and IDs in `session.info`
-   - Register SQLAlchemy `after_commit` event hook
-   - On commit, the compensation function invalidates what synced path didn't cover
+1. **Synchronous path** (enhanced `AsyncSession.commit()`): before commit it auto-registers every cached-model mutation in the session (including bare `session.add()` / attribute mutation / `session.delete()`) and snapshots the pendings; after commit it synchronously `await`s invalidation of the snapshot plus cascade children
+2. **Async compensation path** (fallback): the `after_commit` event hook triggers a compensation function that invalidates whatever the sync path didn't cover — this covers commits that bypassed the enhanced session (e.g. `begin()` / savepoint paths, plain `sqlmodel` sessions); fire-and-forget semantics with a brief stale window
 
 ### Sentinel objects
 
@@ -219,7 +223,7 @@ Solutions:
 
 - Extract IDs with `getattr()` before commit
 - After commit, read from identity map via `sa_inspect()` (no DB query)
-- External SQL methods use `_register_pending_invalidation()` + `_commit_and_invalidate()`
+- External SQL methods use `_register_pending_invalidation()` + `await session.commit()` (the enhanced `AsyncSession` sync-invalidates registered pendings after commit)
 
 ## `check_cache_config()` static check
 

@@ -84,11 +84,17 @@ import redis.asyncio as redis                        # ← new
 from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
-from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlmodel_ext import CachedTableBaseMixin       # ← new
+from sqlmodel_ext import AsyncSession, CachedTableBaseMixin  # ← new (note: the enhanced AsyncSession)
 
 engine = create_async_engine("sqlite+aiosqlite:///blog.db")
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+```
+
+::: warning Must use sqlmodel_ext.AsyncSession
+Since 0.4.0 cache invalidation is orchestrated by the enhanced `AsyncSession.commit()`. The session factory's `class_=` must point at `sqlmodel_ext.AsyncSession` (not `sqlmodel.ext.asyncio.session.AsyncSession`), otherwise invalidation degrades to the fire-and-forget compensation hook with a brief stale window.
+:::
+
+```python
 
 
 @asynccontextmanager

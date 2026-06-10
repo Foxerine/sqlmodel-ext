@@ -84,11 +84,17 @@ import redis.asyncio as redis                        # ← 新增
 from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
-from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlmodel_ext import CachedTableBaseMixin       # ← 新增
+from sqlmodel_ext import AsyncSession, CachedTableBaseMixin  # ← 新增（注意：增强版 AsyncSession）
 
 engine = create_async_engine("sqlite+aiosqlite:///blog.db")
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+```
+
+::: warning 必须用 sqlmodel_ext.AsyncSession
+0.4.0 起缓存失效由增强版 `AsyncSession.commit()` 统一编排。session 工厂的 `class_=` 必须指向 `sqlmodel_ext.AsyncSession`（不是 `sqlmodel.ext.asyncio.session.AsyncSession`），否则失效退化为 fire-and-forget 补偿钩子，存在短暂 stale 窗口。
+:::
+
+```python
 
 
 @asynccontextmanager

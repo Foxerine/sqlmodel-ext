@@ -6,6 +6,7 @@
 
 - 你已经有一个 Redis 实例（开发环境用 `redis://localhost:6379` 即可）
 - 你的模型继承了 `UUIDTableBaseMixin` 或 `TableBaseMixin`
+- session 工厂使用增强版 session 类型：`async_sessionmaker(engine, class_=sqlmodel_ext.AsyncSession)`——0.4.0 起缓存失效由它的 `commit()` 统一编排，普通 session 会退化为 fire-and-forget 补偿（短暂 stale 窗口）
 
 ## 1. 给模型加 `CachedTableBaseMixin`
 
