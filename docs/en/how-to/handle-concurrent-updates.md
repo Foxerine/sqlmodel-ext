@@ -10,11 +10,17 @@
 ## 1. Add `OptimisticLockMixin` to the model
 
 ```python
-from sqlmodel_ext import OptimisticLockMixin, SQLModelBase, UUIDTableBaseMixin
+from enum import StrEnum
+
+from sqlmodel_ext import OptimisticLockMixin, SQLModelBase, UUIDTableBaseMixin, NonNegativeDecimal38_18
+
+class OrderStatusEnum(StrEnum):
+    pending = 'pending'
+    paid = 'paid'
 
 class OrderBase(SQLModelBase):
-    status: str
-    amount: int
+    status: OrderStatusEnum = OrderStatusEnum.pending
+    amount: NonNegativeDecimal38_18
 
 class Order(OptimisticLockMixin, OrderBase, UUIDTableBaseMixin, table=True): # [!code highlight]
     pass

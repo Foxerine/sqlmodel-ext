@@ -43,13 +43,14 @@ pip install sqlmodel-ext aiosqlite "fastapi[standard]"
 from datetime import datetime
 from uuid import UUID
 
+from pydantic import EmailStr  # 需要：pip install 'pydantic[email]'
 from sqlmodel import Field, Relationship
 from sqlmodel_ext import (
     SQLModelBase,
     UUIDTableBaseMixin,
     UUIDIdDatetimeInfoMixin,
-    Str64,
-    Str256,
+    NonEmptyStrippedStr64,
+    NonEmptyStrippedStr256,
     Text10K,
 )
 
@@ -57,9 +58,9 @@ from sqlmodel_ext import (
 # ============ User ============
 
 class UserBase(SQLModelBase):
-    name: Str64
-    """用户名"""
-    email: Str64
+    name: NonEmptyStrippedStr64
+    """用户名（拒绝空串与纯空白）"""
+    email: EmailStr
     """邮箱"""
 
 
@@ -78,8 +79,8 @@ class UserResponse(UserBase, UUIDIdDatetimeInfoMixin):
 # ============ Article ============
 
 class ArticleBase(SQLModelBase):
-    title: Str256
-    """文章标题"""
+    title: NonEmptyStrippedStr256
+    """文章标题（拒绝空串与纯空白）"""
     body: Text10K
     """正文"""
     is_published: bool = False
@@ -97,7 +98,7 @@ class ArticleCreateRequest(ArticleBase):
 
 
 class ArticleUpdateRequest(SQLModelBase):
-    title: Str256 | None = None
+    title: NonEmptyStrippedStr256 | None = None
     body: Text10K | None = None
     is_published: bool | None = None
 
@@ -136,7 +137,7 @@ class CommentResponse(CommentBase, UUIDIdDatetimeInfoMixin):
 - **`XxxUpdateRequest`**：PATCH 请求体（每个字段可选，独立定义）
 - **`XxxResponse`**：响应 DTO（继承 Base + `UUIDIdDatetimeInfoMixin` 自动加 id 和时间戳）
 
-这个分层让验证规则**只写一遍**——你在 `Str256` 上设置的 `max_length=256` 自动适用于 `ArticleBase` 的所有子类。
+这个分层让验证规则**只写一遍**——`NonEmptyStrippedStr256` 携带的 `max_length=256` + 非空 strip 约束自动适用于 `ArticleBase` 的所有子类。
 :::
 
 ::: warning 外键索引

@@ -27,6 +27,7 @@ from sqlmodel_ext import (
     AutoPolymorphicIdentityMixin,
     PolymorphicBaseMixin,
     SQLModelBase,
+    Str64,
     UUIDTableBaseMixin,
     register_sti_column_properties_for_all_subclasses,
     register_sti_columns_for_all_subclasses,
@@ -37,7 +38,7 @@ from sqlmodel_ext import (
 
 class Tool(SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin, table=True):
     """Shared STI parent table."""
-    name: str
+    name: Str64
 
 
 class ExportFunction(Tool, AutoPolymorphicIdentityMixin, table=True):

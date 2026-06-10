@@ -14,8 +14,8 @@ This is the **foundation** of the entire project. All model classes inherit from
 
 ```python
 class UserBase(SQLModelBase):
-    name: Str64
-    email: str
+    name: NonEmptyStrippedStr64
+    email: EmailStr
 
 class User(UserBase, UUIDTableBaseMixin, table=True):
     pass

@@ -17,7 +17,7 @@ from datetime import datetime
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
-    Str256,
+    NonNegativeBigInt, Sha256Hex, Str256,
 )
 
 class UserFile(
@@ -40,8 +40,8 @@ class PendingFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
 
 
 class CompletedFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
-    file_size: int | None = None             # Auto-added as nullable column // [!code highlight]
-    sha256: str | None = None
+    file_size: NonNegativeBigInt | None = None  # Auto-added as nullable column // [!code highlight]
+    sha256: Sha256Hex | None = None
 ```
 
 ::: warning Subclass fields must be nullable
@@ -97,8 +97,8 @@ userfile (
     user_id UUID NOT NULL,
     _polymorphic_name VARCHAR NOT NULL,    -- Discriminator ('pendingfile' / 'completedfile')
     upload_deadline TIMESTAMP NULL,         -- PendingFile field, NULL for other subclasses
-    file_size INTEGER NULL,                 -- CompletedFile field
-    sha256 VARCHAR NULL,                    -- CompletedFile field
+    file_size BIGINT NULL,                  -- CompletedFile field
+    sha256 VARCHAR(64) NULL,                -- CompletedFile field
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 )

@@ -22,13 +22,15 @@ from sqlmodel_ext import (
     DeferredIndex,
     PolymorphicBaseMixin,
     SQLModelBase,
+    Str64,
+    Text1K,
     UUIDTableBaseMixin,
 )
 
 
 class Tool(SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin, table=True):
     """STI root: all subclasses share this single ``tool`` table."""
-    name: str
+    name: Str64
 
 
 class FunctionA(Tool, AutoPolymorphicIdentityMixin, table=True):
@@ -59,9 +61,9 @@ class Node(
     ),
 ):
     """STI root used by the DeferredIndex regression tests."""
-    title: str
+    title: Str64
 
 
 class TextNode(Node, AutoPolymorphicIdentityMixin, table=True):
     """Subclass declaring the column targeted by the base-class DeferredIndex."""
-    payload: str | None = None
+    payload: Text1K | None = None

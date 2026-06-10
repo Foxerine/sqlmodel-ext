@@ -33,12 +33,13 @@ pip install sqlmodel-ext aiosqlite
 Create `app.py`:
 
 ```python
-from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, Str64
+from pydantic import EmailStr  # requires: pip install 'pydantic[email]'
+from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, NonEmptyStrippedStr64
 
 class UserBase(SQLModelBase):
-    name: Str64
-    """User name"""
-    email: Str64
+    name: NonEmptyStrippedStr64
+    """User name (rejects "" and whitespace-only)"""
+    email: EmailStr
     """Email"""
 
 class User(UserBase, UUIDTableBaseMixin, table=True):
@@ -47,7 +48,7 @@ class User(UserBase, UUIDTableBaseMixin, table=True):
 
 What just happened?
 
-- **`UserBase`** inherits `SQLModelBase` — this is a **pure data model** with no table. It only declares fields. `Str64` is a string type alias provided by sqlmodel-ext, equivalent to `Annotated[str, Field(max_length=64)]` — it constrains Pydantic and creates a `VARCHAR(64)` column in SQLAlchemy in one step.
+- **`UserBase`** inherits `SQLModelBase` — this is a **pure data model** with no table. It only declares fields. `NonEmptyStrippedStr64` is a string type alias provided by sqlmodel-ext (the naming-field variant of the `Str64` family): max 64 characters, auto-strips surrounding whitespace, rejects empty and whitespace-only strings — constraining Pydantic and creating a `VARCHAR(64)` column in SQLAlchemy in one step. `EmailStr` is Pydantic's email-format type.
 - **`User`** inherits both `UserBase` (gets the fields) and `UUIDTableBaseMixin` (gets a UUID primary key + `created_at` / `updated_at` + the full set of CRUD methods). `table=True` tells SQLModel "create a table".
 
 ::: info Why split Base and Table

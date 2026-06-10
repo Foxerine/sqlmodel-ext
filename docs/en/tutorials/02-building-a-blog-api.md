@@ -43,13 +43,14 @@ Create `models.py`:
 from datetime import datetime
 from uuid import UUID
 
+from pydantic import EmailStr  # requires: pip install 'pydantic[email]'
 from sqlmodel import Field, Relationship
 from sqlmodel_ext import (
     SQLModelBase,
     UUIDTableBaseMixin,
     UUIDIdDatetimeInfoMixin,
-    Str64,
-    Str256,
+    NonEmptyStrippedStr64,
+    NonEmptyStrippedStr256,
     Text10K,
 )
 
@@ -57,9 +58,9 @@ from sqlmodel_ext import (
 # ============ User ============
 
 class UserBase(SQLModelBase):
-    name: Str64
-    """User name"""
-    email: Str64
+    name: NonEmptyStrippedStr64
+    """User name (rejects "" and whitespace-only)"""
+    email: EmailStr
     """Email"""
 
 
@@ -78,8 +79,8 @@ class UserResponse(UserBase, UUIDIdDatetimeInfoMixin):
 # ============ Article ============
 
 class ArticleBase(SQLModelBase):
-    title: Str256
-    """Article title"""
+    title: NonEmptyStrippedStr256
+    """Article title (rejects "" and whitespace-only)"""
     body: Text10K
     """Article body"""
     is_published: bool = False
@@ -97,7 +98,7 @@ class ArticleCreateRequest(ArticleBase):
 
 
 class ArticleUpdateRequest(SQLModelBase):
-    title: Str256 | None = None
+    title: NonEmptyStrippedStr256 | None = None
     body: Text10K | None = None
     is_published: bool | None = None
 
@@ -136,7 +137,7 @@ class CommentResponse(CommentBase, UUIDIdDatetimeInfoMixin):
 - **`XxxUpdateRequest`**: PATCH body (every field optional, defined separately)
 - **`XxxResponse`**: response DTO (inherits Base + `UUIDIdDatetimeInfoMixin` to add id and timestamps)
 
-This layering means validation rules are **written once** — the `max_length=256` you put on `Str256` automatically applies to every subclass of `ArticleBase`.
+This layering means validation rules are **written once** — the `max_length=256` + non-empty-stripped constraints carried by `NonEmptyStrippedStr256` automatically apply to every subclass of `ArticleBase`.
 :::
 
 ::: warning Foreign key indexes

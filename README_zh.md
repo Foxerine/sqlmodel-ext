@@ -63,12 +63,13 @@ pip install sqlmodel-ext[pgvector]
 ### 定义模型
 
 ```python
-from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, Str64
+from pydantic import EmailStr  # 需要：pip install 'pydantic[email]'
+from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, NonEmptyStrippedStr64
 
 # Base 类 -- 仅定义字段，不创建数据库表
 class UserBase(SQLModelBase):
-    name: Str64
-    email: str
+    name: NonEmptyStrippedStr64   # 用户可见命名：拒绝空串与纯空白
+    email: EmailStr
 
 # Table 类 -- 继承字段 + 获得异步 CRUD + UUID 主键
 class User(UserBase, UUIDTableBaseMixin, table=True):
@@ -361,17 +362,19 @@ async def delete_article(session: SessionDep, article_id: UUID) -> None:
 
 ```python
 from abc import ABC, abstractmethod
+from pydantic import EmailStr
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin,
     AutoPolymorphicIdentityMixin, create_subclass_id_mixin,
     ListResponse, TableViewRequest,
+    Str512, Text1K,
 )
 
 # ── 多态模型 ─────────────────────────────────────────────────────
 
 class NotificationBase(SQLModelBase):
     user_id: UUID = Field(foreign_key='user.id')
-    message: str
+    message: Text1K
 
 class Notification(NotificationBase, UUIDTableBaseMixin, PolymorphicBaseMixin, ABC):
     @abstractmethod
@@ -380,13 +383,13 @@ class Notification(NotificationBase, UUIDTableBaseMixin, PolymorphicBaseMixin, A
 NotifSubclassId = create_subclass_id_mixin('notification')
 
 class EmailNotification(NotifSubclassId, Notification, AutoPolymorphicIdentityMixin, table=True):
-    email_to: str
+    email_to: EmailStr
 
     def summary(self) -> str:
         return f"Email to {self.email_to}: {self.message}"
 
 class PushNotification(NotifSubclassId, Notification, AutoPolymorphicIdentityMixin, table=True):
-    device_token: str
+    device_token: Str512
 
     def summary(self) -> str:
         return f"Push to {self.device_token}: {self.message}"
@@ -416,15 +419,15 @@ async def list_notifications(
 两者均自动添加 `id`、`created_at` 和 `updated_at` 字段。
 
 ```python
-from sqlmodel_ext import SQLModelBase, TableBaseMixin, UUIDTableBaseMixin
+from sqlmodel_ext import SQLModelBase, TableBaseMixin, UUIDTableBaseMixin, NonEmptyStrippedStr64, Text1K
 
 # 整数主键
 class LogEntry(SQLModelBase, TableBaseMixin, table=True):
-    message: str
+    message: Text1K
 
 # UUID 主键（大多数场景推荐）
 class Project(SQLModelBase, UUIDTableBaseMixin, table=True):
-    name: str
+    name: NonEmptyStrippedStr64
 ```
 
 #### `add()` -- 批量插入
@@ -486,8 +489,8 @@ user3 = await user3.save(session)        # 一次性 commit 全部三条
 
 ```python
 class UserUpdate(SQLModelBase):
-    name: str | None = None
-    email: str | None = None
+    name: NonEmptyStrippedStr64 | None = None
+    email: EmailStr | None = None
 
 # 仅更新显式设置的字段
 user = await user.update(session, UserUpdate(name="Charlie"))
@@ -690,11 +693,12 @@ from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
     create_subclass_id_mixin,
+    HttpUrl, NonEmptyStrippedStr64, NonNegativeInt,
 )
 
 # 1. Base 类（仅定义字段，无表）
 class ToolBase(SQLModelBase):
-    name: str
+    name: NonEmptyStrippedStr64
 
 # 2. 抽象父类（创建父表）
 class Tool(ToolBase, UUIDTableBaseMixin, PolymorphicBaseMixin, ABC):
@@ -706,13 +710,13 @@ ToolSubclassIdMixin = create_subclass_id_mixin('tool')
 
 # 4. 具体子类（各自拥有独立表）
 class WebSearchTool(ToolSubclassIdMixin, Tool, AutoPolymorphicIdentityMixin, table=True):
-    search_url: str
+    search_url: HttpUrl
 
     async def execute(self) -> str:
         return f"Searching {self.search_url}"
 
 class CalculatorTool(ToolSubclassIdMixin, Tool, AutoPolymorphicIdentityMixin, table=True):
-    precision: int = 2
+    precision: NonNegativeInt = 2
 
     async def execute(self) -> str:
         return "Calculating..."
@@ -746,16 +750,17 @@ from sqlmodel_ext import (
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
     register_sti_columns_for_all_subclasses,
     register_sti_column_properties_for_all_subclasses,
+    NonNegativeBigInt, Str256,
 )
 
 class UserFile(SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin, table=True):
-    filename: str
+    filename: Str256
 
 class PendingFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
     upload_deadline: datetime | None = None  # 作为 nullable 列添加到 userfile 表
 
 class CompletedFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
-    file_size: int | None = None  # 作为 nullable 列添加到 userfile 表
+    file_size: NonNegativeBigInt | None = None  # 作为 nullable 列添加到 userfile 表
 
 # 所有模型定义完成后，在 configure_mappers() 之前调用：
 register_sti_columns_for_all_subclasses()
@@ -808,15 +813,22 @@ Tool._is_joined_table_inheritance()  # JTI 返回 True，STI 返回 False
 利用 SQLAlchemy 的 `version_id_col` 机制防止并发环境下的更新丢失。
 
 ```python
+from enum import StrEnum
+
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     OptimisticLockMixin, OptimisticLockError,
+    NonNegativeDecimal38_18,
 )
+
+class OrderStatusEnum(StrEnum):
+    pending = 'pending'
+    paid = 'paid'
 
 # OptimisticLockMixin 在 MRO 中必须位于 TableBaseMixin 之前
 class Order(OptimisticLockMixin, UUIDTableBaseMixin, table=True):
-    status: str
-    amount: int
+    status: OrderStatusEnum = OrderStatusEnum.pending
+    amount: NonNegativeDecimal38_18
 ```
 
 该 Mixin 添加一个 `version` 整数字段（初始值为 0）。每次 `UPDATE` 生成如下 SQL：
@@ -868,11 +880,11 @@ order = await order.update(session, update_data, optimistic_retry_count=3)
 
 ```python
 from sqlmodel import Relationship
-from sqlmodel_ext import UUIDTableBaseMixin, SQLModelBase
+from sqlmodel_ext import UUIDTableBaseMixin, SQLModelBase, NonNegativeDecimal38_18
 from sqlmodel_ext.mixins import RelationPreloadMixin, requires_relations
 
 class GeneratorConfig(SQLModelBase, UUIDTableBaseMixin, table=True):
-    price: int
+    price: NonNegativeDecimal38_18
 
 class Generator(SQLModelBase, UUIDTableBaseMixin, table=True):
     config: GeneratorConfig = Relationship()

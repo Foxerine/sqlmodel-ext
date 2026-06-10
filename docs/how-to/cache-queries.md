@@ -14,12 +14,12 @@
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     CachedTableBaseMixin,
-    Str64,
+    NonEmptyStrippedStr64, Text10K,
 )
 
 class CharacterBase(SQLModelBase):
-    name: Str64
-    system_prompt: str
+    name: NonEmptyStrippedStr64
+    system_prompt: Text10K
 
 class Character(
     CachedTableBaseMixin,                     # ← 必须放第一位 // [!code highlight]

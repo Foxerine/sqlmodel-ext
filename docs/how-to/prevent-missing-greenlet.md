@@ -95,13 +95,13 @@ async def calculate_cost(self, session: AsyncSession) -> int:
 如果方法内部要修改字段并 `save()`，应该让调用方先获取行锁：
 
 ```python
-from sqlmodel_ext import requires_for_update
+from sqlmodel_ext import requires_for_update, SignedDecimal38_18
 
 class Account(SQLModelBase, UUIDTableBaseMixin, RelationPreloadMixin, table=True):
-    balance: int
+    balance: SignedDecimal38_18
 
     @requires_for_update                                  # ← // [!code highlight]
-    async def adjust_balance(self, session: AsyncSession, *, amount: int) -> None:
+    async def adjust_balance(self, session: AsyncSession, *, amount: SignedDecimal38_18) -> None:
         self.balance += amount
         await self.save(session)
 ```

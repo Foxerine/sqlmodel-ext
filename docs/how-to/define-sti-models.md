@@ -17,7 +17,7 @@ from datetime import datetime
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
-    Str256,
+    NonNegativeBigInt, Sha256Hex, Str256,
 )
 
 class UserFile(
@@ -40,8 +40,8 @@ class PendingFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
 
 
 class CompletedFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
-    file_size: int | None = None             # 自动加为 nullable 列 // [!code highlight]
-    sha256: str | None = None
+    file_size: NonNegativeBigInt | None = None  # 自动加为 nullable 列 // [!code highlight]
+    sha256: Sha256Hex | None = None
 ```
 
 ::: warning 子类字段必须是 nullable
@@ -97,8 +97,8 @@ userfile (
     user_id UUID NOT NULL,
     _polymorphic_name VARCHAR NOT NULL,    -- 鉴别列（'pendingfile' / 'completedfile'）
     upload_deadline TIMESTAMP NULL,         -- PendingFile 的字段，对其他子类为 NULL
-    file_size INTEGER NULL,                 -- CompletedFile 的字段
-    sha256 VARCHAR NULL,                    -- CompletedFile 的字段
+    file_size BIGINT NULL,                  -- CompletedFile 的字段
+    sha256 VARCHAR(64) NULL,                -- CompletedFile 的字段
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 )

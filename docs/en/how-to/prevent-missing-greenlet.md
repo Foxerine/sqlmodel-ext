@@ -95,13 +95,13 @@ If you mistype `@requires_relations('typo_name')`, an `AttributeError` is raised
 If a method modifies fields and `save()`s, callers should acquire a row lock first:
 
 ```python
-from sqlmodel_ext import requires_for_update
+from sqlmodel_ext import requires_for_update, SignedDecimal38_18
 
 class Account(SQLModelBase, UUIDTableBaseMixin, RelationPreloadMixin, table=True):
-    balance: int
+    balance: SignedDecimal38_18
 
     @requires_for_update                                  # ← // [!code highlight]
-    async def adjust_balance(self, session: AsyncSession, *, amount: int) -> None:
+    async def adjust_balance(self, session: AsyncSession, *, amount: SignedDecimal38_18) -> None:
         self.balance += amount
         await self.save(session)
 ```

@@ -33,12 +33,13 @@ pip install sqlmodel-ext aiosqlite
 新建 `app.py`：
 
 ```python
-from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, Str64
+from pydantic import EmailStr  # 需要：pip install 'pydantic[email]'
+from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, NonEmptyStrippedStr64
 
 class UserBase(SQLModelBase):
-    name: Str64
-    """用户名"""
-    email: Str64
+    name: NonEmptyStrippedStr64
+    """用户名（拒绝空串与纯空白）"""
+    email: EmailStr
     """邮箱"""
 
 class User(UserBase, UUIDTableBaseMixin, table=True):
@@ -47,7 +48,7 @@ class User(UserBase, UUIDTableBaseMixin, table=True):
 
 发生了什么？
 
-- **`UserBase`** 继承 `SQLModelBase`——这是一个**纯数据模型**，不建表。它只声明了字段。`Str64` 是 sqlmodel-ext 提供的字符串类型别名，等于 `Annotated[str, Field(max_length=64)]`，同时给 Pydantic 加约束、给 SQLAlchemy 创建 `VARCHAR(64)` 列。
+- **`UserBase`** 继承 `SQLModelBase`——这是一个**纯数据模型**，不建表。它只声明了字段。`NonEmptyStrippedStr64` 是 sqlmodel-ext 提供的字符串类型别名（`Str64` 家族的命名字段变体）：限制 64 字符、自动 strip 首尾空白、拒绝空串与纯空白——同时给 Pydantic 加约束、给 SQLAlchemy 创建 `VARCHAR(64)` 列。`EmailStr` 是 Pydantic 的邮箱格式类型。
 - **`User`** 同时继承 `UserBase`（拿到字段）和 `UUIDTableBaseMixin`（拿到 UUID 主键 + `created_at` / `updated_at` + 全套 CRUD 方法）。`table=True` 告诉 SQLModel "建一张表"。
 
 ::: info 为什么要拆 Base 和 Table

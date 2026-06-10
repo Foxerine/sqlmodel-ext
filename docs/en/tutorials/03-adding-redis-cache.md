@@ -46,8 +46,8 @@ from sqlmodel_ext import (
     UUIDTableBaseMixin,
     UUIDIdDatetimeInfoMixin,
     CachedTableBaseMixin,    # ← new
-    Str64,
-    Str256,
+    NonEmptyStrippedStr64,
+    NonEmptyStrippedStr256,
     Text10K,
 )
 

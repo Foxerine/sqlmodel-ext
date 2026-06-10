@@ -63,12 +63,13 @@ pip install sqlmodel-ext[pgvector]
 ### Define Models
 
 ```python
-from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, Str64
+from pydantic import EmailStr  # requires: pip install 'pydantic[email]'
+from sqlmodel_ext import SQLModelBase, UUIDTableBaseMixin, NonEmptyStrippedStr64
 
 # Base class -- fields only, no database table
 class UserBase(SQLModelBase):
-    name: Str64
-    email: str
+    name: NonEmptyStrippedStr64   # user-visible name: rejects "" and whitespace-only
+    email: EmailStr
 
 # Table class -- inherits fields + gains async CRUD + UUID primary key
 class User(UserBase, UUIDTableBaseMixin, table=True):
@@ -393,17 +394,19 @@ async def delete_article(session: SessionDep, article_id: UUID) -> None:
 
 ```python
 from abc import ABC, abstractmethod
+from pydantic import EmailStr
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin,
     AutoPolymorphicIdentityMixin, create_subclass_id_mixin,
     ListResponse, TableViewRequest,
+    Str512, Text1K,
 )
 
 # ── Polymorphic models ────────────────────────────────────────────
 
 class NotificationBase(SQLModelBase):
     user_id: UUID = Field(foreign_key='user.id')
-    message: str
+    message: Text1K
 
 class Notification(NotificationBase, UUIDTableBaseMixin, PolymorphicBaseMixin, ABC):
     @abstractmethod
@@ -412,13 +415,13 @@ class Notification(NotificationBase, UUIDTableBaseMixin, PolymorphicBaseMixin, A
 NotifSubclassId = create_subclass_id_mixin('notification')
 
 class EmailNotification(NotifSubclassId, Notification, AutoPolymorphicIdentityMixin, table=True):
-    email_to: str
+    email_to: EmailStr
 
     def summary(self) -> str:
         return f"Email to {self.email_to}: {self.message}"
 
 class PushNotification(NotifSubclassId, Notification, AutoPolymorphicIdentityMixin, table=True):
-    device_token: str
+    device_token: Str512
 
     def summary(self) -> str:
         return f"Push to {self.device_token}: {self.message}"
@@ -448,15 +451,15 @@ These mixins provide the async CRUD interface. `TableBaseMixin` uses an auto-inc
 Both mixins automatically add `id`, `created_at`, and `updated_at` fields.
 
 ```python
-from sqlmodel_ext import SQLModelBase, TableBaseMixin, UUIDTableBaseMixin
+from sqlmodel_ext import SQLModelBase, TableBaseMixin, UUIDTableBaseMixin, NonEmptyStrippedStr64, Text1K
 
 # Integer primary key
 class LogEntry(SQLModelBase, TableBaseMixin, table=True):
-    message: str
+    message: Text1K
 
 # UUID primary key (recommended for most use cases)
 class Project(SQLModelBase, UUIDTableBaseMixin, table=True):
-    name: str
+    name: NonEmptyStrippedStr64
 ```
 
 #### `add()` -- Batch Insert
@@ -518,8 +521,8 @@ user3 = await user3.save(session)        # commits all three
 
 ```python
 class UserUpdate(SQLModelBase):
-    name: str | None = None
-    email: str | None = None
+    name: NonEmptyStrippedStr64 | None = None
+    email: EmailStr | None = None
 
 # Only updates fields that were explicitly set
 user = await user.update(session, UserUpdate(name="Charlie"))
@@ -722,11 +725,12 @@ from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
     create_subclass_id_mixin,
+    HttpUrl, NonEmptyStrippedStr64, NonNegativeInt,
 )
 
 # 1. Base class (fields only, no table)
 class ToolBase(SQLModelBase):
-    name: str
+    name: NonEmptyStrippedStr64
 
 # 2. Abstract parent (creates the parent table)
 class Tool(ToolBase, UUIDTableBaseMixin, PolymorphicBaseMixin, ABC):
@@ -738,13 +742,13 @@ ToolSubclassIdMixin = create_subclass_id_mixin('tool')
 
 # 4. Concrete subclasses (each gets its own table)
 class WebSearchTool(ToolSubclassIdMixin, Tool, AutoPolymorphicIdentityMixin, table=True):
-    search_url: str
+    search_url: HttpUrl
 
     async def execute(self) -> str:
         return f"Searching {self.search_url}"
 
 class CalculatorTool(ToolSubclassIdMixin, Tool, AutoPolymorphicIdentityMixin, table=True):
-    precision: int = 2
+    precision: NonNegativeInt = 2
 
     async def execute(self) -> str:
         return "Calculating..."
@@ -778,16 +782,17 @@ from sqlmodel_ext import (
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
     register_sti_columns_for_all_subclasses,
     register_sti_column_properties_for_all_subclasses,
+    NonNegativeBigInt, Str256,
 )
 
 class UserFile(SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin, table=True):
-    filename: str
+    filename: Str256
 
 class PendingFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
     upload_deadline: datetime | None = None  # Added to userfile table as nullable
 
 class CompletedFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
-    file_size: int | None = None  # Added to userfile table as nullable
+    file_size: NonNegativeBigInt | None = None  # Added to userfile table as nullable
 
 # After all models are defined, before configure_mappers():
 register_sti_columns_for_all_subclasses()
@@ -840,15 +845,22 @@ Tool._is_joined_table_inheritance()  # True for JTI, False for STI
 Prevents lost updates in concurrent environments using SQLAlchemy's `version_id_col` mechanism.
 
 ```python
+from enum import StrEnum
+
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     OptimisticLockMixin, OptimisticLockError,
+    NonNegativeDecimal38_18,
 )
+
+class OrderStatusEnum(StrEnum):
+    pending = 'pending'
+    paid = 'paid'
 
 # OptimisticLockMixin MUST come before TableBaseMixin in MRO
 class Order(OptimisticLockMixin, UUIDTableBaseMixin, table=True):
-    status: str
-    amount: int
+    status: OrderStatusEnum = OrderStatusEnum.pending
+    amount: NonNegativeDecimal38_18
 ```
 
 The mixin adds a `version` integer field (starting at 0). Every `UPDATE` generates SQL like:
@@ -900,11 +912,11 @@ The `RelationPreloadMixin` and `@requires_relations` decorator automatically loa
 
 ```python
 from sqlmodel import Relationship
-from sqlmodel_ext import UUIDTableBaseMixin, SQLModelBase
+from sqlmodel_ext import UUIDTableBaseMixin, SQLModelBase, NonNegativeDecimal38_18
 from sqlmodel_ext.mixins import RelationPreloadMixin, requires_relations
 
 class GeneratorConfig(SQLModelBase, UUIDTableBaseMixin, table=True):
-    price: int
+    price: NonNegativeDecimal38_18
 
 class Generator(SQLModelBase, UUIDTableBaseMixin, table=True):
     config: GeneratorConfig = Relationship()
@@ -1346,12 +1358,12 @@ When using Pydantic's `use_attribute_docstrings=True` (enabled by default in `SQ
 
 ```python
 class UserBase(SQLModelBase):
-    name: str
+    name: NonEmptyStrippedStr64
     """User display name"""     # ← parsed by Pydantic
 
 class UserUpdateRequest(UserBase, all_fields_optional=True):
     pass
-    # name: str | None = None   — description "User display name" is automatically inherited
+    # name: NonEmptyStrippedStr64 | None = None — description "User display name" is inherited
     # Shows up correctly in OpenAPI/Swagger docs
 ```
 
