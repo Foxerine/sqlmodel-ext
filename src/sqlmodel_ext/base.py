@@ -22,7 +22,7 @@ from pydantic import ConfigDict, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined as Undefined
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.orm import Mapped, relationship as sa_relationship
+from sqlalchemy.orm import Mapped, declared_attr, relationship as sa_relationship
 from sqlmodel import Field, SQLModel
 from sqlmodel.main import (
     SQLModelMetaclass,
@@ -772,6 +772,28 @@ class __DeclarativeMeta(SQLModelMetaclass):
             existing = attrs.get('__mapper_args__', {}).copy()
             existing.update(collected_mapper_args)
             attrs['__mapper_args__'] = existing
+
+        # 3.5. OptimisticLockMixin wiring: register the mixin's ``version``
+        # column as SQLAlchemy's ``version_id_col`` so every UPDATE emits
+        # ``SET version = version + 1 WHERE ... AND version = :current`` and a
+        # lost update surfaces as StaleDataError. The Column object only exists
+        # after the Table is built, so this must be a ``declared_attr`` that
+        # declarative evaluates late. Only applied to the root table class --
+        # STI/JTI children inherit version_id_col from the root mapper.
+        if will_be_table and any(getattr(b, '_has_optimistic_lock', False) for b in bases):
+            _is_inheriting_table = parent_tablename is not None
+            if not _is_inheriting_table and 'version_id_col' not in attrs.get('__mapper_args__', {}):
+                _static_mapper_args = dict(attrs.get('__mapper_args__', {}))
+
+                def _mapper_args_with_version_col(target_cls, _static=_static_mapper_args):
+                    merged = dict(_static)
+                    merged['version_id_col'] = target_cls.__table__.c.version
+                    return merged
+
+                # ``.directive`` is SQLAlchemy 2.0's spelling for declarative
+                # dunder directives like __mapper_args__ (plain declared_attr
+                # on a dunder emits a usage warning).
+                attrs['__mapper_args__'] = declared_attr.directive(_mapper_args_with_version_col)
 
         # Process other explicit args
         if 'table_args' in kwargs:

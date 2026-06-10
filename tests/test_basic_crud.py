@@ -44,11 +44,21 @@ class TestBasicCRUD:
     async def test_delete_removes(self, session: AsyncSession) -> None:
         from sqlmodel_ext import RecordNotFoundError
 
+        # get_exist_one raises HTTPException(404) when FastAPI is installed,
+        # RecordNotFoundError otherwise -- accept both so the test is
+        # environment-independent.
+        not_found_excs: tuple[type[BaseException], ...]
+        try:
+            from fastapi import HTTPException
+            not_found_excs = (RecordNotFoundError, HTTPException)
+        except ImportError:
+            not_found_excs = (RecordNotFoundError,)
+
         widget = await Widget(name="temp").save(session)
         deleted_count = await Widget.delete(session, widget)
         assert deleted_count == 1
 
-        with pytest.raises(RecordNotFoundError):
+        with pytest.raises(not_found_excs):
             await Widget.get_exist_one(session, widget.id)
 
     async def test_fetch_all_returns_list(self, session: AsyncSession) -> None:

@@ -384,6 +384,30 @@ class TableBaseMixin(AsyncAttrs):
         current_data: dict[str, Any] | None = None
 
         while True:
+            # Snapshot scalar state BEFORE attempting the flush: a failed
+            # versioned UPDATE rolls back the inner transaction, which expires
+            # every attribute -- inside the except block any attribute read
+            # would emit SQL and raise PendingRollbackError/MissingGreenlet.
+            # Read via identity/__dict__ only: the instance itself may already
+            # be expired by an earlier commit, so plain getattr could emit SQL.
+            _pre_insp = cast(InstanceState[Any], inspect(instance))
+            instance_id = _pre_insp.identity[0] if _pre_insp.identity else instance.__dict__.get('id')
+            instance_version = instance.__dict__.get('version')
+            if optimistic_retry_count > 0 and current_data is None:
+                # Capture only the columns the caller actually modified (via
+                # SQLAlchemy attribute history). Re-applying a full model_dump
+                # on retry would overwrite the other transaction's committed
+                # values with our stale ones -- the exact lost update the
+                # optimistic lock exists to prevent. For a transient instance
+                # every set attribute has history, so this also covers INSERTs.
+                _hist_insp = cast(InstanceState[Any], inspect(instance))
+                current_data = {}
+                for _col_attr in _hist_insp.mapper.column_attrs:
+                    if _col_attr.key in ('id', 'version', 'created_at', 'updated_at'):
+                        continue
+                    if _hist_insp.attrs[_col_attr.key].history.has_changes():
+                        current_data[_col_attr.key] = _hist_insp.attrs[_col_attr.key].value
+
             session.add(instance)
             try:
                 if commit:
@@ -397,22 +421,18 @@ class TableBaseMixin(AsyncAttrs):
                     raise OptimisticLockError(
                         message=f"{cls.__name__} optimistic lock conflict: record modified by another transaction",
                         model_class=cls.__name__,
-                        record_id=str(getattr(instance, 'id', None)),
-                        expected_version=getattr(instance, 'version', None),
+                        record_id=str(instance_id),
+                        expected_version=instance_version,
                         original_error=e,
                     ) from e
 
                 retries_remaining -= 1
-                if current_data is None:
-                    # TableBaseMixin is always used with SQLModelBase; model_dump provided by Pydantic
-                    current_data = cast(SQLModelBase, self).model_dump(exclude={'id', 'version', 'created_at', 'updated_at'})
-
-                fresh = await cls.get(session, cls.id == self.id)
+                fresh = await cls.get(session, cls.id == instance_id)
                 if fresh is None:
                     raise OptimisticLockError(
                         message=f"{cls.__name__} retry failed: record has been deleted",
                         model_class=cls.__name__,
-                        record_id=str(getattr(self, 'id', None)),
+                        record_id=str(instance_id),
                         original_error=e,
                     ) from e
 
@@ -472,6 +492,16 @@ class TableBaseMixin(AsyncAttrs):
         retries_remaining = optimistic_retry_count
 
         while True:
+            # Snapshot scalar state BEFORE attempting the flush: a failed
+            # versioned UPDATE rolls back the inner transaction, which expires
+            # every attribute -- inside the except block any attribute read
+            # would emit SQL and raise PendingRollbackError/MissingGreenlet.
+            # Read via identity/__dict__ only: the instance itself may already
+            # be expired by an earlier commit, so plain getattr could emit SQL.
+            _pre_insp = cast(InstanceState[Any], inspect(instance))
+            instance_id = _pre_insp.identity[0] if _pre_insp.identity else instance.__dict__.get('id')
+            instance_version = instance.__dict__.get('version')
+
             # TableBaseMixin is always used with SQLModelBase; sqlmodel_update provided by SQLModel
             _ = cast(SQLModelBase, instance).sqlmodel_update(update_data, update=extra_data)
             session.add(instance)
@@ -488,18 +518,18 @@ class TableBaseMixin(AsyncAttrs):
                     raise OptimisticLockError(
                         message=f"{cls.__name__} optimistic lock conflict: record modified by another transaction",
                         model_class=cls.__name__,
-                        record_id=str(getattr(instance, 'id', None)),
-                        expected_version=getattr(instance, 'version', None),
+                        record_id=str(instance_id),
+                        expected_version=instance_version,
                         original_error=e,
                     ) from e
 
                 retries_remaining -= 1
-                fresh = await cls.get(session, cls.id == self.id)
+                fresh = await cls.get(session, cls.id == instance_id)
                 if fresh is None:
                     raise OptimisticLockError(
                         message=f"{cls.__name__} retry failed: record has been deleted",
                         model_class=cls.__name__,
-                        record_id=str(getattr(self, 'id', None)),
+                        record_id=str(instance_id),
                         original_error=e,
                     ) from e
                 instance = fresh
@@ -575,6 +605,21 @@ class TableBaseMixin(AsyncAttrs):
         if condition is not None:
             # cast to ColumnElement[bool]: at runtime condition is always a column expression
             stmt = sql_delete(cls).where(cast(ColumnElement[bool], condition))
+            # STI auto-filter: a Core DELETE built from an STI subclass targets the
+            # shared table with no discriminator criteria, so without this filter a
+            # subclass-level conditional delete would also remove sibling-subclass
+            # rows. Mirrors the WHERE discriminator IN (...) logic used by get()/count().
+            if issubclass(cls, PolymorphicBaseMixin) and not cls._is_joined_table_inheritance():
+                mapper = cast(Mapper[Any], inspect(cls))
+                poly_on = mapper.polymorphic_on
+                if poly_on is not None:
+                    descendant_identities = [
+                        m.polymorphic_identity
+                        for m in mapper.self_and_descendants
+                        if m.polymorphic_identity is not None
+                    ]
+                    if descendant_identities:
+                        stmt = stmt.where(poly_on.in_(descendant_identities))
             result = cast(CursorResult[Any], await session.execute(stmt))
             deleted_count = result.rowcount
         else:
@@ -950,7 +995,7 @@ class TableBaseMixin(AsyncAttrs):
         chains: list[list[QueryableAttribute[Any]]] = []
         used: set[QueryableAttribute[Any]] = set()
 
-        for root in roots:
+        def _walk_chain(root: QueryableAttribute[Any]) -> None:
             chain = [root]
             used.add(root)
             current = root
@@ -967,6 +1012,18 @@ class TableBaseMixin(AsyncAttrs):
                 used.add(next_rel)
                 current = next_rel
             chains.append(chain)
+
+        for root in roots:
+            _walk_chain(root)
+
+        # Cycle guard: a bidirectional pair (A.b + B.a) makes every
+        # relationship someone's successor, so it never appears under any
+        # root and the requested loads would be silently dropped. Break each
+        # remaining cycle at its first-listed member -- list order expresses
+        # the caller's intended chain direction.
+        for r in load_list:
+            if r not in used:
+                _walk_chain(r)
 
         return chains
 
