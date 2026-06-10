@@ -29,6 +29,28 @@ def get_computed_field_names(cls) -> set[str]
 
 Returns the set of all `@computed_field` field names.
 
+```python
+@classmethod
+def validate_list(cls, items: Sequence[Any]) -> list[Self]
+```
+
+Batch validation: `model_validate`s each ORM instance / dict in the sequence
+into the current model type and returns the list. Typical use: converting a
+query result list into a response-DTO list.
+
+**Common class-definition keyword arguments** (handled by the metaclass; see
+[the metaclass explanation](/en/explanation/metaclass)):
+
+| Keyword | Purpose |
+|---------|---------|
+| `table_name` | Custom table name (equivalent to `__tablename__`) |
+| `table_args` | Table-level constraints/indexes tuple (equivalent to `__table_args__`; `CustomTableArg` subclass instances inside it are intercepted for deferred processing, e.g. `DeferredIndex`) |
+| `mapper_args` | SQLAlchemy mapper args dict (equivalent to `__mapper_args__`) |
+| `polymorphic_on` / `polymorphic_identity` / `polymorphic_abstract` | STI/JTI polymorphism config (top-level shortcuts) |
+| `cache_ttl` | Redis cache TTL in seconds (only effective on `CachedTableBaseMixin` subclasses) |
+| `all_fields_optional` | Converts every inherited field to `T \| None = None` (PATCH/UpdateRequest DTOs; constraints are nested and preserved, JSON `null` parses safely) |
+| `abstract` | Marks the class abstract (equivalent to `__abstract__`) |
+
 **Inheritance patterns**:
 
 - `class XxxBase(SQLModelBase)` — pure data model (no table), used for API input/output

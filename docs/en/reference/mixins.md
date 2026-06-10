@@ -185,6 +185,41 @@ STI subclass fields must be registered to the parent table in two phases:
 1. `register_sti_columns_for_all_subclasses()` — call **before** `configure_mappers()`
 2. `register_sti_column_properties_for_all_subclasses()` — call **after** `configure_mappers()`
 
+## `DeferredIndex` (new in 0.4.0)
+
+```python
+from sqlmodel_ext import DeferredIndex
+```
+
+**Signature**:
+
+```python
+class DeferredIndex(CustomTableArg):
+    def __init__(self, name: str, *column_names: str, **kwargs: Any) -> None
+```
+
+A **deferred-index marker** for STI base-class `table_args`. STI subclass
+columns are registered dynamically during phase 1 and do not exist yet when
+the base class's `__table_args__` is evaluated — a plain `Index('name', 'col')`
+raises `ConstraintColumnNotFoundError` on the spot. `DeferredIndex` is
+intercepted by the metaclass (never handed to SQLAlchemy) and materialized
+into a real `Index` at the end of `register_sti_columns_for_all_subclasses()`.
+
+```python
+class CanvasNode(
+    SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin,
+    table=True,
+    table_args=(
+        DeferredIndex('ix_canvasnode_file_ids_gin', 'file_ids', postgresql_using='gin'),
+    ),
+):
+    ...
+```
+
+- `name` — index name (unique per database)
+- `*column_names` — column-name strings (columns STI subclasses register onto the parent table)
+- `**kwargs` — passed through to SQLAlchemy `Index` (e.g. `unique=True`, `postgresql_using='gin'`)
+
 ## `RelationPreloadMixin`
 
 ```python

@@ -214,6 +214,8 @@ async def get_exist_one(
     session: AsyncSession,
     id: int,                        # UUIDTableBaseMixin override 为 uuid.UUID
     load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
+    *,
+    detail: str = "Not found",
 ) -> T
 ```
 
@@ -221,8 +223,10 @@ async def get_exist_one(
 
 | 环境 | 异常 |
 |------|------|
-| 已安装 FastAPI | `HTTPException(status_code=404, detail="Not found")` |
+| 已安装 FastAPI | `HTTPException(status_code=404, detail=detail)` |
 | 未安装 FastAPI | `RecordNotFoundError` |
+
+`detail`（keyword-only）自定义 404 错误文案——免去"先 `get` 再手写 null 检查 + raise"的样板代码，例如 `detail="角色不存在"`。
 
 判定在模块导入时完成，缓存为 `_HAS_FASTAPI`。
 

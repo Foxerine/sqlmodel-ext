@@ -70,6 +70,10 @@ return user.profile                        # RLC002 // [!code error]
 
 追踪本地变量绑定的对象类型和已加载的关系，发现对未加载关系的属性访问。
 
+### RLC005：依赖函数未预加载 response_model 需要的关系
+
+FastAPI 依赖（`Depends`）返回的 ORM 对象被端点直接 return 时，依赖内部的查询必须预加载 response_model 序列化所需的关系——RLC005 检查依赖函数体的 `load=` 是否覆盖。
+
 ### RLC007：commit 后访问过期对象的列属性
 
 追踪 `session.commit()` 调用，之后访问相关对象的任何属性都视为危险。
@@ -81,6 +85,22 @@ return user.profile                        # RLC002 // [!code error]
 ### RLC009：类型注解解析错误
 
 检测混用已解析类型和字符串前向引用导致的类型解析问题。
+
+### RLC010：把 commit 后的过期对象当参数传递
+
+`commit()` 之后把已过期的 ORM 对象作为参数传给其他函数/方法——被调用方访问其列属性会触发同步懒加载 → `MissingGreenlet`。比 RLC007（本函数内访问）更隐蔽，因为崩溃点在调用链下游。
+
+### RLC011：对未加载关系的对象做布尔判断
+
+`if not obj:` / `if obj:` 会隐式调用 `__bool__()`/`__len__()`，可能触碰未加载的关系。建议改写为 `if obj is None:`。
+
+### RLC012：STI 异构序列化字段缺失
+
+端点 `response_model` 的字段不在 STI **所有**子类的 `model_fields` 中：端点返回 STI 基类时，查询可能产出缺少该字段的子类实例，序列化将失败。修法：在具体子类上调用 `get()`/`get_with_count()` 窄化返回类型。
+
+### RLC013：async generator 在 yield 之后访问列属性
+
+`yield` 把控制权交给持有同一 session 的消费方，消费方可能在 yield 期间 commit 使对象过期；恢复后访问列属性触发 `MissingGreenlet`。yield 前把需要的字段提取到局部变量。
 
 ## `RelationLoadWarning`
 

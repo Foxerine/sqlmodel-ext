@@ -214,6 +214,8 @@ async def get_exist_one(
     session: AsyncSession,
     id: int,                        # UUIDTableBaseMixin overrides to uuid.UUID
     load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
+    *,
+    detail: str = "Not found",
 ) -> T
 ```
 
@@ -221,8 +223,12 @@ Like `get_one()`, but the not-found exception is friendlier:
 
 | Environment | Exception |
 |-------------|-----------|
-| FastAPI installed | `HTTPException(status_code=404, detail="Not found")` |
+| FastAPI installed | `HTTPException(status_code=404, detail=detail)` |
 | FastAPI not installed | `RecordNotFoundError` |
+
+`detail` (keyword-only) customizes the 404 message — replacing the
+"get, then hand-write the null check + raise" boilerplate, e.g.
+`detail="Character not found"`.
 
 The decision is made at module import time and cached as `_HAS_FASTAPI`.
 

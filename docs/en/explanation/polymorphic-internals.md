@@ -170,6 +170,30 @@ def _register_sti_column_properties(cls):
 Phase 1 modifies the columns of the SQLAlchemy `Table` object; Phase 2 modifies the `ColumnProperty` on the mapper. `configure_mappers()` is the watershed — before it you can still modify the Table, after it you can only modify the mapper. Merging the two would either fail Phase 1 (mapper not ready) or fail Phase 2 (Table already frozen).
 :::
 
+### DeferredIndex materialization (end of phase 1, new in 0.4.0)
+
+When an STI base class needs an index over a **column only a subclass
+registers**, a plain `Index('name', 'col')` in `table_args` cannot work — the
+column does not exist when the base class's `__table_args__` is evaluated, and
+SQLAlchemy raises `ConstraintColumnNotFoundError` immediately. Use the
+`DeferredIndex` marker instead:
+
+```python
+class CanvasNode(
+    ..., table=True,
+    table_args=(DeferredIndex('ix_canvasnode_file_ids_gin', 'file_ids', postgresql_using='gin'),),
+): ...
+```
+
+The metaclass intercepts `CustomTableArg` subclass instances (including
+`DeferredIndex`) out of `table_args` and pushes them onto a module-level
+queue; `register_sti_columns_for_all_subclasses()` calls
+`_create_sti_deferred_indexes()` after every subclass column is registered,
+converting the markers into real `Index` objects — `table.c[col_name]`
+resolves correctly by then. Same-named existing indexes are skipped
+(idempotent, so test harnesses may invoke the registration function more than
+once).
+
 ### StrEnum auto-conversion
 
 STI subclass `StrEnum` fields are stored as strings in the database. SQLAlchemy only returns `str` when loading, so event listeners are registered for auto-conversion:

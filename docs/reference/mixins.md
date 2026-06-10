@@ -185,6 +185,36 @@ STI 子类字段需要分两阶段注册到父表：
 1. `register_sti_columns_for_all_subclasses()` — 在 `configure_mappers()` **之前**调用
 2. `register_sti_column_properties_for_all_subclasses()` — 在 `configure_mappers()` **之后**调用
 
+## `DeferredIndex`（0.4.0 新增）
+
+```python
+from sqlmodel_ext import DeferredIndex
+```
+
+**签名**：
+
+```python
+class DeferredIndex(CustomTableArg):
+    def __init__(self, name: str, *column_names: str, **kwargs: Any) -> None
+```
+
+STI 基类 `table_args` 中的**延迟索引标记**。STI 子类列由阶段 1 动态注册，基类 `__table_args__` 求值时尚不存在——直接写 `Index('name', 'col')` 会立即抛 `ConstraintColumnNotFoundError`。`DeferredIndex` 被元类拦截（不传给 SQLAlchemy），在 `register_sti_columns_for_all_subclasses()` 末尾物化为真正的 `Index`。
+
+```python
+class CanvasNode(
+    SQLModelBase, UUIDTableBaseMixin, PolymorphicBaseMixin,
+    table=True,
+    table_args=(
+        DeferredIndex('ix_canvasnode_file_ids_gin', 'file_ids', postgresql_using='gin'),
+    ),
+):
+    ...
+```
+
+- `name` — 索引名（全库唯一）
+- `*column_names` — 列名字符串（STI 子类注册到父表的列）
+- `**kwargs` — 透传给 SQLAlchemy `Index`（如 `unique=True`、`postgresql_using='gin'`）
+
 ## `RelationPreloadMixin`
 
 ```python

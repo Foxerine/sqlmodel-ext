@@ -107,6 +107,30 @@ class Tool(SQLModel, table=True): # [!code --]
 
 `_KNOWN_MAPPER_KEYS` supports these shortcut keywords: `polymorphic_on`, `polymorphic_identity`, `polymorphic_abstract`, `version_id_col`, `concrete`.
 
+### Step 3.5: Intercept `CustomTableArg` in `table_args` (new in 0.4.0)
+
+While processing `table_args`, the metaclass **splits out** marker objects
+inheriting `CustomTableArg` and never hands them to SQLAlchemy:
+
+```python
+if 'table_args' in kwargs:
+    raw_table_args = kwargs.pop('table_args')
+    real_table_args, custom_table_args = [], []
+    for arg in raw_table_args:
+        (custom_table_args if isinstance(arg, CustomTableArg) else real_table_args).append(arg)
+    attrs['__table_args__'] = tuple(real_table_args)
+    # appended to the module-level _classes_with_custom_table_args queue after super().__new__
+```
+
+**Why**: SQLAlchemy's `Table.__init__` consumes every `__table_args__` element
+immediately — an `Index` referencing a not-yet-existing column raises
+`ConstraintColumnNotFoundError` on the spot. `CustomTableArg` is a generic
+"defer processing" marker base class: the metaclass only intercepts and
+enqueues, knowing **nothing** about concrete semantics; downstream
+infrastructure scans the queue at the right moment. The only consumer today is
+`mixins.polymorphic.DeferredIndex` (deferred indexes over STI subclass
+columns, materialized at the end of STI phase 1).
+
 ### Step 4: Extract `sa_type` from type annotations
 
 This is the **most elegant part** of the metaclass.

@@ -17,7 +17,7 @@ Inherits from `SQLModelBase`. DTO carrying pagination and sorting parameters.
 | Field | Type | Default | Constraint |
 |-------|------|---------|------------|
 | `offset` | `int \| None` | `0` | `ge=0` |
-| `limit` | `int \| None` | `50` | `le=100` |
+| `limit` | `int \| None` | `50` | `ge=1, le=100` |
 | `desc` | `bool \| None` | `True` | — |
 | `order` | `Literal["created_at", "updated_at"] \| None` | `"created_at"` | — |
 

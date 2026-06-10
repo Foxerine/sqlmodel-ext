@@ -170,6 +170,19 @@ def _register_sti_column_properties(cls):
 Phase 1 修改的是 SQLAlchemy `Table` 对象的列定义；Phase 2 修改的是 mapper 上的 ColumnProperty。`configure_mappers()` 是分水岭——之前修改 Table 还来得及，之后只能修改 mapper。如果合并成一步，要么 Phase 1 失败（mapper 还没 ready），要么 Phase 2 失败（Table 已被冻结）。
 :::
 
+### DeferredIndex 物化（Phase 1 末尾，0.4.0 新增）
+
+STI 基类如果需要给**子类才注册的列**建索引，不能在 `table_args` 里直接写 `Index('name', 'col')`——基类 `__table_args__` 求值时该列还不存在，SQLAlchemy 当场抛 `ConstraintColumnNotFoundError`。改用 `DeferredIndex` 标记：
+
+```python
+class CanvasNode(
+    ..., table=True,
+    table_args=(DeferredIndex('ix_canvasnode_file_ids_gin', 'file_ids', postgresql_using='gin'),),
+): ...
+```
+
+元类把 `CustomTableArg` 子类实例（含 `DeferredIndex`）从 `table_args` 拦截下来推入模块级队列；`register_sti_columns_for_all_subclasses()` 在所有子类列注册完成后调用 `_create_sti_deferred_indexes()`，扫描队列把标记物化为真正的 `Index`——此时 `table.c[col_name]` 已能正确解析。同名索引已存在则跳过（幂等，测试 harness 可重复调用注册函数）。
+
 ### StrEnum 自动转换
 
 STI 子类的 `StrEnum` 字段在数据库中存储为字符串。SQLAlchemy 加载时只返回 `str`，需要注册事件监听器自动转换：

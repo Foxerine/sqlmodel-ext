@@ -51,4 +51,4 @@ from sqlmodel_ext import (
 
 ## 版本
 
-参见 `sqlmodel_ext.__version__`。本文档面向 `0.3.x` 系列。
+参见 `sqlmodel_ext.__version__`。本文档面向 `0.4.x` 系列。

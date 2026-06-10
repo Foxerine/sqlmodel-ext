@@ -51,4 +51,4 @@ from sqlmodel_ext import (
 
 ## Version
 
-See `sqlmodel_ext.__version__`. This documentation tracks the `0.3.x` series.
+See `sqlmodel_ext.__version__`. This documentation tracks the `0.4.x` series.

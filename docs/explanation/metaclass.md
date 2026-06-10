@@ -107,6 +107,22 @@ class Tool(SQLModel, table=True): # [!code --]
 
 `_KNOWN_MAPPER_KEYS` 支持的快捷关键字：`polymorphic_on`、`polymorphic_identity`、`polymorphic_abstract`、`version_id_col`、`concrete`。
 
+### 第 3.5 步：拦截 `table_args` 中的 `CustomTableArg`（0.4.0 新增）
+
+处理 `table_args` 时，元类会把其中继承 `CustomTableArg` 的标记对象**拆出来**，不传给 SQLAlchemy：
+
+```python
+if 'table_args' in kwargs:
+    raw_table_args = kwargs.pop('table_args')
+    real_table_args, custom_table_args = [], []
+    for arg in raw_table_args:
+        (custom_table_args if isinstance(arg, CustomTableArg) else real_table_args).append(arg)
+    attrs['__table_args__'] = tuple(real_table_args)
+    # super().__new__ 之后追加到模块级队列 _classes_with_custom_table_args
+```
+
+**为什么**：SQLAlchemy 的 `Table.__init__` 会立即消费 `__table_args__` 的每个元素——引用尚不存在的列的 `Index` 当场抛 `ConstraintColumnNotFoundError`。`CustomTableArg` 是通用"延迟处理"标记基类：元类只负责拦截 + 入队，**不知道**具体语义；下游基础设施在合适时机扫描队列消费。目前唯一的消费者是 `mixins.polymorphic.DeferredIndex`（STI 子类列的延迟索引，在 STI 阶段 1 末尾物化）。
+
 ### 第四步：从类型注解中提取 `sa_type`
 
 这是元类**最精巧的部分**。

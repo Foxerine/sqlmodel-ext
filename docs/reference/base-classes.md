@@ -29,6 +29,25 @@ def get_computed_field_names(cls) -> set[str]
 
 返回所有 `@computed_field` 字段的名称集合。
 
+```python
+@classmethod
+def validate_list(cls, items: Sequence[Any]) -> list[Self]
+```
+
+批量验证：把 ORM 实例 / dict 序列逐项 `model_validate` 为当前模型类型，返回列表。常用于"查询结果列表 → 响应 DTO 列表"的转换。
+
+**常用类定义关键字参数**（由元类处理，详见[元类机制](/explanation/metaclass)）：
+
+| 关键字 | 说明 |
+|--------|------|
+| `table_name` | 自定义表名（等价 `__tablename__`） |
+| `table_args` | 表级约束/索引元组（等价 `__table_args__`；其中的 `CustomTableArg` 子类实例会被拦截延迟处理，如 `DeferredIndex`） |
+| `mapper_args` | SQLAlchemy mapper 参数 dict（等价 `__mapper_args__`） |
+| `polymorphic_on` / `polymorphic_identity` / `polymorphic_abstract` | STI/JTI 多态配置（顶级快捷形式） |
+| `cache_ttl` | Redis 缓存 TTL 秒数（仅 `CachedTableBaseMixin` 子类有效） |
+| `all_fields_optional` | 继承字段全部转为 `T \| None = None`（PATCH/UpdateRequest DTO 场景；约束自动嵌套保留，JSON `null` 安全） |
+| `abstract` | 标记抽象类（等价 `__abstract__`） |
+
 **继承场景**：
 
 - `class XxxBase(SQLModelBase)` — 纯数据模型（不建表），用于 API 输入/输出

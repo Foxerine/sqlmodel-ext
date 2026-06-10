@@ -70,6 +70,13 @@ return user.profile                        # RLC002 // [!code error]
 
 Tracks the object types and loaded relations bound to local variables, detecting attribute access on unloaded relations.
 
+### RLC005: dependency does not preload response_model relations
+
+When an ORM object returned by a FastAPI dependency (`Depends`) is returned
+directly by the endpoint, the dependency's query must preload every relation
+the response_model serializes — RLC005 checks whether the dependency body's
+`load=` covers them.
+
 ### RLC007: accessing expired object column attributes after commit
 
 Tracks `session.commit()` calls — accessing any attribute on related objects afterward is considered dangerous.
@@ -81,6 +88,31 @@ Similar to RLC007, but detects method calls rather than attribute access.
 ### RLC009: type annotation resolution errors
 
 Detects issues caused by mixing resolved types with string forward references.
+
+### RLC010: passing an expired post-commit object as an argument
+
+Passing an already-expired ORM object to another function/method after
+`commit()` — the callee's column access triggers a synchronous lazy load →
+`MissingGreenlet`. Sneakier than RLC007 (in-function access) because the crash
+site is downstream in the call chain.
+
+### RLC011: boolean test on an object with unloaded relations
+
+`if not obj:` / `if obj:` implicitly calls `__bool__()`/`__len__()`, which may
+touch unloaded relations. Rewrite as `if obj is None:`.
+
+### RLC012: STI heterogeneous serialization field missing
+
+A `response_model` field is missing from the `model_fields` of **some** STI
+subclasses: when the endpoint returns the STI base class, the query may yield
+subclass instances lacking the field, and serialization fails. Fix: call
+`get()`/`get_with_count()` on the concrete subclass to narrow the return type.
+
+### RLC013: column access after yield in an async generator
+
+`yield` hands control to a consumer holding the same session reference, which
+may commit during the yield and expire the object; access after resuming
+triggers `MissingGreenlet`. Extract needed fields into locals before yielding.
 
 ## `RelationLoadWarning`
 
