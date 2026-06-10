@@ -97,10 +97,9 @@ class ArticleCreateRequest(ArticleBase):
     pass
 
 
-class ArticleUpdateRequest(SQLModelBase):
-    title: NonEmptyStrippedStr256 | None = None
-    body: Text10K | None = None
-    is_published: bool | None = None
+class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
+    # 继承字段自动转为 ``T | None = None``，max_length / 非空 strip 等约束原样保留
+    pass
 
 
 class ArticleResponse(ArticleBase, UUIDIdDatetimeInfoMixin):
@@ -134,7 +133,7 @@ class CommentResponse(CommentBase, UUIDIdDatetimeInfoMixin):
 - **`XxxBase`**：所有变体的最大公约数（"创建"和"响应"都需要的字段）
 - **`Xxx`**：表模型，加上外键和 Relationship
 - **`XxxCreateRequest`**：POST 请求体（继承 Base，所有字段必填）
-- **`XxxUpdateRequest`**：PATCH 请求体（每个字段可选，独立定义）
+- **`XxxUpdateRequest`**：PATCH 请求体（`all_fields_optional=True` 自动把继承字段转为可选，约束保留）
 - **`XxxResponse`**：响应 DTO（继承 Base + `UUIDIdDatetimeInfoMixin` 自动加 id 和时间戳）
 
 这个分层让验证规则**只写一遍**——`NonEmptyStrippedStr256` 携带的 `max_length=256` + 非空 strip 约束自动适用于 `ArticleBase` 的所有子类。

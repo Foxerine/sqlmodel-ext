@@ -206,16 +206,18 @@ The fix is simple — tell the query to preload `author`:
 
 ```python
 # main.py
+from sqlmodel_ext import rel
+
 @articles.get("/{article_id}", response_model=ArticleResponse)
 async def get_article(session: SessionDep, article_id: UUID) -> Article:
     return await Article.get_exist_one(
         session,
         article_id,
-        load=Article.author,    # ← new
+        load=rel(Article.author),    # ← new
     )
 ```
 
-`load=Article.author` makes sqlmodel-ext use `selectinload(Article.author)` under the hood to pull the author back in one query.
+`load=rel(Article.author)` makes sqlmodel-ext use `selectinload(Article.author)` under the hood to pull the author back in one query (`rel()` casts the Relationship field to a loadable attribute, keeping type checkers happy).
 
 Try it again:
 
@@ -225,7 +227,7 @@ curl http://127.0.0.1:8000/articles/<article_id>
 ```
 
 ::: tip Nested relations also work
-If you want the author **and** something related to the author, write `load=[Article.author, User.profile]` — sqlmodel-ext will build the `selectinload(author).selectinload(profile)` chain automatically.
+If you want the author **and** something related to the author, write `load=[rel(Article.author), rel(User.profile)]` — sqlmodel-ext will build the `selectinload(author).selectinload(profile)` chain automatically.
 :::
 
 ## 7. About bypassing the cache
@@ -254,9 +256,9 @@ Usually you don't need it though — `save()` / `update()` already invalidated t
 | `configure_redis()` is called once at startup | inside lifespan |
 | `check_cache_config()` validates every subclass | inside lifespan |
 | `decode_responses=False` is non-negotiable | redis client config |
-| Cache invalidation is fully automatic | handled inside `save()` / `update()` / `delete()` |
+| Cache invalidation is fully automatic | CRUD registers pendings; the enhanced `AsyncSession.commit()` sync-invalidates them |
 | `lazy='raise_on_sql'` is the MissingGreenlet safety net | no setup needed; on by default |
-| `load=` preloads relations | `Article.get_exist_one(..., load=Article.author)` |
+| `load=` preloads relations | `Article.get_exist_one(..., load=rel(Article.author))` |
 
 ## What you can already do
 

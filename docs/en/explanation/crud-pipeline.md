@@ -155,7 +155,7 @@ if load:
         statement = statement.options(loader)
 ```
 
-`_build_load_chains` automatically detects relation dependencies and builds nested loading chains. For example, `load=[User.profile, Profile.avatar]` → `selectinload(User.profile).selectinload(Profile.avatar)`.
+`_build_load_chains` automatically detects relation dependencies and builds nested loading chains. For example, `load=[rel(User.profile), rel(Profile.avatar)]` → `selectinload(User.profile).selectinload(Profile.avatar)`.
 
 ### Layer 5: Polymorphic queries
 

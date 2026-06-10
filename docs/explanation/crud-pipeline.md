@@ -155,7 +155,7 @@ if load:
         statement = statement.options(loader)
 ```
 
-`_build_load_chains` 自动检测关系依赖，构建嵌套加载链。比如 `load=[User.profile, Profile.avatar]` → `selectinload(User.profile).selectinload(Profile.avatar)`。
+`_build_load_chains` 自动检测关系依赖，构建嵌套加载链。比如 `load=[rel(User.profile), rel(Profile.avatar)]` → `selectinload(User.profile).selectinload(Profile.avatar)`。
 
 ### 第五层：多态查询
 

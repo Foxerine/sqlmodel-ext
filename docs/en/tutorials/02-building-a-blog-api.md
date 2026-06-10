@@ -97,10 +97,10 @@ class ArticleCreateRequest(ArticleBase):
     pass
 
 
-class ArticleUpdateRequest(SQLModelBase):
-    title: NonEmptyStrippedStr256 | None = None
-    body: Text10K | None = None
-    is_published: bool | None = None
+class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
+    # Inherited fields auto-convert to ``T | None = None``;
+    # max_length / non-empty-stripped constraints are preserved as-is
+    pass
 
 
 class ArticleResponse(ArticleBase, UUIDIdDatetimeInfoMixin):
@@ -134,7 +134,7 @@ class CommentResponse(CommentBase, UUIDIdDatetimeInfoMixin):
 - **`XxxBase`**: the greatest common factor across every variant (fields needed by both "create" and "response")
 - **`Xxx`**: the table model, with foreign keys and `Relationship` added
 - **`XxxCreateRequest`**: POST body (inherits Base, all fields required)
-- **`XxxUpdateRequest`**: PATCH body (every field optional, defined separately)
+- **`XxxUpdateRequest`**: PATCH body (`all_fields_optional=True` auto-converts inherited fields to optional, constraints preserved)
 - **`XxxResponse`**: response DTO (inherits Base + `UUIDIdDatetimeInfoMixin` to add id and timestamps)
 
 This layering means validation rules are **written once** — the `max_length=256` + non-empty-stripped constraints carried by `NonEmptyStrippedStr256` automatically apply to every subclass of `ArticleBase`.

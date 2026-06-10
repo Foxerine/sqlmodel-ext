@@ -11,10 +11,10 @@
 ## 1. 准备 DTO
 
 ```python
-from sqlmodel_ext import SQLModelBase, UUIDIdDatetimeInfoMixin, Str64, Text10K
+from sqlmodel_ext import SQLModelBase, UUIDIdDatetimeInfoMixin, NonEmptyStrippedStr64, Text10K
 
 class ArticleBase(SQLModelBase):
-    title: Str64
+    title: NonEmptyStrippedStr64
     body: Text10K
 
 class Article(ArticleBase, UUIDTableBaseMixin, table=True):
@@ -24,10 +24,9 @@ class ArticleCreateRequest(ArticleBase):
     """POST 请求体：所有字段都必填"""
     pass
 
-class ArticleUpdateRequest(SQLModelBase):
-    """PATCH 请求体：所有字段可选"""
-    title: Str64 | None = None
-    body: Text10K | None = None
+class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
+    """PATCH 请求体：继承字段自动转为 ``T | None = None``，约束原样保留（无需手写）"""
+    pass
 
 class ArticleResponse(ArticleBase, UUIDIdDatetimeInfoMixin):
     """响应 DTO：必带 id 和时间戳"""
@@ -107,7 +106,11 @@ async def delete_article(
 如果 `ArticleResponse` 中包含关系字段（如 `author: UserResponse`），你必须在查询时 `load=` 预加载，否则会触发 MissingGreenlet。具体见 [防止 MissingGreenlet 错误](./prevent-missing-greenlet)。
 
 ```python
-return await Article.get_exist_one(session, article_id, load=Article.author)
+from sqlmodel_ext import rel
+
+# rel() 把 Relationship 字段 cast 为 QueryableAttribute——
+# 类型检查器会把 Article.author 推断为 User 而非可加载属性
+return await Article.get_exist_one(session, article_id, load=rel(Article.author))
 ```
 
 ## 相关参考

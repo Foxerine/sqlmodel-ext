@@ -61,7 +61,7 @@ async def get_user(session: SessionDep, id: UUID):
 追踪变量的"过期状态"——在 `save()` 或 `update()` 调用之后，对象的所有关系视为过期。
 
 ```python
-user = await User.get_exist_one(session, id, load=User.profile)
+user = await User.get_exist_one(session, id, load=rel(User.profile))
 user = await user.update(session, data)   # 之后所有关系过期 // [!code warning]
 return user.profile                        # RLC002 // [!code error]
 ```

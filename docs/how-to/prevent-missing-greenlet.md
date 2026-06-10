@@ -25,10 +25,12 @@ print(user.profile)  # ⚠ raise_on_sql: 立刻抛 InvalidRequestError
 
 ## 第二道防线：`load=` 显式预加载
 
-最常用的做法。在查询时声明需要的关系：
+最常用的做法。在查询时声明需要的关系（用 `rel()` 包装——它把 Relationship 字段 cast 为 `QueryableAttribute`，否则类型检查器会把 `User.profile` 推断为 `Profile` 而非可加载属性）：
 
 ```python
-user = await User.get_exist_one(session, user_id, load=User.profile)
+from sqlmodel_ext import rel
+
+user = await User.get_exist_one(session, user_id, load=rel(User.profile))
 print(user.profile)  # 安全
 ```
 
@@ -38,7 +40,7 @@ print(user.profile)  # 安全
 user = await User.get_exist_one(
     session,
     user_id,
-    load=[User.profile, Profile.avatar],
+    load=[rel(User.profile), rel(Profile.avatar)],
 )
 # 自动构建: selectinload(User.profile).selectinload(Profile.avatar)
 ```

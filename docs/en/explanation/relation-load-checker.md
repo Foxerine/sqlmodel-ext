@@ -61,7 +61,7 @@ async def get_user(session: SessionDep, id: UUID):
 Tracks variable "expiration state" — after a `save()` or `update()` call, all relations on the object are considered expired.
 
 ```python
-user = await User.get_exist_one(session, id, load=User.profile)
+user = await User.get_exist_one(session, id, load=rel(User.profile))
 user = await user.update(session, data)   # All relations expire after this // [!code warning]
 return user.profile                        # RLC002 // [!code error]
 ```

@@ -455,7 +455,9 @@ user = await User.add(session, User(name="Alice", email="a@x.com"))
 user = await user.save(session)
 
 # 保存后预加载关系
-user = await user.save(session, load=User.profile)
+# rel() 把 Relationship 字段 cast 为 QueryableAttribute——
+# 否则类型检查器把 User.profile 推断为 Profile 而非可加载属性
+user = await user.save(session, load=rel(User.profile))
 
 # 乐观锁自动重试
 user = await user.save(session, optimistic_retry_count=3)
@@ -488,9 +490,10 @@ user3 = await user3.save(session)        # 一次性 commit 全部三条
 #### `update()` -- 从模型实例局部更新
 
 ```python
-class UserUpdate(SQLModelBase):
-    name: NonEmptyStrippedStr64 | None = None
-    email: EmailStr | None = None
+# all_fields_optional 自动把所有继承字段转为 ``T | None = None``
+# 并保留约束——无需手写 Optional 样板
+class UserUpdate(UserBase, all_fields_optional=True):
+    pass
 
 # 仅更新显式设置的字段
 user = await user.update(session, UserUpdate(name="Charlie"))
@@ -569,7 +572,7 @@ users = await User.get(session, fetch_mode="all")
 user = await User.get(
     session,
     User.id == user_id,
-    load=[User.profile, User.orders],
+    load=[rel(User.profile), rel(User.orders)],
 )
 
 # JOIN 查询
@@ -786,7 +789,7 @@ class ToolSet(SQLModelBase, UUIDTableBaseMixin, table=True):
 tool_set = await ToolSet.get(
     session,
     ToolSet.id == ts_id,
-    load=ToolSet.tools,
+    load=rel(ToolSet.tools),
     jti_subclasses='all',  # 加载所有子类特有的列
 )
 ```

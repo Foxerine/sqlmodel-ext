@@ -206,16 +206,18 @@ sqlmodel-ext 0.2.0 起把所有 `Relationship` 的默认 `lazy` 设为 `'raise_o
 
 ```python
 # main.py
+from sqlmodel_ext import rel
+
 @articles.get("/{article_id}", response_model=ArticleResponse)
 async def get_article(session: SessionDep, article_id: UUID) -> Article:
     return await Article.get_exist_one(
         session,
         article_id,
-        load=Article.author,    # ← 新增
+        load=rel(Article.author),    # ← 新增
     )
 ```
 
-`load=Article.author` 让 sqlmodel-ext 在底层用 `selectinload(Article.author)` 一次性把作者带回来。
+`load=rel(Article.author)` 让 sqlmodel-ext 在底层用 `selectinload(Article.author)` 一次性把作者带回来（`rel()` 把 Relationship 字段 cast 为可加载属性，让类型检查器满意）。
 
 试试看：
 
@@ -225,7 +227,7 @@ curl http://127.0.0.1:8000/articles/<article_id>
 ```
 
 ::: tip 嵌套关系也能预加载
-如果你想同时拿到作者**和**作者的某个字段相关对象，写 `load=[Article.author, User.profile]`——sqlmodel-ext 会自动构建 `selectinload(author).selectinload(profile)` 链。
+如果你想同时拿到作者**和**作者的某个字段相关对象，写 `load=[rel(Article.author), rel(User.profile)]`——sqlmodel-ext 会自动构建 `selectinload(author).selectinload(profile)` 链。
 :::
 
 ## 7. 关于跳过缓存
@@ -254,9 +256,9 @@ fresh = await Article.get_one(session, article_id, no_cache=True)
 | `configure_redis()` 启动时调用一次 | lifespan 中 |
 | `check_cache_config()` 校验所有子类 | lifespan 中 |
 | `decode_responses=False` 不能改 | redis 客户端配置 |
-| 缓存失效完全自动 | `save()` / `update()` / `delete()` 内部处理 |
+| 缓存失效完全自动 | CRUD 登记待失效项，增强 `AsyncSession.commit()` 统一同步失效 |
 | `lazy='raise_on_sql'` 是 MissingGreenlet 的安全网 | 不用配置，默认开启 |
-| `load=` 预加载关系 | `Article.get_exist_one(..., load=Article.author)` |
+| `load=` 预加载关系 | `Article.get_exist_one(..., load=rel(Article.author))` |
 
 ## 你已经会的
 

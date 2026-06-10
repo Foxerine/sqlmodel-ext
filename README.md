@@ -487,7 +487,9 @@ user = await User.add(session, User(name="Alice", email="a@x.com"))
 user = await user.save(session)
 
 # Save with relationship preloading
-user = await user.save(session, load=User.profile)
+# (rel() casts the Relationship field for type checkers, which would
+#  otherwise infer User.profile as Profile instead of a loadable attribute)
+user = await user.save(session, load=rel(User.profile))
 
 # Save with optimistic lock retry
 user = await user.save(session, optimistic_retry_count=3)
@@ -520,9 +522,10 @@ user3 = await user3.save(session)        # commits all three
 #### `update()` -- Partial Update from a Model
 
 ```python
-class UserUpdate(SQLModelBase):
-    name: NonEmptyStrippedStr64 | None = None
-    email: EmailStr | None = None
+# all_fields_optional auto-converts every inherited field to ``T | None = None``
+# while preserving constraints -- no hand-written Optional boilerplate
+class UserUpdate(UserBase, all_fields_optional=True):
+    pass
 
 # Only updates fields that were explicitly set
 user = await user.update(session, UserUpdate(name="Charlie"))
@@ -601,7 +604,7 @@ users = await User.get(session, fetch_mode="all")
 user = await User.get(
     session,
     User.id == user_id,
-    load=[User.profile, User.orders],
+    load=[rel(User.profile), rel(User.orders)],
 )
 
 # With JOIN
@@ -818,7 +821,7 @@ class ToolSet(SQLModelBase, UUIDTableBaseMixin, table=True):
 tool_set = await ToolSet.get(
     session,
     ToolSet.id == ts_id,
-    load=ToolSet.tools,
+    load=rel(ToolSet.tools),
     jti_subclasses='all',  # Loads all subclass-specific columns
 )
 ```

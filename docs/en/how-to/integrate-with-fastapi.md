@@ -11,10 +11,10 @@
 ## 1. Prepare the DTOs
 
 ```python
-from sqlmodel_ext import SQLModelBase, UUIDIdDatetimeInfoMixin, Str64, Text10K
+from sqlmodel_ext import SQLModelBase, UUIDIdDatetimeInfoMixin, NonEmptyStrippedStr64, Text10K
 
 class ArticleBase(SQLModelBase):
-    title: Str64
+    title: NonEmptyStrippedStr64
     body: Text10K
 
 class Article(ArticleBase, UUIDTableBaseMixin, table=True):
@@ -24,10 +24,9 @@ class ArticleCreateRequest(ArticleBase):
     """POST body: all fields are required"""
     pass
 
-class ArticleUpdateRequest(SQLModelBase):
-    """PATCH body: every field is optional"""
-    title: Str64 | None = None
-    body: Text10K | None = None
+class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
+    """PATCH body: inherited fields auto-convert to ``T | None = None``, constraints preserved (no hand-writing)"""
+    pass
 
 class ArticleResponse(ArticleBase, UUIDIdDatetimeInfoMixin):
     """Response DTO: id and timestamps are guaranteed to exist"""
@@ -107,7 +106,11 @@ The code above assumes `CurrentUserDep` already handles authentication. In real 
 If `ArticleResponse` includes a relation field (e.g. `author: UserResponse`), you **must** preload it via `load=` at query time, or the response will trigger MissingGreenlet. See [Prevent MissingGreenlet errors](./prevent-missing-greenlet).
 
 ```python
-return await Article.get_exist_one(session, article_id, load=Article.author)
+from sqlmodel_ext import rel
+
+# rel() casts the Relationship field to QueryableAttribute --
+# type checkers infer Article.author as User, not a loadable attribute
+return await Article.get_exist_one(session, article_id, load=rel(Article.author))
 ```
 
 ## Related reference

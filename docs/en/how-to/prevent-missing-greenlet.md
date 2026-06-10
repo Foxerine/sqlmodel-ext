@@ -25,10 +25,15 @@ This defense is **automatic** — you don't have to do anything. The benefit is 
 
 ## Second defense: explicit `load=`
 
-The most common approach. Declare needed relations at query time:
+The most common approach. Declare needed relations at query time (wrapped in
+`rel()` — it casts the Relationship field to `QueryableAttribute`; type
+checkers would otherwise infer `User.profile` as `Profile`, not a loadable
+attribute):
 
 ```python
-user = await User.get_exist_one(session, user_id, load=User.profile)
+from sqlmodel_ext import rel
+
+user = await User.get_exist_one(session, user_id, load=rel(User.profile))
 print(user.profile)  # safe
 ```
 
@@ -38,7 +43,7 @@ For nested relations, just list them:
 user = await User.get_exist_one(
     session,
     user_id,
-    load=[User.profile, Profile.avatar],
+    load=[rel(User.profile), rel(Profile.avatar)],
 )
 # Auto-builds: selectinload(User.profile).selectinload(Profile.avatar)
 ```
