@@ -20,7 +20,7 @@ Quick start::
     user = await user.save(session)
     users = await User.get(session, fetch_mode="all")
 """
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Base
 from sqlmodel_ext.base import SQLModelBase, ExtraIgnoreModelBase, CustomTableArg

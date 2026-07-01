@@ -137,6 +137,7 @@ Behavioral contract:
 - **Serializes to a fixed-point JSON string** (`model_dump_json()`): never scientific notation (`0E-18` → `'0'`), trailing zeros stripped (`1200.000...0` → `'1200'`) — protects JS clients from Number precision loss
 - **dict mode keeps the `Decimal` object** (`model_dump()`)
 - The `Optional*` variants nest their constraints in the inner `Annotated`, so JSON `null` parses safely
+- **Request-body OpenAPI schema is `string`-only (since 0.4.1)**: Pydantic maps `Decimal` to `anyOf: [number, string]` by default, but the runtime validator rejects floats — so the docs would misleadingly advertise a JSON number like `0.00001005` as valid while the server returns 422. These aliases use `WithJsonSchema(mode='validation')` to narrow the request-body schema to a plain `string` (with a fixed-point decimal pattern), keeping the OpenAPI contract in sync with runtime behavior. Response-body schemas are unaffected.
 
 ## Bounded-length list aliases (new in 0.4.0)
 
@@ -229,6 +230,9 @@ PostgreSQL `ARRAY` column.
 | `list[int]` | `INTEGER[]` |
 | `list[float]` | `FLOAT[]` |
 | `list[UUID]` | `UUID[]` |
+| `list[SomeStrEnum]` | `someenum[]` (read-tolerant, see below) |
+
+**Read-tolerant enum arrays (since 0.4.1)**: an `Array[SomeEnum]` column is wrapped in a read-tolerant `TypeDecorator`. When the database returns an enum value that is not a member of this process's Python enum (typically during a rolling-deployment version-skew window — a newer pod has written a new enum value into the array column while an older pod, still serving traffic, does not yet know it), that element is dropped on the **read path** with a warning instead of raising `LookupError` and 500-ing the request. The write path still goes through Pydantic / PG enum strict validation, so no dirty writes occur; dropped values remain in the database and become visible again once code that knows them is deployed. The semantics mirror Pydantic's `extra='ignore'` for unknown fields — the database is the superset source of truth, and each code version consumes the subset it recognizes.
 
 ### `JSON100K` / `JSONList100K`
 

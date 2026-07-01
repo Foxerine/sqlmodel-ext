@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Any, Generic, TypeAlias, TypeVar
 
 from annotated_types import Ge, Gt
-from pydantic import BeforeValidator, PlainSerializer, StringConstraints
+from pydantic import BeforeValidator, PlainSerializer, StringConstraints, WithJsonSchema
 from sqlalchemy import BigInteger, Numeric
 from sqlmodel import Field
 
@@ -373,6 +373,51 @@ This promotes "string at the boundary" from a documentation convention into a
 hard type-system contract.
 """
 
+# ---------------------------------------------------------------------------
+#  Decimal OpenAPI validation-schema fix (drop ``number``, keep ``string`` only)
+#
+#  Pydantic maps ``Decimal`` to ``anyOf: [number, string]`` in JSON Schema, but
+#  ``_reject_float_decimal_input`` rejects float at runtime (a JSON number with a
+#  decimal point *is* a float). So the docs would advertise ``0.00001005`` as a
+#  valid request value while the server returns 422 — a contract mismatch.
+#  ``WithJsonSchema(mode='validation')`` overrides the request-body schema only;
+#  response-body schemas are unaffected.
+# ---------------------------------------------------------------------------
+
+_DECIMAL_38_18_STR_PATTERN = (
+    r'^(?!^[-+.]*$)[+-]?0*(?:\d{0,20}|(?=[\d.]{1,39}0*$)\d{0,20}\.\d{0,18}0*$)'
+)
+_DECIMAL_20_10_STR_PATTERN = (
+    r'^(?!^[-+.]*$)[+-]?0*(?:\d{0,10}|(?=[\d.]{1,21}0*$)\d{0,10}\.\d{0,10}0*$)'
+)
+
+_DECIMAL_38_18_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
+    {'type': 'string', 'pattern': _DECIMAL_38_18_STR_PATTERN},
+    mode='validation',
+)
+_DECIMAL_20_10_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
+    {'type': 'string', 'pattern': _DECIMAL_20_10_STR_PATTERN},
+    mode='validation',
+)
+_OPTIONAL_DECIMAL_38_18_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
+    {
+        'anyOf': [
+            {'type': 'string', 'pattern': _DECIMAL_38_18_STR_PATTERN},
+            {'type': 'null'},
+        ]
+    },
+    mode='validation',
+)
+_OPTIONAL_DECIMAL_20_10_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
+    {
+        'anyOf': [
+            {'type': 'string', 'pattern': _DECIMAL_20_10_STR_PATTERN},
+            {'type': 'null'},
+        ]
+    },
+    mode='validation',
+)
+
 # NUMERIC(38, 18) — 20 integer digits + 18 fractional digits (matches the EVM
 # wei = 1e-18 ether de-facto standard for high-precision amounts)
 
@@ -381,6 +426,7 @@ SignedDecimal38_18: TypeAlias = Annotated[
     _REJECT_FLOAT,
     Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _DECIMAL_38_18_STR_SCHEMA,
 ]
 """NUMERIC(38, 18) Decimal, positive or negative"""
 
@@ -394,6 +440,7 @@ NonNegativeDecimal38_18: TypeAlias = Annotated[
     # annotated_types so the ignore scope stays minimal.
     Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _DECIMAL_38_18_STR_SCHEMA,
 ]
 """NUMERIC(38, 18) Decimal, >= 0"""
 
@@ -404,6 +451,7 @@ PositiveDecimal38_18: TypeAlias = Annotated[
     # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _DECIMAL_38_18_STR_SCHEMA,
 ]
 """NUMERIC(38, 18) Decimal, > 0"""
 
@@ -418,6 +466,7 @@ OptionalNonNegativeDecimal38_18: TypeAlias = Annotated[
     # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(default=None, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _OPTIONAL_DECIMAL_38_18_STR_SCHEMA,
 ]
 """NUMERIC(38, 18) Decimal, >= 0 or None"""
 
@@ -429,6 +478,7 @@ SignedDecimal20_10: TypeAlias = Annotated[
     _REJECT_FLOAT,
     Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _DECIMAL_20_10_STR_SCHEMA,
 ]
 """NUMERIC(20, 10) Decimal, positive or negative"""
 
@@ -439,6 +489,7 @@ NonNegativeDecimal20_10: TypeAlias = Annotated[
     # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _DECIMAL_20_10_STR_SCHEMA,
 ]
 """NUMERIC(20, 10) Decimal, >= 0"""
 
@@ -449,6 +500,7 @@ OptionalNonNegativeDecimal20_10: TypeAlias = Annotated[
     # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(default=None, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
     _DECIMAL_TO_JSON_STR,
+    _OPTIONAL_DECIMAL_20_10_STR_SCHEMA,
 ]
 """NUMERIC(20, 10) Decimal, >= 0 or None"""
 

@@ -51,6 +51,11 @@ from sqlmodel_ext.field_types.dialects.postgresql.exceptions import (
     VectorDTypeError,
     VectorError,
 )
+from sqlmodel_ext.field_types.dialects.postgresql.array import (
+    _UNKNOWN_ENUM_ELEM,
+    _TolerantEnum,
+    _TolerantEnumArray,
+)
 from sqlmodel_ext.field_types.dialects.postgresql.jsonb_types import MAX_JSON_LENGTH
 
 pg_dialect = PGDialect()
@@ -99,8 +104,19 @@ class TestArray:
         ]
         for alias, expected_item_type in cases:
             sa_type = _array_handler(alias).sa_array_type
-            assert isinstance(sa_type, sa.ARRAY)
-            assert isinstance(sa_type.item_type, expected_item_type)
+            if expected_item_type is sa.Enum:
+                # Enum arrays are wrapped in read-tolerant TypeDecorators so an
+                # unknown DB enum value (rolling-deploy version skew) is dropped
+                # rather than raising LookupError. The chain is
+                # _TolerantEnumArray -> ARRAY -> _TolerantEnum -> sa.Enum.
+                assert isinstance(sa_type, _TolerantEnumArray)
+                array_impl = sa_type.impl_instance
+                assert isinstance(array_impl, sa.ARRAY)
+                assert isinstance(array_impl.item_type, _TolerantEnum)
+                assert isinstance(array_impl.item_type.impl_instance, sa.Enum)
+            else:
+                assert isinstance(sa_type, sa.ARRAY)
+                assert isinstance(sa_type.item_type, expected_item_type)
 
     def test_enum_array_uses_member_values(self) -> None:
         """PG ENUM must be populated with .value strings, not Python names."""
@@ -131,6 +147,54 @@ class TestArray:
         assert list(m.scopes) == ["scope:read", "scope:write"]
         with pytest.raises(ValidationError):
             FtArrayModel(scopes=["bogus:scope"])
+
+
+class TestTolerantEnumRead:
+    """Read-path tolerance for enum arrays: an unknown DB enum value (rolling
+    deploy version skew) is dropped rather than raising LookupError.
+
+    The processors are unit-tested directly because a real PostgreSQL ENUM is
+    needed to reproduce the LookupError end-to-end, which the SQLite-backed test
+    suite cannot host. ``result_processor`` / ``process_result_value`` are the
+    exact hooks SQLAlchemy calls when loading rows, so exercising them directly
+    covers the behavior faithfully.
+    """
+
+    class _FakeDialect:
+        """Minimal stand-in; the impl Enum processor ignores it for str values."""
+
+    def _enum_processor(self):
+        deco = _TolerantEnum(FtPgScopeEnum, name="ftpgscopeenum")
+        return deco.result_processor(self._FakeDialect(), object())  # type: ignore[arg-type]
+
+    def test_known_value_maps_to_enum_member(self) -> None:
+        process = self._enum_processor()
+        assert process("scope:read") is FtPgScopeEnum.read
+
+    def test_none_passes_through(self) -> None:
+        process = self._enum_processor()
+        assert process(None) is None
+
+    def test_unknown_value_becomes_sentinel(self) -> None:
+        process = self._enum_processor()
+        assert process("scope:future") is _UNKNOWN_ENUM_ELEM
+
+    def test_array_filters_unknown_sentinels(self) -> None:
+        array_deco = _TolerantEnumArray(_TolerantEnum(FtPgScopeEnum, name="ftpgscopeenum"))
+        row = [FtPgScopeEnum.read, _UNKNOWN_ENUM_ELEM, FtPgScopeEnum.write]
+        result = array_deco.process_result_value(row, self._FakeDialect())  # type: ignore[arg-type]
+        assert result == [FtPgScopeEnum.read, FtPgScopeEnum.write]
+
+    def test_array_preserves_genuine_null_elements(self) -> None:
+        """A real NULL element (None) must survive; only the sentinel is dropped."""
+        array_deco = _TolerantEnumArray(_TolerantEnum(FtPgScopeEnum, name="ftpgscopeenum"))
+        row = [FtPgScopeEnum.read, None, _UNKNOWN_ENUM_ELEM]
+        result = array_deco.process_result_value(row, self._FakeDialect())  # type: ignore[arg-type]
+        assert result == [FtPgScopeEnum.read, None]
+
+    def test_array_none_passes_through(self) -> None:
+        array_deco = _TolerantEnumArray(_TolerantEnum(FtPgScopeEnum, name="ftpgscopeenum"))
+        assert array_deco.process_result_value(None, self._FakeDialect()) is None  # type: ignore[arg-type]
 
 
 # ============================================================

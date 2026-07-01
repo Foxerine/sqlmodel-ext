@@ -137,6 +137,7 @@ from sqlmodel_ext import (
 - **JSON 序列化为定点字符串**（`model_dump_json()`），永不出现科学计数法（`0E-18` → `'0'`）、剔除冗余尾零（`1200.000...0` → `'1200'`），防止 JS Number 精度损失
 - **dict 模式保留 `Decimal` 对象**（`model_dump()`）
 - `Optional*` 变体的约束嵌套在内层 `Annotated`，JSON `null` 解析安全
+- **OpenAPI 请求体 schema 仅 `string`（0.4.1 起）**：Pydantic 默认把 `Decimal` 映射为 `anyOf: [number, string]`，但运行时校验器拒绝 float——文档会误导地宣称 `0.00001005` 这样的 JSON number 合法，实际返回 422。这些别名通过 `WithJsonSchema(mode='validation')` 把请求体 schema 收窄为纯 `string`（带定点小数 pattern），使 OpenAPI 契约与运行时行为一致。响应体 schema 不受影响。
 
 ## 有界长度 List 别名（0.4.0 新增）
 
@@ -229,6 +230,9 @@ PostgreSQL `ARRAY` 列。
 | `list[int]` | `INTEGER[]` |
 | `list[float]` | `FLOAT[]` |
 | `list[UUID]` | `UUID[]` |
+| `list[SomeStrEnum]` | `someenum[]`（读容忍，见下） |
+
+**枚举数组读容忍（0.4.1 起）**：`Array[SomeEnum]` 列会被包装为读容忍的 `TypeDecorator`。当数据库返回的枚举值不在当前进程的 Python 枚举中时（典型场景：滚动部署版本偏差窗口——较新的 pod 已把新枚举值写入数组列，仍在服务流量的旧 pod 代码尚未认识该值），该元素在**读路径**被丢弃并记一条 warning，而非抛 `LookupError` 导致 500。写路径仍走 Pydantic / PG enum 严格校验，不会脏写；被丢弃的值仍在数据库中，认识它的代码版本部署后恢复可见。语义与 Pydantic `extra='ignore'` 对未知字段的处理一致——数据库是超集真相源，每个代码版本消费自己认识的子集。
 
 ### `JSON100K` / `JSONList100K`
 

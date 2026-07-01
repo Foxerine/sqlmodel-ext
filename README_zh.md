@@ -25,7 +25,7 @@ SQLModel 增强基础设施：智能元类、异步 CRUD Mixin、多态继承、
 | **RelationPreloadMixin** | 基于装饰器的关系自动预加载（防止 `MissingGreenlet` 错误） |
 | **ListResponse[T]** | 泛型分页响应模型，适用于列表接口 |
 | **字段类型** | 可复用的约束类型：`Str64`、`Port`、`IPAddress`、`HttpUrl`、`SafeHttpUrl` 等 |
-| **PostgreSQL 类型** | `Array[T]` 原生 ARRAY、`JSON100K`/`JSONList100K` 限长 JSONB、`NumpyVector` pgvector+NumPy 集成 |
+| **PostgreSQL 类型** | `Array[T]` 原生 ARRAY（枚举数组在滚动部署版本偏差窗口读容忍）、`JSON100K`/`JSONList100K` 限长 JSONB、`NumpyVector` pgvector+NumPy 集成 |
 | **响应 DTO Mixin** | 预构建的 API 响应模型 Mixin，包含 id/时间戳字段 |
 
 ## 安装

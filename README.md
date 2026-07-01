@@ -25,7 +25,7 @@ Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphi
 | **RelationPreloadMixin** | Decorator-based automatic relationship preloading (prevents `MissingGreenlet` errors) |
 | **ListResponse[T]** | Generic paginated response model for list endpoints |
 | **Field Types** | Reusable constrained types: `Str64`, `Port`, `IPAddress`, `HttpUrl`, `SafeHttpUrl`, and more |
-| **PostgreSQL Types** | `Array[T]` for native ARRAY, `JSON100K`/`JSONList100K` for size-limited JSONB, `NumpyVector` for pgvector+NumPy |
+| **PostgreSQL Types** | `Array[T]` for native ARRAY (read-tolerant for enum arrays during rolling-deploy version skew), `JSON100K`/`JSONList100K` for size-limited JSONB, `NumpyVector` for pgvector+NumPy |
 | **Info Response DTOs** | Pre-built mixins for API response models with id/timestamp fields |
 
 ## Installation

@@ -41,6 +41,10 @@ from sqlmodel import Field, SQLModel
 
 from sqlmodel_ext import SQLModelBase, TableBaseMixin, UUIDTableBaseMixin
 from sqlmodel_ext.field_types.dialects.postgresql import Array
+from sqlmodel_ext.field_types.dialects.postgresql.array import (
+    _TolerantEnum,
+    _TolerantEnumArray,
+)
 
 
 # Module-level enums: with ``from __future__ import annotations`` all
@@ -97,9 +101,16 @@ class TestExplicitFieldArraySaType:
             scopes: Array[ScopeLikeEnum] = Field(default_factory=list)
             tags: Array[str] = Field(default_factory=list)
 
+        # Enum arrays are wrapped in read-tolerant TypeDecorators
+        # (_TolerantEnumArray -> ARRAY -> _TolerantEnum -> sa.Enum) so an unknown
+        # DB enum value is dropped rather than raising LookupError during a
+        # rolling-deploy version-skew window.
         scopes_type = ScopeTable.__table__.c.scopes.type
-        assert isinstance(scopes_type, sa.ARRAY)
-        assert isinstance(scopes_type.item_type, sa.Enum)
+        assert isinstance(scopes_type, _TolerantEnumArray)
+        assert isinstance(scopes_type.impl_instance, sa.ARRAY)
+        assert isinstance(scopes_type.impl_instance.item_type, _TolerantEnum)
+        assert isinstance(scopes_type.impl_instance.item_type.impl_instance, sa.Enum)
+        # Plain str arrays stay a native ARRAY (only enum items get wrapped)
         assert isinstance(ScopeTable.__table__.c.tags.type, sa.ARRAY)
 
         # default_factory survives (not silently is_required=True)
@@ -112,9 +123,12 @@ class TestExplicitFieldArraySaType:
         class ScopeRow(SQLModelBase, UUIDTableBaseMixin, table=True):
             scopes: Array[DynScopeEnum] = Field(default_factory=list)
 
+        # Read-tolerant TypeDecorator chain (see test above)
         col_type = ScopeRow.__table__.c.scopes.type
-        assert isinstance(col_type, sa.ARRAY)
-        assert isinstance(col_type.item_type, sa.Enum)
+        assert isinstance(col_type, _TolerantEnumArray)
+        assert isinstance(col_type.impl_instance, sa.ARRAY)
+        assert isinstance(col_type.impl_instance.item_type, _TolerantEnum)
+        assert isinstance(col_type.impl_instance.item_type.impl_instance, sa.Enum)
 
     def test_non_array_field_unaffected(self) -> None:
         """Guard: ordinary scalar Field columns keep working unchanged."""

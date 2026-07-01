@@ -9,6 +9,7 @@ Provides a smart metaclass that handles:
 - Annotated sa_type extraction and injection
 - Python 3.14 (PEP 649) compatibility
 """
+import ast
 import copy
 import logging
 import re
@@ -599,6 +600,99 @@ def _recover_annotated_sqlmodel_fields(
             annotations[field_name] = rebuilt
         else:
             annotations[field_name] = new_inner
+
+
+def _is_none_node(node: ast.expr) -> bool:
+    """Whether a type-expression AST node denotes ``None`` / ``NoneType``."""
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    return isinstance(node, ast.Name) and node.id in ('None', 'NoneType')
+
+
+def _relationship_target_node(node: ast.expr) -> ast.expr | None:
+    """
+    Extract the single non-``None`` target node from a type-expression AST.
+
+    Covers every shape a relationship annotation can take: ``Foo`` / ``pkg.Foo`` /
+    ``Foo | None`` / ``None | Foo`` / ``Optional[Foo]`` / ``Union[Foo, None]``, plus
+    an inner requoted form (``Optional['Foo']``). When the expression cannot be
+    reduced to a single target (e.g. a multi-member union ``Foo | Bar``), returns
+    ``None`` so the caller hands the annotation back to SQLModel's native parser
+    untouched, letting it raise its own clear error.
+    """
+    # Bare class name / dotted (module-qualified) class name.
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return node
+    # Inner requoted string constant (e.g. ``Optional['Foo']``): recurse into it.
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            return _relationship_target_node(ast.parse(node.value.strip(), mode='eval').body)
+        except SyntaxError:
+            return None
+    # ``A | None`` / ``None | A``.
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left_none, right_none = _is_none_node(node.left), _is_none_node(node.right)
+        if left_none ^ right_none:  # exactly one side is None
+            return _relationship_target_node(node.right if left_none else node.left)
+        return None
+    # ``Optional[A]`` / ``Union[A, None]``.
+    if isinstance(node, ast.Subscript):
+        base = node.value
+        base_name = (
+            base.id if isinstance(base, ast.Name)
+            else base.attr if isinstance(base, ast.Attribute)
+            else None
+        )
+        if base_name == 'Optional':
+            return _relationship_target_node(node.slice)
+        if base_name == 'Union':
+            elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            non_none = [e for e in elts if not _is_none_node(e)]
+            if len(non_none) == 1:
+                return _relationship_target_node(non_none[0])
+    return None
+
+
+def _resolve_relationship_target(
+    name: str,
+    rel_info: typing.Any,
+    annotation: typing.Any,
+) -> typing.Any:
+    """
+    Wrapper around SQLModel's ``get_relationship_to`` that first normalizes a
+    flat-string / ``ForwardRef`` nullable relationship annotation (e.g.
+    ``'UserFolder | None'``) into a structured ``ForwardRef('UserFolder')`` via
+    ``ast``, then delegates to upstream.
+
+    Root cause: ``get_relationship_to`` can only strip ``None`` from an
+    **already-evaluated** ``typing.Union``; it cannot parse a whole-string PEP 604
+    annotation -- it would treat the entire ``'UserFolder | None'`` string as the
+    class name and hand it to SQLAlchemy. ``Optional['T']`` works only because
+    ``Optional[...]`` is evaluated at class-definition time into
+    ``Union[ForwardRef('T'), None]``, leaving just the inner ``'T'`` as a ForwardRef.
+
+    This wrapper lets relationship fields be annotated with the PEP 604
+    ``'X | None'`` form (pyright-friendly, no ``reportDeprecated`` from
+    ``Optional[...]``) and converts it back at runtime into a form
+    ``get_relationship_to`` recognizes. Already-evaluated typing objects
+    (``list[...]`` / ``Optional[...]`` / concrete classes) pass through unchanged;
+    unrecognized expressions are likewise passed through to upstream, preserving
+    its original error semantics. Note: only a temporary local value is produced
+    for resolution -- ``cls.__annotations__`` is left intact.
+    """
+    if isinstance(annotation, (str, typing.ForwardRef)):
+        expr = (
+            annotation.__forward_arg__
+            if isinstance(annotation, typing.ForwardRef)
+            else annotation
+        )
+        try:
+            target = _relationship_target_node(ast.parse(expr.strip(), mode='eval').body)
+        except SyntaxError:
+            target = None
+        if target is not None:
+            annotation = typing.ForwardRef(ast.unparse(target))
+    return get_relationship_to(name=name, rel_info=rel_info, annotation=annotation)
 
 
 def _make_sti_fk_resolver(
@@ -1202,7 +1296,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
                                         ann = raw_ann.__args__[0]
                                     else:
                                         ann = raw_ann
-                                    relationship_to = get_relationship_to(
+                                    relationship_to = _resolve_relationship_target(
                                         name=rel_name, rel_info=rel_info, annotation=ann
                                     )
                                     rel_kwargs: dict[str, typing.Any] = {}
@@ -1297,7 +1391,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
             else:
                 ann = raw_ann
 
-            relationship_to = get_relationship_to(
+            relationship_to = _resolve_relationship_target(
                 name=rel_name, rel_info=rel_info, annotation=ann
             )
             rel_kwargs: dict[str, typing.Any] = {}

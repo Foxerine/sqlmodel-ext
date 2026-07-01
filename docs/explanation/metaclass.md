@@ -209,6 +209,22 @@ if fields_removed:
 
 修复 SQLModel/SQLAlchemy 在处理继承 + 关系时的 bug：Relationship 被当 Pydantic 字段处理、JTI 子类丢失父类 Relationship、子类重定义导致歧义。
 
+### PEP 604 可空关系注解归一化（0.4.1 起）
+
+创建 Relationship 时，元类不直接调用 SQLModel 的 `get_relationship_to`，而是先经 `_resolve_relationship_target` 包装：把**扁平字符串 / ForwardRef 形式**的可空关系注解（如 `'Parent | None'`）用 `ast` 归一化为结构化的 `ForwardRef('Parent')`，再交给上游。
+
+根因：`get_relationship_to` 只能从**已求值的** `typing.Union` 中剥离 `None`，无法解析「整体是字符串」的 PEP 604 注解——它会把整串 `'Parent | None'` 当类名丢给 SQLAlchemy。`Optional['Parent']` 之所以历史可用，是因为 `Optional[...]` 在类定义时即被求值成 `Union[ForwardRef('Parent'), None]`，只剩内层 `'Parent'` 是 ForwardRef。
+
+因此现在关系字段可以写 pyright 友好的前向引用形式：
+
+```python
+class Child(SQLModelBase, UUIDTableBaseMixin, table=True):
+    parent_id: uuid.UUID | None = Field(default=None, foreign_key="parent.id")
+    parent: 'Parent | None' = Relationship(back_populates="children")   # ✅ 无需 Optional['Parent']
+```
+
+覆盖全部形态：`Foo` / `pkg.Foo` / `Foo | None` / `None | Foo` / `Optional[Foo]` / `Union[Foo, None]` 以及内层再套引号（`Optional['Foo']`）。无法归一化为单一目标（如多元 union `Foo | Bar`）时原样交还上游，抛它本来的清晰错误。归一化只作用于传给 `get_relationship_to` 的临时局部值，不改写 `cls.__annotations__`。已求值的 typing 对象（`list[...]` / 具体类 / `Optional[...]`）原样穿透，向后兼容。
+
 ## `__DeclarativeMeta.__init__` — JTI 表创建
 
 `__new__` 创建类后，`__init__` 做后续初始化。核心任务：**处理 JTI 子表的创建**。

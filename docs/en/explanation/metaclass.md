@@ -217,6 +217,38 @@ if fields_removed:
 
 Fixes bugs in SQLModel/SQLAlchemy when handling inheritance + relationships: Relationships being treated as Pydantic fields, JTI subclasses losing parent Relationships, and subclass redefinition causing ambiguity.
 
+### PEP 604 nullable relationship annotation normalization (since 0.4.1)
+
+When building a Relationship, the metaclass does not call SQLModel's
+`get_relationship_to` directly — it first wraps it in `_resolve_relationship_target`,
+which normalizes a **flat-string / ForwardRef** nullable relationship annotation
+(e.g. `'Parent | None'`) into a structured `ForwardRef('Parent')` via `ast` before
+delegating to upstream.
+
+Root cause: `get_relationship_to` can only strip `None` from an **already-evaluated**
+`typing.Union`; it cannot parse a whole-string PEP 604 annotation — it would treat
+the entire `'Parent | None'` string as the class name and hand it to SQLAlchemy.
+`Optional['Parent']` works only because `Optional[...]` is evaluated at
+class-definition time into `Union[ForwardRef('Parent'), None]`, leaving just the
+inner `'Parent'` as a ForwardRef.
+
+So relationship fields can now use the pyright-friendly forward-reference form:
+
+```python
+class Child(SQLModelBase, UUIDTableBaseMixin, table=True):
+    parent_id: uuid.UUID | None = Field(default=None, foreign_key="parent.id")
+    parent: 'Parent | None' = Relationship(back_populates="children")   # ✅ no Optional['Parent']
+```
+
+Every shape is covered: `Foo` / `pkg.Foo` / `Foo | None` / `None | Foo` /
+`Optional[Foo]` / `Union[Foo, None]`, plus an inner requoted form (`Optional['Foo']`).
+When the annotation cannot be reduced to a single target (e.g. a multi-member union
+`Foo | Bar`), it is handed back to upstream unchanged, preserving its original clear
+error. Normalization only affects the temporary local value passed to
+`get_relationship_to`; `cls.__annotations__` is left intact. Already-evaluated typing
+objects (`list[...]` / concrete classes / `Optional[...]`) pass through unchanged, so
+the change is backward-compatible.
+
 ## `__DeclarativeMeta.__init__` — JTI table creation
 
 After `__new__` creates the class, `__init__` does post-initialization. Core task: **handle JTI sub-table creation**.
