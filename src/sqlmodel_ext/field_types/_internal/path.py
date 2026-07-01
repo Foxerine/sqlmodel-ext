@@ -17,7 +17,11 @@ class _PathAsSQLString(TypeDecorator):
 
 class _BasePathHandler(ABC):
     """(Internal) Base class for single-value type handlers like Path."""
-    sa_type: TypeDecorator = _PathAsSQLString
+    # Must be an *instance*, not the class: the metaclass extracts this value
+    # from the core-schema metadata and hands it straight to the column
+    # builder, which expects a TypeEngine instance (a bare class silently
+    # falls back to AutoString, dropping the Path<->str result_processor).
+    sa_type: TypeDecorator = _PathAsSQLString()
 
     @classmethod
     @abstractmethod

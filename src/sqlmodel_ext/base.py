@@ -975,6 +975,14 @@ class __DeclarativeMeta(SQLModelMetaclass):
                     # FieldInfoMetadata channel — plain setattr is dropped
                     # before SQLModel's column build (see _durably_set_sa_type).
                     _durably_set_sa_type(field_value, sa_type)
+                else:
+                    # Bare default value (e.g. ``fpath: FilePathType = Path("a.txt")``):
+                    # the assignment is neither Undefined nor a FieldInfo. Wrap it in a
+                    # Field so the extracted sa_type reaches the column builder while the
+                    # default is preserved — without this branch the column silently
+                    # falls back to the base-type inference (AutoString for Path),
+                    # dropping the type's result_processor.
+                    attrs[field_name] = Field(default=field_value, sa_type=sa_type)
 
         # 5. Save SQLModel FieldInfo from Annotated fields before super().__new__(),
         # because Pydantic rebuilds model_fields with plain FieldInfo that lacks

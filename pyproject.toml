@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-ext"
-version = "0.4.1"
+version = "0.4.2"
 description = "Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphic inheritance, optimistic locking, relation preloading, and reusable field types."
 readme = "README.md"
 license = "MIT"
@@ -43,10 +43,16 @@ pgvector = [
     "pgvector>=0.3",
 ]
 dev = [
+    # Pull in every optional feature so the full test suite can run: the
+    # cached-table (fakeredis), FastAPI-integration and pgvector/NumPy tests
+    # hard-import these. Keeping them here (rather than in the CI workflow)
+    # makes ``uv pip install -e ".[dev]"`` reproduce CI locally.
+    "sqlmodel-ext[fastapi,cache,pgvector]",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "aiosqlite>=0.20",
     "ruff>=0.4",
+    "fakeredis>=2.20",
 ]
 
 [project.urls]
