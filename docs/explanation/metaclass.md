@@ -169,7 +169,7 @@ if is_partial:
 
 - `T` → `Unset | T`，默认值设为 `Unset`（可空字段自然得到 `Unset | T | None`）；
 - 字段写成 `field: T = Field(gt=..., le=...)`（非 `Annotated` 形式）时，约束在右侧，元类从基类 `model_fields[name].metadata` 把它们取回并重新包进 `Annotated`；
-- `exclude` / `alias` / `validation_alias` / `serialization_alias` / `discriminator` / `repr` / `frozen` 这些**字段级**属性放在联合成员上会被 Pydantic 静默丢弃，所以由 `_hoist_field_metadata()` 提升到联合外层；约束留在内层；
+- `exclude` / `alias` / `validation_alias` / `serialization_alias` / `repr` / `frozen` / `deprecated` 这些**字段级**属性放在联合成员上会被 Pydantic 静默丢弃，所以由 `_hoist_field_metadata()` 从基类已解析的字段读取并提升到联合外层（`alias_generator` 生成的别名不提升，与普通继承一样由派生类重新生成），同时由 `_union_member_annotation()` 从联合成员中移除；约束与 `discriminator` 留在内层；
 - 跳过本类自己声明的字段（`_own_annotation_names`）与 `Literal` 字段。
 
 生成的注解是运行时的，静态类型检查器看到的仍是基类注解。需要静态强制时，显式声明 `Unset | T = Unset`，或用实验性的 `python -m sqlmodel_ext.check_derived`（见 [检查 partial DTO 的误用](/how-to/check-partial-dtos)）。详见 [Unset 三态](./unset-three-state)。

@@ -169,7 +169,7 @@ if is_partial:
 
 - `T` → `Unset | T` with default `Unset` (nullable fields naturally become `Unset | T | None`);
 - for fields declared as `field: T = Field(gt=..., le=...)` (non-`Annotated` form) the constraints live on the right-hand side, so they are pulled from the base's `model_fields[name].metadata` and re-wrapped into `Annotated`;
-- **field-level** attributes — `exclude` / `alias` / `validation_alias` / `serialization_alias` / `discriminator` / `repr` / `frozen` — would be silently dropped by Pydantic on a union member, so `_hoist_field_metadata()` hoists them outside the union; constraints stay inside;
+- **field-level** attributes — `exclude` / `alias` / `validation_alias` / `serialization_alias` / `repr` / `frozen` / `deprecated` — would be silently dropped by Pydantic on a union member, so `_hoist_field_metadata()` reads them from the base's resolved field and hoists them outside the union (aliases produced by an `alias_generator` are left to be regenerated, as in plain inheritance), while `_union_member_annotation()` strips them from the member; constraints and `discriminator` stay inside;
 - fields the class declares itself (`_own_annotation_names`) and `Literal` fields are skipped.
 
 The generated annotations exist at runtime; static type checkers still see the base annotations. Where static enforcement matters, declare `Unset | T = Unset` explicitly, or use the experimental `python -m sqlmodel_ext.check_derived` (see [Check partial DTOs for misuse](/en/how-to/check-partial-dtos)). See [Unset](./unset-three-state).
