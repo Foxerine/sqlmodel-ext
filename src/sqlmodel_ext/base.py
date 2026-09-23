@@ -352,6 +352,9 @@ Excluded on purpose:
 """
 
 
+_ALIAS_FIELD_ATTRS: typing.Final = frozenset({'alias', 'validation_alias', 'serialization_alias'})
+"""The members of ``_UNION_INCOMPATIBLE_FIELD_ATTRS`` an ``alias_generator`` can fill in."""
+
 _DEFAULT_FIELD_INFO: typing.Final = FieldInfo()
 """Reference ``FieldInfo`` for "attribute left at its default" (e.g. ``repr`` defaults to ``True``, not ``None``)."""
 
@@ -382,8 +385,17 @@ def _hoist_field_metadata(union_ann: typing.Any, base_field: FieldInfo) -> typin
     :returns: ``union_ann`` unchanged when there is nothing to hoist, otherwise
         ``union_ann`` wrapped in ``Annotated`` with a ``Field`` carrying the hoisted attributes
     """
+    # Aliases filled in by a model's ``alias_generator`` carry ``alias_priority``
+    # 1; Pydantic regenerates those for every subclass (so a derived class with
+    # its own generator gets its own aliases), while author-declared aliases
+    # (priority 2) are inherited as-is. Hoisting generated aliases would turn
+    # them into explicit ones and freeze them, so the alias family is carried
+    # only when priority is 2 -- exactly what plain inheritance keeps.
+    aliases_are_declared = base_field.alias_priority is not None and base_field.alias_priority >= 2
     carried: dict[str, typing.Any] = {}
     for attr in _UNION_INCOMPATIBLE_FIELD_ATTRS:
+        if attr in _ALIAS_FIELD_ATTRS and not aliases_are_declared:
+            continue
         value = getattr(base_field, attr, None)
         if value is not None and value != getattr(_DEFAULT_FIELD_INFO, attr, None):
             carried[attr] = value
