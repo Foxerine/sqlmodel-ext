@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from typing import Any, Self, Sequence, get_args, get_origin
 
 from pydantic import AliasChoices, BaseModel, model_validator
+from pydantic import Field as PydanticField
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined as Undefined
 from sqlalchemy import Column, inspect as sa_inspect
@@ -336,12 +337,18 @@ constructs from an empty payload and dumps to ``{}``.
 
 _UNION_INCOMPATIBLE_FIELD_ATTRS: typing.Final = (
     'exclude', 'alias', 'validation_alias', 'serialization_alias',
-    'discriminator', 'repr', 'frozen',
+    'repr', 'frozen',
 )
 """
 ``FieldInfo`` attributes that have no effect on a union member and must be hoisted outside the union.
 
 Excluded on purpose:
+
+- ``discriminator``: it already works on the member (Pydantic supports a
+  tagged union nested in an outer union, as in
+  ``Unset | Annotated[Cat | Dog, Field(discriminator='kind')]``), while
+  hoisting it would make Pydantic treat ``Unset`` as a tagged-union variant
+  and fail at class creation.
 
 - ``default`` / ``default_factory``: ``partial`` sets the class attribute to
   ``Unset`` (the default); an outer FieldInfo that also carried a
@@ -401,7 +408,10 @@ def _hoist_field_metadata(union_ann: typing.Any, base_field: FieldInfo) -> typin
             carried[attr] = value
     if not carried:
         return union_ann
-    return typing.Annotated[tuple([union_ann, Field(**carried)])]
+    # Pydantic's ``Field``, not SQLModel's: the outer layer only carries
+    # Pydantic field-level attributes, and ``sqlmodel.Field`` does not accept
+    # all of them (e.g. ``frozen``).
+    return typing.Annotated[tuple([union_ann, PydanticField(**carried)])]
 
 
 def _apply_partial(
