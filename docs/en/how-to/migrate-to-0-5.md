@@ -99,7 +99,7 @@ Checklist:
 
 - the rename: `version` is a very common domain field name, and having it taken by the lock forced awkward names on business fields;
 - `BIGINT`: removes any realistic risk of `INTEGER` overflow on frequently updated rows;
-- `server_default`: writers that do not know the column (raw SQL, other services, fixtures) omit it on INSERT; a database default keeps those INSERTs valid. It does **not** make the 0.4 → 0.5 rename rolling-compatible — see the warning below the SQL;
+- `server_default`: writers that do not know the column (raw SQL, other services, fixtures) omit it on INSERT; a database default keeps those INSERTs valid. It does **not** make the 0.4 → 0.5 rename rolling-compatible — see the deployment notes below;
 - `exclude=True`: it is ORM-internal state and must not leak into `model_dump()` (e.g. into response DTOs with `extra='forbid'`).
 
 **How to migrate**:
@@ -129,17 +129,6 @@ ALTER TABLE "order" ALTER COLUMN version TYPE BIGINT;
 ALTER TABLE "order" ALTER COLUMN version SET DEFAULT 0;
 ALTER TABLE "order" RENAME version TO oplock_version;
 ```
-
-Only the **root** table of a JTI hierarchy carries the column (child tables share it through mapper inheritance); STI has a single table anyway. Run the migration once per root table of every model that mixes in `OptimisticLockMixin`.
-
-::: warning This rename is not rolling-compatible
-Once the column is renamed, any application instance still running sqlmodel-ext 0.4.x reads and writes a `version` column that no longer exists, and every load or save of those models fails. Conversely, 0.5.0 instances cannot run against the old column name. So for models that use `OptimisticLockMixin`:
-
-- **simplest**: stop all 0.4.x instances, run the migration, start the 0.5.0 instances (a short maintenance window);
-- **zero downtime**: plan your own expand/contract sequence (for example, keep both columns in sync with a database trigger during the rollout, then drop `version` afterwards). The library does not ship such a bridge.
-
-Models without `OptimisticLockMixin` are unaffected. A shared Redis cache is safe during a mixed 0.4/0.5 window: an entry written by the other version fails validation, is deleted and the read falls back to the database — correctness is kept, only the hit rate drops until the rollout completes.
-:::
 
 The equivalent Alembic operation (the SQL above is what it generates for the PostgreSQL dialect):
 
@@ -175,6 +164,7 @@ def downgrade() -> None:
 - **The rename cannot run alongside old code**: after the migration, still-running 0.4.x instances cannot find the `version` column; before it, 0.5.0 instances cannot find `oplock_version`. Run it in a maintenance window or a blue/green switch so the migration and the code switch happen together.
 - `INTEGER → BIGINT` **rewrites the whole table** on PostgreSQL and holds an `ACCESS EXCLUSIVE` lock; estimate the time for large tables.
 - Run it for every table using `OptimisticLockMixin` (for STI/JTI, the root table).
+- **Clear the Redis cache when you switch** (if you use `CachedTableBaseMixin`): cache keys are the same in 0.4.x and 0.5.0, and an entry written by 0.4.x can validate under 0.5.0 with a different meaning — e.g. a model that now declares a domain `version` field would read the old lock counter into it. Stopping the old instances does not remove their entries, so flush the cache (or call `await Model.invalidate_all(strict=True)` for each cached model) before the 0.5.0 instances serve traffic.
 :::
 
 ## 4. `OptimisticLockMixin` retries 3 times by default; `delete()` conflicts raise `OptimisticLockError`

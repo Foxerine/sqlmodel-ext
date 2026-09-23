@@ -99,7 +99,7 @@ if body.title is not Unset:              # 用 is not Unset 判断"有没有传"
 
 - 改名：`version` 是一个很常见的领域字段名，被乐观锁占用会逼用户给业务字段起别扭的名字；
 - `BIGINT`：频繁更新的行消除 `INTEGER` 溢出的现实风险；
-- `server_default`：不认识这一列的写入方（裸 SQL、其他服务、测试夹具）INSERT 时会省略它，数据库默认值让这些 INSERT 依然合法。它**不能**让 0.4 → 0.5 的改名变得滚动兼容——见 SQL 下方的警告；
+- `server_default`：不认识这一列的写入方（裸 SQL、其他服务、测试夹具）INSERT 时会省略它，数据库默认值让这些 INSERT 依然合法。它**不能**让 0.4 → 0.5 的改名变得滚动兼容——见下方「上线注意」；
 - `exclude=True`：它是 ORM 内部状态，不应泄漏进 `model_dump()`（比如泄漏进 `extra='forbid'` 的响应 DTO）。
 
 **改法**：
@@ -129,17 +129,6 @@ ALTER TABLE "order" ALTER COLUMN version TYPE BIGINT;
 ALTER TABLE "order" ALTER COLUMN version SET DEFAULT 0;
 ALTER TABLE "order" RENAME version TO oplock_version;
 ```
-
-JTI 层级里只有**根表**带这一列（子表经 mapper 继承共享）；STI 本来就只有一张表。对每个混入了 `OptimisticLockMixin` 的模型，按它的根表各跑一次迁移。
-
-::: warning 这次改名不是滚动兼容的
-列一改名，仍在运行 sqlmodel-ext 0.4.x 的应用实例读写的还是已经不存在的 `version` 列，这些模型的每次加载、保存都会失败；反过来，0.5.0 的实例也无法在旧列名上运行。所以对使用了 `OptimisticLockMixin` 的模型：
-
-- **最简单**：停掉所有 0.4.x 实例 → 跑迁移 → 启动 0.5.0 实例（一个短维护窗口）；
-- **零停机**：自行设计 expand/contract 序列（例如上线期间用数据库触发器保持两列同步，完成后再删掉 `version`）。本库不提供这种桥接。
-
-没有使用 `OptimisticLockMixin` 的模型不受影响。0.4/0.5 混跑期间共享 Redis 缓存是安全的：对方版本写入的条目会校验失败、被删除，读取回落到数据库——正确性不受影响，只是上线完成前命中率会下降。
-:::
 
 对应的 Alembic 操作（上面的 SQL 就是它在 PostgreSQL 方言下生成的）：
 
@@ -175,6 +164,7 @@ def downgrade() -> None:
 - **改名不能与旧代码混跑**：迁移执行后，仍在运行的 0.4.x 实例找不到 `version` 列；迁移执行前，0.5.0 实例找不到 `oplock_version` 列。请在停机窗口或蓝绿切换中执行，让迁移与代码切换同时完成。
 - `INTEGER → BIGINT` 在 PostgreSQL 上会**重写整张表**并持有 `ACCESS EXCLUSIVE` 锁，大表请预估耗时。
 - 每一张使用 `OptimisticLockMixin` 的表（STI/JTI 以根表为准）都要执行一遍。
+- **切换时清空 Redis 缓存**（若使用了 `CachedTableBaseMixin`）：0.4.x 与 0.5.0 的缓存键相同，0.4.x 写入的条目可能在 0.5.0 下校验通过、却是另一个含义——例如某个模型现在声明了业务字段 `version`，就会把旧的锁版本号读进这个字段。停掉旧实例并不会清掉它们写入的条目，所以请在 0.5.0 实例对外服务前清空缓存（或对每个缓存模型调用 `await Model.invalidate_all(strict=True)`）。
 :::
 
 ## 4. `OptimisticLockMixin` 默认重试 3 次；`delete()` 冲突抛 `OptimisticLockError`

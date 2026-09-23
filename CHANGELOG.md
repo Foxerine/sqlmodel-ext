@@ -25,8 +25,10 @@ Upgrade guide: [Migrate from 0.4.x to 0.5.0](docs/en/how-to/migrate-to-0-5.md)
   (bounded by `JS_MAX_SAFE_INTEGER`) with `server_default 0`, and excluded from
   `model_dump()`. Requires a database migration (see the upgrade guide). The
   rename is **not rolling-compatible**: 0.4.x and 0.5.0 instances cannot run
-  against the same table at once, so stop the old instances before migrating
-  (or plan your own expand/contract sequence).
+  against the same table at once, so switch all instances together. If you
+  use `CachedTableBaseMixin`, also clear the Redis cache at the switch: cache
+  keys are unchanged and a 0.4.x entry can validate under 0.5.0 with a
+  different meaning.
 - **`oplock_version` is a reserved name**: declaring it in the class body of any
   `SQLModelBase` subclass raises `TypeError`.
 - **`OptimisticLockMixin` retries conflicts 3 times by default**
@@ -128,6 +130,12 @@ Upgrade guide: [Migrate from 0.4.x to 0.5.0](docs/en/how-to/migrate-to-0-5.md)
 
 ### Fixed
 
+- A raw `insert(...)` into a cached table executed through the enhanced
+  `AsyncSession` left cached query results stale after commit (until TTL). It
+  now registers a query-level invalidation that the enhanced `commit()` runs.
+  `text()` writes and writes nested in a `SELECT` (writable CTEs) are still not
+  invalidated after commit -- register `invalidate_on_commit` or call
+  `invalidate_all` yourself.
 - An explicit `default=None` inside merged `Field` metadata was dropped, silently making
   the field required.
 - On sqlmodel ≥ 0.0.32, `id: NonNegativeInt = Field(primary_key=True)` lost its primary key.

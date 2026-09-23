@@ -73,9 +73,10 @@ await Owner.get(session, Owner.id == oid)              # 仍走缓存：owner �
 
 - `update` / `delete` / `insert`：登记目标表
 - `text()`：首个关键字在 `SELECT` / `SHOW` / `SET` 中视为只读；其余一律登记**所有表**（fail-closed）。`EXPLAIN` 刻意不在只读集合里——`EXPLAIN ANALYZE UPDATE ...` 在 PostgreSQL 里真的会执行写入
-- 命中缓存表的 `UPDATE` / `DELETE`，如果该表对应的缓存类都没有登记待失效项，额外记一条 warning（它绕过了缓存失效）
+- 写入缓存表的 `INSERT` 会额外为该表的每个缓存类登记一次查询级失效（新行不可能已在 ID 缓存里，但缓存的查询结果可能因此不完整），commit 后无需调用方做任何事
+- 命中缓存表的 `UPDATE` / `DELETE`，如果该表对应的缓存类都没有登记待失效项，额外记一条 warning（它绕过了缓存失效）——这两种请按下文自行登记受影响的 ID
 
-已知盲区：直接在原生连接上执行、绕过 session 的写入不可见；多对多 `secondary` 表不在 `mapper.tables` 里，通过关系集合 `append` 写入的关联行两个 ORM 来源都登记不到；数据库级 `passive_deletes='all'` 级联删除的子表 ORM 不知道。
+已知盲区：`text()` 写入只有上面的事务内登记，没有 commit 后的失效；嵌套在 `SELECT` 里的写入（例如可写 CTE）不是顶层 DML，完全不会被登记——这两种写完后请自行调用 `invalidate_on_commit` / `invalidate_all`；直接在原生连接上执行、绕过 session 的写入不可见；多对多 `secondary` 表不在 `mapper.tables` 里，通过关系集合 `append` 写入的关联行两个 ORM 来源都登记不到；数据库级 `passive_deletes='all'` 级联删除的子表 ORM 不知道。
 
 ### 原生 DML 的正确写法：`invalidate_on_commit`
 

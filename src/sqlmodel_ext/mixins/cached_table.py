@@ -2687,8 +2687,20 @@ class CachedTableBaseMixin(TableBaseMixin):
         invalidation). CRUD's ``delete(condition=...)`` also executes a
         ``Delete`` but registers its pending invalidation first, so the
         warning only fires when **none** of the cached classes mapped to the
-        table has a pending registration. ``INSERT`` is only registered, not
-        warned about. Non-DML statements (SELECT etc.) return immediately.
+        table has a pending registration.
+
+        ``INSERT`` on a cached table needs no caller action: it additionally
+        registers a query-level invalidation for every cached class mapped to
+        the table (new rows cannot be in an ID cache, but cached query results
+        over the table may now be incomplete), which the enhanced ``commit()``
+        runs after the write lands.
+
+        Not covered: ``text()`` writes (registered fail-closed for the
+        in-transaction check only, no post-commit invalidation) and writes
+        nested in a ``SELECT`` -- e.g. a writable CTE -- which are not DML
+        statements at the top level. After such writes, register
+        ``invalidate_on_commit`` or call ``invalidate_all`` yourself.
+        Non-DML statements (SELECT etc.) return immediately.
         """
         if isinstance(statement, TextClause):
             words = statement.text.lstrip().split(maxsplit=1)
@@ -2702,14 +2714,20 @@ class CachedTableBaseMixin(TableBaseMixin):
         if isinstance(table, TableClause):
             flushed: set[TableClause] = session.info.setdefault(_SESSION_FLUSHED_TABLES, set())
             flushed.add(table)
-        if isinstance(statement, Insert):
-            return
         tablename = getattr(table, 'name', None)
         if not isinstance(tablename, str):
             return
         classes = CachedTableBaseMixin._build_cached_tablename_index().get(tablename)
         if not classes:
             return  # not a cached table
+        if isinstance(statement, Insert):
+            # New rows cannot be in any ID cache, but every cached query over
+            # the table may now be incomplete: register a query-level
+            # invalidation (the same sentinel ``add()`` uses) so the enhanced
+            # ``commit()`` bumps the query version after the write lands.
+            for model_type in classes:
+                CachedTableBaseMixin._register_pending_invalidation(session, model_type, _QUERY_ONLY_INVALIDATION)
+            return
         pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
         if pending and any(c in pending for c in classes):
             return  # registered by a CRUD path, not a bare statement

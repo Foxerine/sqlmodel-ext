@@ -73,9 +73,10 @@ The enhanced `AsyncSession` registers automatically at **five** entry points: `e
 
 - `update` / `delete` / `insert`: register the target table
 - `text()`: a first keyword among `SELECT` / `SHOW` / `SET` is treated as read-only; everything else registers **all tables** (fail-closed). `EXPLAIN` is deliberately not in the read-only set — `EXPLAIN ANALYZE UPDATE ...` really performs the write in PostgreSQL
-- an `UPDATE` / `DELETE` hitting a cached table logs an extra warning if none of the cached classes for that table has registered a pending invalidation (it bypassed cache invalidation)
+- an `INSERT` into a cached table additionally registers a query-level invalidation for every cached class of that table (new rows cannot be in an ID cache, but cached query results may now be incomplete), so after commit no caller action is needed
+- an `UPDATE` / `DELETE` hitting a cached table logs an extra warning if none of the cached classes for that table has registered a pending invalidation (it bypassed cache invalidation) — for these, register the affected IDs yourself (below)
 
-Known blind spots: writes executed directly on the raw connection, bypassing the session, are invisible; many-to-many `secondary` tables are not in `mapper.tables`, so association rows written through a relation collection's `append` are registered by neither ORM source; the ORM doesn't know about child tables deleted by a database-level `passive_deletes='all'` cascade.
+Known blind spots: `text()` writes get only the in-transaction registration above, no post-commit invalidation; writes nested inside a `SELECT` (e.g. a writable CTE) are not top-level DML and are not registered at all — after either, call `invalidate_on_commit` / `invalidate_all` yourself; writes executed directly on the raw connection, bypassing the session, are invisible; many-to-many `secondary` tables are not in `mapper.tables`, so association rows written through a relation collection's `append` are registered by neither ORM source; the ORM doesn't know about child tables deleted by a database-level `passive_deletes='all'` cascade.
 
 ### The correct way to do raw DML: `invalidate_on_commit`
 
