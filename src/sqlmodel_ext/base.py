@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import re
 import sys
+import inspect
 import typing
 from collections.abc import Mapping
 from typing import Any, Self, Sequence, get_args, get_origin
@@ -24,6 +25,8 @@ from typing import Any, Self, Sequence, get_args, get_origin
 from pydantic import AliasChoices, BaseModel, model_validator
 from pydantic import Field as PydanticField
 from pydantic.fields import FieldInfo
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
+from pydantic_core import core_schema as pydantic_core_schema
 from pydantic_core import PydanticUndefined as Undefined
 from sqlalchemy import Column, inspect as sa_inspect
 from sqlalchemy.orm import Mapped, declared_attr, relationship as sa_relationship
@@ -1753,24 +1756,25 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
         """
         Add the sentinel branch to omissible fields (only when ``omitted_sentinel`` is on).
 
-        This must happen at the ``model_json_schema()`` exit, not in
+        The injection runs in the JSON-schema generator's ``model_schema``
+        hook (a subclass of the caller's ``schema_generator``), not in
         ``__get_pydantic_json_schema__``: the latter sees an intermediate
         product that Pydantic later re-assembles (``$ref`` resolution), and
-        edits to ``properties`` made there do not reach the final output.
+        edits to ``properties`` made there do not reach the final output,
+        whereas ``model_schema``'s return value is the model's final body.
 
         Which fields are omissible can only be decided at model level: a
         field-level ``Annotated`` hook does not see the host model's config.
 
-        Nested models reachable from the fields are processed too (their
-        ``$defs`` entries), since a caller that cannot omit keys cannot omit
-        them in nested items either. Each host's ``model_json_schema()``
-        produces its own ``$defs`` copy, so this never leaks into the schema of
-        the nested model itself or of hosts with the switch off.
+        Every model in the generation is processed -- the host and the nested
+        models reachable from it, whatever their ``$defs`` keys are -- since a
+        caller that cannot omit keys cannot omit them in nested items either.
+        The generator exists only for this call, so this never leaks into the
+        schema of the nested model itself or of hosts with the switch off.
         """
-        json_schema = super().model_json_schema(*args, **kwargs)
         config = typing.cast(Mapping[str, Any], cls.model_config)
         if not config.get('omitted_sentinel', False):
-            return json_schema
+            return super().model_json_schema(*args, **kwargs)
 
         def _inject(props: object, model: type[BaseModel]) -> None:
             """Inject the sentinel branch into the omissible fields of ``model`` found in ``props``."""
@@ -1800,36 +1804,26 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
                     'default': OMITTED_SENTINEL,
                 }
 
-        _inject(json_schema.get('properties'), cls)
+        # Inject per model, inside the generator: ``model_schema`` is called
+        # once for every model in this generation (host and nested alike) with
+        # the model class in hand, and its output is what lands in the final
+        # schema. No pairing of classes with ``$defs`` keys is needed -- those
+        # keys are not class names (same-named models get disambiguated keys).
+        bound = inspect.signature(BaseModel.model_json_schema).bind(*args, **kwargs)
+        bound.apply_defaults()
+        base_generator = typing.cast(type[GenerateJsonSchema], bound.arguments['schema_generator'])
 
-        defs = json_schema.get('$defs')
-        if not isinstance(defs, dict):
-            return json_schema
+        class _SentinelGenerator(base_generator):
+            @typing.override
+            def model_schema(self, schema: pydantic_core_schema.ModelSchema) -> JsonSchemaValue:
+                json_schema = super().model_schema(schema)
+                model: type[Any] = schema['cls']
+                if issubclass(model, BaseModel):
+                    _inject(json_schema.get('properties'), model)
+                return json_schema
 
-        # Collect nested models from the annotations and pair them with $defs by
-        # class name. ``seen`` guards against self-referencing models. The host
-        # itself is included: a self-referencing host's schema is a bare
-        # ``$ref`` into ``$defs`` with no top-level ``properties``.
-        nested_by_name: dict[str, type[BaseModel]] = {cls.__name__: cls}
-        seen: set[type[BaseModel]] = {cls}
-        stack: list[type[BaseModel]] = [cls]
-        while stack:
-            for field in stack.pop().model_fields.values():
-                pending: list[object] = [field.annotation]
-                while pending:
-                    candidate = pending.pop()
-                    pending.extend(get_args(candidate))
-                    if (isinstance(candidate, type) and issubclass(candidate, BaseModel)
-                            and candidate not in seen):
-                        seen.add(candidate)
-                        stack.append(candidate)
-                        nested_by_name[candidate.__name__] = candidate
-
-        for def_name, def_schema in typing.cast(dict[str, Any], defs).items():
-            nested = nested_by_name.get(def_name)
-            if nested is not None and isinstance(def_schema, dict):
-                _inject(typing.cast(dict[str, Any], def_schema).get('properties'), nested)
-        return json_schema
+        bound.arguments['schema_generator'] = _SentinelGenerator
+        return super().model_json_schema(*bound.args, **bound.kwargs)
 
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
