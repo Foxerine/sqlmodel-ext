@@ -13,13 +13,15 @@ NOTE: no ``from __future__ import annotations`` here -- PEP 563 string
 annotations break SQLAlchemy's resolution of ``list['CrudBook']``
 relationship targets.
 """
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import asc, desc
-from sqlalchemy.exc import MultipleResultsFound, NoResultFound
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Field, Relationship, col
@@ -35,6 +37,12 @@ from sqlmodel_ext import (
     rel,
 )
 from sqlmodel_ext import AsyncSession as ExtAsyncSession
+from sqlmodel_ext.mixins import (
+    FK_DELETE_RESTRICT_FALLBACK_MESSAGE,
+    GroupSumRow,
+    ResourceReferencedError,
+)
+from sqlmodel_ext.mixins._uuid import _uuid7_fallback
 
 
 # --------------------------------------------------------------------------
@@ -474,7 +482,7 @@ class TestCount:
 
     async def test_count_time_filter_object_takes_priority(self, session: AsyncSession) -> None:
         await _seed_authors(session)  # created Jan 1/2/3
-        tf = TimeFilterRequest(created_after_datetime=datetime(2024, 1, 3))
+        tf = TimeFilterRequest(created_after_datetime=datetime(2024, 1, 3, tzinfo=timezone.utc))
         # the explicit kwarg (Jan 1, matches all) must lose to the time_filter
         n = await CrudAuthor.count(
             session, time_filter=tf, created_after_datetime=datetime(2024, 1, 1)
@@ -497,7 +505,7 @@ class TestCount:
 
     async def test_get_with_count_time_filter_applies_to_both(self, session: AsyncSession) -> None:
         await _seed_authors(session)
-        tv = TableViewRequest(created_after_datetime=datetime(2024, 1, 2), desc=False)
+        tv = TableViewRequest(created_after_datetime=datetime(2024, 1, 2, tzinfo=timezone.utc), desc=False)
         resp = await CrudAuthor.get_with_count(session, table_view=tv)
         assert resp.count == 2
         assert [a.name for a in resp.items] == ["bob", "carol"]
@@ -580,3 +588,235 @@ class TestForUpdateTracking:
         # Session stays usable after reset.
         again = await CrudAuthor.get(enhanced_session, col(CrudAuthor.id) == a.id)
         assert again is not None
+
+    async def test_skip_locked_compiles_into_for_update(self) -> None:
+        from sqlalchemy.dialects import postgresql
+        from sqlmodel import select
+
+        stmt = select(CrudAuthor).with_for_update(skip_locked=True)
+        assert "FOR UPDATE SKIP LOCKED" in str(stmt.compile(dialect=postgresql.dialect()))
+
+    async def test_get_accepts_skip_locked(self, session: AsyncSession) -> None:
+        await _seed_authors(session)
+        rows = await CrudAuthor.get(session, fetch_mode="all", with_for_update=True, skip_locked=True)
+        assert len(rows) == 3
+
+    async def test_get_exist_one_with_for_update_tracks_lock(self, session: AsyncSession) -> None:
+        aid = (await CrudAuthor(name="x").save(session)).id
+        locked = await CrudAuthor.get_exist_one(session, aid, with_for_update=True)
+        assert id(locked) in session.info[SESSION_FOR_UPDATE_KEY]
+
+
+# --------------------------------------------------------------------------
+# delete(): FK RESTRICT -> ResourceReferencedError
+# --------------------------------------------------------------------------
+
+class _FakeDriverError(Exception):
+    """Stands in for asyncpg's ForeignKeyViolationError (SQLite has no SQLSTATE)."""
+
+    def __init__(self, sqlstate: str, constraint_name: str | None) -> None:
+        super().__init__("fk violation")
+        self.sqlstate = sqlstate
+        self.constraint_name = constraint_name
+
+
+def _integrity_error(statement: str | None, sqlstate: str = '23503', constraint: str | None = 'crudbook_author_id_fkey') -> IntegrityError:
+    return IntegrityError(statement, {}, _FakeDriverError(sqlstate, constraint))
+
+
+@pytest.mark.asyncio
+class TestDeleteForeignKeyRestrict:
+    async def test_delete_statement_fk_violation_becomes_resource_referenced(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        author = await CrudAuthor(name="ref").save(session)
+        TableBaseMixin.register_fk_delete_restrict_message(
+            'crudbook_author_id_fkey', "Delete the author's books first",
+        )
+
+        async def failing_commit() -> None:
+            raise _integrity_error("DELETE FROM crudauthor WHERE crudauthor.id = ?")
+
+        monkeypatch.setattr(session, "commit", failing_commit)
+        with pytest.raises(ResourceReferencedError) as exc_info:
+            await CrudAuthor.delete(session, author)
+        err = exc_info.value
+        assert err.friendly_message == "Delete the author's books first"
+        assert err.constraint_name == 'crudbook_author_id_fkey'
+        assert isinstance(err.original_error, IntegrityError)
+        assert ResourceReferencedError.status_code == 409
+
+    async def test_unregistered_constraint_uses_fallback_message(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        author = await CrudAuthor(name="ref").save(session)
+
+        async def failing_commit() -> None:
+            raise _integrity_error("  delete from crudauthor", constraint='unregistered_fk')
+
+        monkeypatch.setattr(session, "commit", failing_commit)
+        with pytest.raises(ResourceReferencedError) as exc_info:
+            await CrudAuthor.delete(session, author)
+        assert exc_info.value.friendly_message == FK_DELETE_RESTRICT_FALLBACK_MESSAGE
+
+    async def test_insert_direction_fk_violation_is_not_translated(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A co-flushed bad INSERT surfaces inside delete() too -- it must keep
+        # its "reference target missing" meaning.
+        author = await CrudAuthor(name="ref").save(session)
+
+        async def failing_commit() -> None:
+            raise _integrity_error("INSERT INTO crudbook (title, author_id) VALUES (?, ?)")
+
+        monkeypatch.setattr(session, "commit", failing_commit)
+        with pytest.raises(IntegrityError):
+            await CrudAuthor.delete(session, author)
+
+    async def test_other_sqlstate_or_missing_statement_not_translated(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        author = await CrudAuthor(name="ref").save(session)
+        errors = [
+            _integrity_error("DELETE FROM crudauthor", sqlstate='23505'),
+            _integrity_error(None),
+        ]
+
+        async def failing_commit() -> None:
+            raise errors.pop(0)
+
+        monkeypatch.setattr(session, "commit", failing_commit)
+        with pytest.raises(IntegrityError):
+            await CrudAuthor.delete(session, author)
+        with pytest.raises(IntegrityError):
+            await CrudAuthor.delete(session, author)
+
+
+class TestIntegrityMessageLookup:
+    def test_lookup_reads_constraint_from_cause(self) -> None:
+        TableBaseMixin.register_unique_violation_message('uq_crud_probe', "Name already taken")
+
+        class _Adapter(Exception):
+            sqlstate = '23505'
+
+        adapter = _Adapter("wrapped")
+        adapter.__cause__ = _FakeDriverError('23505', 'uq_crud_probe')
+        err = IntegrityError("INSERT ...", {}, adapter)
+        assert TableBaseMixin.lookup_integrity_violation_message(err) == "Name already taken"
+        assert TableBaseMixin.sanitize_integrity_error(err) == "Name already taken"
+
+    def test_lookup_miss_returns_none_and_sanitize_falls_back(self) -> None:
+        err = _integrity_error("INSERT ...", sqlstate='23505', constraint='never_registered')
+        assert TableBaseMixin.lookup_integrity_violation_message(err) is None
+        assert TableBaseMixin.sanitize_integrity_error(err, "fallback") == "fallback"
+
+    def test_trigger_message_taken_from_cause_without_adapter_prefix(self) -> None:
+        class _Adapter(Exception):
+            sqlstate = '23514'
+            constraint_name = None
+
+        adapter = _Adapter("<class 'asyncpg.exceptions.CheckViolationError'>: Quota exceeded")
+        adapter.__cause__ = Exception("Quota exceeded\nDETAIL: internal")
+        err = IntegrityError("UPDATE ...", {}, adapter)
+        assert TableBaseMixin.lookup_integrity_violation_message(err) == "Quota exceeded"
+
+    def test_fk_delete_restrict_registry_is_separate(self) -> None:
+        TableBaseMixin.register_fk_delete_restrict_message('fk_sep_probe', "still referenced")
+        assert TableBaseMixin.lookup_fk_delete_restrict_message('fk_sep_probe') == "still referenced"
+        assert TableBaseMixin.lookup_foreign_key_violation_message('fk_sep_probe') is None
+        assert TableBaseMixin.lookup_fk_delete_restrict_message(None) is None
+
+
+# --------------------------------------------------------------------------
+# count(distinct_column=) / distinct_column() / group_sum()
+# --------------------------------------------------------------------------
+
+async def _seed_books(session: AsyncSession) -> None:
+    authors = await _seed_authors(session)
+    author_ids = [a.id for a in await CrudAuthor.get(session, fetch_mode="all")]
+    del authors
+    for title, author_id in (("b1", author_ids[0]), ("b2", author_ids[0]), ("b3", author_ids[1]), ("b4", None)):
+        await CrudBook(title=title, author_id=author_id).save(session)
+
+
+@pytest.mark.asyncio
+class TestAggregates:
+    async def test_count_distinct_column(self, session: AsyncSession) -> None:
+        await _seed_books(session)
+        assert await CrudBook.count(session) == 4
+        # COUNT(DISTINCT author_id) ignores NULL
+        assert await CrudBook.count(session, distinct_column=col(CrudBook.author_id)) == 2
+
+    async def test_distinct_column(self, session: AsyncSession) -> None:
+        await _seed_books(session)
+        values = await CrudBook.distinct_column(session, col(CrudBook.author_id))
+        assert len(values) == 3  # two authors + NULL
+        non_null = await CrudBook.distinct_column(
+            session, col(CrudBook.author_id), col(CrudBook.author_id).is_not(None),
+        )
+        assert len(non_null) == 2
+        assert len(await CrudBook.distinct_column(session, col(CrudBook.author_id), limit=1)) == 1
+
+    async def test_group_sum_whole_table(self, session: AsyncSession) -> None:
+        await _seed_authors(session)  # ages 10, 20, 30
+        rows = await CrudAuthor.group_sum(session, [col(CrudAuthor.age), col(CrudAuthor.id)])
+        assert len(rows) == 1
+        assert isinstance(rows[0], GroupSumRow)
+        assert rows[0].key is None
+        assert rows[0].count == 3
+        assert rows[0].totals == [Decimal(60), Decimal(6)]
+
+    async def test_group_sum_grouped_and_filtered(self, session: AsyncSession) -> None:
+        await _seed_books(session)
+        rows = await CrudBook.group_sum(
+            session, [col(CrudBook.id)],
+            group_by=col(CrudBook.author_id),
+            condition=col(CrudBook.author_id).is_not(None),
+        )
+        assert [r.count for r in rows] == [2, 1]
+        assert all(isinstance(t, Decimal) for r in rows for t in r.totals)
+
+    async def test_group_sum_empty_table_returns_zero_row(self, session: AsyncSession) -> None:
+        rows = await CrudAuthor.group_sum(session, [col(CrudAuthor.age)])
+        assert rows[0].count == 0
+        assert rows[0].totals == [Decimal(0)]
+
+
+# --------------------------------------------------------------------------
+# UUIDv7 primary keys
+# --------------------------------------------------------------------------
+
+class TestUuid7:
+    def test_uuid_table_default_is_uuid7(self) -> None:
+        from tests._models import FunctionC
+
+        value = FunctionC(name="x").id
+        assert value.version == 7
+        assert value.variant == uuid.RFC_4122
+
+    def test_fallback_layout_and_order(self) -> None:
+        values = [_uuid7_fallback() for _ in range(2000)]
+        for value in values:
+            assert value.version == 7
+            assert value.variant == uuid.RFC_4122
+        # strictly increasing within one process (monotonic counter)
+        assert values == sorted(values)
+        assert len(set(values)) == len(values)
+
+    def test_fallback_timestamp_prefix(self) -> None:
+        import time
+
+        before = time.time_ns() // 1_000_000
+        value = _uuid7_fallback()
+        after = time.time_ns() // 1_000_000
+        ts_ms = value.int >> 80
+        assert before <= ts_ms <= after + 1
+
+    def test_fallback_orders_across_milliseconds(self) -> None:
+        import time
+
+        first = _uuid7_fallback()
+        time.sleep(0.003)
+        second = _uuid7_fallback()
+        assert (first.int >> 80) < (second.int >> 80)
+        assert first < second

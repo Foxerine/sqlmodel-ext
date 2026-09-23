@@ -6,6 +6,8 @@ Provides PostgreSQL-specific types for SQLModel:
 - ``Array[T]`` -- PostgreSQL ARRAY type with optional length limit
 - ``JSON100K`` -- JSONB dict type with 100K character limit (requires ``orjson``)
 - ``JSONList100K`` -- JSONB list type with 100K character limit (requires ``orjson``)
+- ``ensure_json_within_limits`` -- the encodability / 100K check behind both
+  JSONB types, for code paths that bypass Pydantic validation (requires ``orjson``)
 - ``NumpyVector[dims, dtype]`` -- pgvector + NumPy integration (requires ``numpy``, ``pgvector``)
 - Vector exception hierarchy
 
@@ -27,7 +29,7 @@ from .exceptions import (
 
 # JSONB types require orjson; install sqlmodel-ext[postgresql]
 try:
-    from .jsonb_types import JSON100K, JSONList100K
+    from .jsonb_types import JSON100K, JSONList100K, ensure_json_within_limits
 except ImportError:
     pass
 

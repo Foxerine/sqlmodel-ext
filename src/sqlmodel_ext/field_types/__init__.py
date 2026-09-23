@@ -4,17 +4,21 @@ sqlmodel_ext.field_types -- Reusable type aliases and custom types for SQLModel.
 Provides constrained string/numeric types, path types, URL types, and IP address types,
 all compatible with Pydantic validation and SQLAlchemy column mapping.
 """
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Generic, TypeAlias, TypeVar
+from types import NoneType, UnionType
+from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union, get_args, get_origin
 
-from annotated_types import Ge, Gt
-from pydantic import BeforeValidator, PlainSerializer, StringConstraints, WithJsonSchema
+from annotated_types import Ge, GroupedMetadata, Gt, MaxLen
+from pydantic import AllowInfNan, BeforeValidator, PlainSerializer, StringConstraints, WithJsonSchema
+from pydantic.fields import FieldInfo
 from sqlalchemy import BigInteger, Numeric
 from sqlmodel import Field
 
 from ._internal.path import _DirectoryPathHandler, _FilePathHandler
-from .ip_address import IPAddress
+from .dialects.postgresql.array import _ArrayTypeHandler
+from .ip_address import ClientIPAddress, IPAddress
 from .mixins import ModuleNameMixin
 from .url import HttpUrl, SafeHttpUrl, Url, WebSocketUrl
 
@@ -49,7 +53,24 @@ while behaving as a ``pathlib.Path`` in Python code.
 _NO_NULL_BYTE = StringConstraints(pattern=r'^[^\x00]*$')
 """PostgreSQL rejects null bytes in text columns. pydantic-core compiles the regex once with zero Python overhead."""
 
+HttpHeaderName: TypeAlias = Annotated[
+    str,
+    Field(min_length=1, max_length=64),
+    StringConstraints(pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"),
+]
+"""HTTP header field name (RFC 9110 ``token``: letters, digits and
+``!#$%&'*+-.^_`|~``; no whitespace, no colon).
+
+Use it for configurable header names (e.g. "which request header carries the
+client IP") so a misspelled name containing a space, a colon or non-ASCII
+characters is rejected with a validation error instead of being stored and
+then silently never matching. The pattern is already a strict allowlist, so
+``_NO_NULL_BYTE`` is not stacked on top."""
+
 # String length constraints
+Str1: TypeAlias = Annotated[str, Field(max_length=1), _NO_NULL_BYTE]
+"""1-character string field"""
+
 Str16: TypeAlias = Annotated[str, Field(max_length=16), _NO_NULL_BYTE]
 """16-character string field (trigger words, short tokens)"""
 
@@ -103,6 +124,14 @@ Text2500: TypeAlias = Annotated[str, Field(max_length=2500), _NO_NULL_BYTE]
 
 Text3K: TypeAlias = Annotated[str, Field(max_length=3000), _NO_NULL_BYTE]
 """3000-character text field"""
+
+Text3072: TypeAlias = Annotated[str, Field(max_length=3072), _NO_NULL_BYTE]
+"""3072-character text field"""
+
+Text4K: TypeAlias = Annotated[str, Field(max_length=4000), _NO_NULL_BYTE]
+"""4000-character text field (e.g. presigned URLs: CDN host + long object key +
+encoded ``response-content-disposition`` realistically stay below ~1800
+characters, leaving 2x headroom)"""
 
 Text5K: TypeAlias = Annotated[str, Field(max_length=5000), _NO_NULL_BYTE]
 """5000-character text field"""
@@ -160,6 +189,18 @@ NonEmptyStr256: TypeAlias = Annotated[str, Field(min_length=1, max_length=256), 
 # whitespace-only name degrades into an unidentifiable empty block in UIs,
 # search results, and share links.
 
+NonEmptyStrippedStr32: TypeAlias = Annotated[
+    str,
+    Field(min_length=1, max_length=32),
+    StringConstraints(strip_whitespace=True, min_length=1),
+    _NO_NULL_BYTE,
+]
+"""1-32 character string, non-empty after stripping (rejects ``""`` and pure whitespace).
+
+Suited to short user-written identifiers such as tags. Using the same alias on
+the storage side and the filter side guarantees "a value that can be stored
+can be filtered by its original text": both sides strip identically."""
+
 NonEmptyStrippedStr64: TypeAlias = Annotated[
     str,
     Field(min_length=1, max_length=64),
@@ -167,6 +208,78 @@ NonEmptyStrippedStr64: TypeAlias = Annotated[
     _NO_NULL_BYTE,
 ]
 """1-64 character string, non-empty after stripping (rejects ``""`` and pure whitespace)"""
+
+_LINE_BREAK_SCAN_BOUND = 0x2100
+"""Upper bound of the code-point scan that derives ``_LINE_BREAK_CHARS``.
+
+A full scan (0x110000 code points) costs roughly 100-150 ms at import time
+versus under 1 ms for this bound, and a full scan finds **no** line-break
+character in ``[0x2100, 0x110000)``. This is a measured fact, not a structural
+guarantee: should a future Python add a line-break character above the bound,
+the derived set would miss it (the test suite re-derives the set over all code
+points to catch that)."""
+
+_LINE_BREAK_CHARS = ''.join(
+    chr(code) for code in range(_LINE_BREAK_SCAN_BOUND)
+    if len(('a' + chr(code) + 'b').splitlines()) > 1
+)
+"""Every character that starts a new line, **derived** from ``str.splitlines()``.
+
+A hand-written set almost always stops at ``\\n`` (maybe ``\\r``), but there
+are ten: ``\\n \\v \\f \\r \\x1c \\x1d \\x1e \\x85 \\u2028 \\u2029``. The last six
+also break lines in renderers, terminals and most parsers, yet all of them pass
+``_NO_NULL_BYTE``. ``str.splitlines()`` is CPython's definition of "a line",
+so it is used as the single source of truth instead of a copied list.
+
+A pattern (rather than e.g. ``annotated_types.Predicate(str.isprintable)``) is
+used because a pattern is emitted into the JSON Schema; a predicate is not, so
+the published schema would hide the real accepted input set."""
+
+_SINGLE_LINE = StringConstraints(
+    pattern='^[^\\x00' + ''.join(f'\\u{ord(c):04x}' for c in _LINE_BREAK_CHARS) + ']*$',
+)
+"""Single-line constraint: forbids NUL and every line-break character (see
+``_LINE_BREAK_CHARS``).
+
+Values that are rendered line by line into another text (listings, search
+results, LLM context) must be rejected at the input boundary: a name containing
+a line break can forge an extra, non-existent entry in such a listing. Escaping
+at render time is not a substitute -- every render site is another chance to
+forget, and forgetting is silent.
+
+Tabs are allowed: ``\\t`` does not break lines."""
+
+SingleLineStr64: TypeAlias = Annotated[
+    str,
+    Field(min_length=1, max_length=64),
+    StringConstraints(strip_whitespace=True, min_length=1),
+    _SINGLE_LINE,
+]
+"""1-64 characters, non-empty after stripping, and **always a single line**.
+
+Equivalent to ``NonEmptyStrippedStr64`` plus the single-line constraint. Use it
+for user-visible *names* that are displayed as one line. Descriptions, which
+may legitimately span several lines, should use ``Str500`` / ``Text*``
+instead."""
+
+SearchQueryStr64: TypeAlias = Annotated[
+    str,
+    Field(min_length=2, max_length=64),
+    StringConstraints(strip_whitespace=True, min_length=2),
+    _NO_NULL_BYTE,
+]
+"""Fuzzy-search keyword: at most 64 characters and **at least 2 characters after
+stripping** (rejects ``""``, whitespace-only and single-character queries).
+
+Same shape as ``NonEmptyStrippedStr64`` with a lower bound of 2: a
+one-character trigram query has no selective trigrams and degrades into a
+near-full table scan.
+
+Being a type alias (rather than a validator) puts ``minLength`` into the JSON
+Schema, so generated clients know the real accepted input set.
+``strip_whitespace=True`` normalizes ``" ab "`` to ``"ab"`` instead of rejecting
+it, and the post-strip ``min_length=2`` rejects ``" a "`` and whitespace of any
+length -- a caller that does not want to filter simply omits the parameter."""
 
 NonEmptyStrippedStr128: TypeAlias = Annotated[
     str,
@@ -210,6 +323,96 @@ column type, while pattern + min_length live in ``StringConstraints`` for
 Pydantic validation.
 """
 
+
+# ---------------------------------------------------------------------------
+#  Reflecting the length bound of an alias
+# ---------------------------------------------------------------------------
+
+def _flatten_metadata(candidate: Any) -> Iterator[Any]:
+    """Recursively expand ``GroupedMetadata``, yielding leaf constraints in declaration order.
+
+    A ``GroupedMetadata`` is not a constraint itself but a container that
+    iterates into constraints -- and what it yields may be a container again
+    (``annotated_types.Len`` is one: ``tuple(Len(0, 7)) == (MaxLen(7),)``).
+    Pydantic expands recursively, so this must too: expanding one level only
+    would miss the inner bound and report a *wider* limit than the one
+    Pydantic enforces.
+
+    There is deliberately no depth limit: a self-referencing
+    ``GroupedMetadata`` raises ``RecursionError`` here, exactly as it does in
+    Pydantic.
+    """
+    if isinstance(candidate, GroupedMetadata):
+        for inner in candidate:
+            yield from _flatten_metadata(inner)
+    else:
+        yield candidate
+
+
+def max_length_of(alias: Any) -> int:
+    """Reflect the effective ``max_length`` of a type alias.
+
+    Use this whenever code needs "how long may this field be" instead of
+    repeating the number: a second constant drifts from the alias, and then
+    either accepts values Pydantic / the database will reject, or truncates
+    values that are still valid.
+
+    Rules, all aligned with what Pydantic actually enforces:
+
+    1. ``Field(max_length=N)`` does not store the bound as a ``FieldInfo``
+       attribute; it lives in ``FieldInfo.metadata`` as
+       ``annotated_types.MaxLen``, so ``FieldInfo`` metadata is expanded.
+       ``StringConstraints`` carries ``max_length`` directly.
+    2. **The last constraint wins**, because Pydantic applies stacked
+       constraints in order (``Annotated[str, Field(max_length=10),
+       Field(max_length=11)]`` accepts 11 characters; ``Field`` and
+       ``StringConstraints`` override each other the same way).
+    3. **Only carriers that Pydantic enforces are recognized**: ``MaxLen``,
+       ``StringConstraints``, any ``GroupedMetadata`` that expands to them
+       (recursively, see :func:`_flatten_metadata`), and the handler behind
+       ``Array[T, N]``, which injects ``N`` into the list schema as the element
+       count bound. Arbitrary metadata that merely has a ``max_length``
+       attribute is ignored, since Pydantic ignores it too.
+    4. **``X | None`` is accepted**: Pydantic does not lift the ``Annotated``
+       metadata of a union member into ``FieldInfo.metadata``, so the union is
+       unwrapped first. It must have exactly one non-``None`` member.
+
+    :param alias: A string alias of the ``Annotated[str, Field(max_length=N), ...]``
+        shape, its ``X | None`` form, or an ``Array[T, N]`` alias -- for which
+        the **element count** bound (JSON Schema ``maxItems``) is returned.
+        Typed as ``Any`` because an ``Annotated`` alias is a
+        ``typing._AnnotatedAlias`` at runtime, which has no public type.
+    :raises TypeError: If the alias declares no ``max_length`` (including an
+        unbounded ``Array[T]``), or a union has other than exactly one
+        non-``None`` member -- failing loudly instead of inventing a bound.
+    """
+    if get_origin(alias) in (Union, UnionType):
+        members = [member for member in get_args(alias) if member is not NoneType]
+        if len(members) != 1:
+            raise TypeError(
+                f"{alias!r} has {len(members)} non-None members; expected the 'X | None' "
+                "form, so there is no single bound to reflect"
+            )
+        alias = members[0]
+    effective: int | None = None
+    for meta in get_args(alias)[1:]:
+        # Only FieldInfo hides its constraints in ``.metadata``; branch on
+        # isinstance explicitly instead of a getattr fallback.
+        candidates = (meta, *meta.metadata) if isinstance(meta, FieldInfo) else (meta,)
+        for candidate in candidates:
+            for item in _flatten_metadata(candidate):
+                # Keep iterating: a later constraint overrides an earlier one.
+                if isinstance(item, MaxLen):
+                    effective = item.max_length
+                elif isinstance(item, StringConstraints) and item.max_length is not None:
+                    effective = item.max_length
+                elif isinstance(item, _ArrayTypeHandler) and item.max_length is not None:
+                    effective = item.max_length
+    if effective is None:
+        raise TypeError(f"type alias {alias!r} declares no max_length; cannot reflect a bound")
+    return effective
+
+
 # Numeric range constraints
 Port: TypeAlias = Annotated[int, Field(ge=1, le=65535)]
 """Port number (1-65535)"""
@@ -219,6 +422,10 @@ Percentage: TypeAlias = Annotated[int, Field(ge=0, le=100)]
 
 INT32_MAX = 2147483647
 """Maximum value for PostgreSQL INTEGER column (2^31-1)"""
+
+INT32_MIN = -2147483648
+"""Minimum value for PostgreSQL INTEGER column (-2^31); the explicit lower bound
+for full-range integer columns (e.g. a priority that may be negative)"""
 
 INT64_MAX = 9223372036854775807
 """Maximum value for PostgreSQL BIGINT column (2^63-1)"""
@@ -252,11 +459,28 @@ NonNegativeBigInt: TypeAlias = Annotated[int, Field(ge=0, le=JS_MAX_SAFE_INTEGER
 See :data:`PositiveBigInt` for the rationale behind the JS_MAX_SAFE_INTEGER bound.
 """
 
-PositiveFloat: TypeAlias = Annotated[float, Field(gt=0.0)]
-"""Positive float (>0)"""
+SignedBigInt: TypeAlias = Annotated[
+    int, Field(ge=-JS_MAX_SAFE_INTEGER, le=JS_MAX_SAFE_INTEGER, sa_type=BigInteger)
+]
+"""Signed big integer (-JS_MAX_SAFE_INTEGER to JS_MAX_SAFE_INTEGER, stored as PostgreSQL BIGINT).
 
-NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0.0)]
-"""Non-negative float (>=0)"""
+For **increment / delta** columns, as opposed to :data:`NonNegativeBigInt`
+(absolute amounts / counters). Both bounds are JS_MAX_SAFE_INTEGER for the
+reason given in :data:`PositiveBigInt`.
+"""
+
+PositiveFloat: TypeAlias = Annotated[float, Field(gt=0.0), AllowInfNan(False)]
+"""Positive **finite** float (>0; rejects inf and nan).
+
+Pydantic floats default to ``allow_inf_nan=True``, and ``gt=0`` is only a
+comparison that ``inf`` satisfies: the JSON number ``1e309`` parses to
+``float('inf')`` and would pass, only to blow up later (e.g.
+``math.ceil(float('inf'))`` raises ``OverflowError``). ``AllowInfNan(False)``
+rejects inf / nan at the boundary.
+"""
+
+NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0.0), AllowInfNan(False)]
+"""Non-negative **finite** float (>=0; rejects inf and nan) -- see :data:`PositiveFloat`"""
 
 # ---------------------------------------------------------------------------
 #  Decimal Numeric Constraints (NUMERIC(precision, scale) + sign constraint)
@@ -384,47 +608,117 @@ hard type-system contract.
 #  response-body schemas are unaffected.
 # ---------------------------------------------------------------------------
 
-_DECIMAL_38_18_STR_PATTERN = (
-    r'^(?!^[-+.]*$)[+-]?0*(?:\d{0,20}|(?=[\d.]{1,39}0*$)\d{0,20}\.\d{0,18}0*$)'
-)
-_DECIMAL_20_10_STR_PATTERN = (
-    r'^(?!^[-+.]*$)[+-]?0*(?:\d{0,10}|(?=[\d.]{1,21}0*$)\d{0,10}\.\d{0,10}0*$)'
-)
+DECIMAL_38_18_COLUMN_DIGITS: int = 38
+"""Total digits of a ``NUMERIC(38, 18)`` column -- the **column width**, which is
+also the write limit of the ``*Decimal38_18`` aliases.
 
-_DECIMAL_38_18_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
-    {'type': 'string', 'pattern': _DECIMAL_38_18_STR_PATTERN},
-    mode='validation',
-)
-_DECIMAL_20_10_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
-    {'type': 'string', 'pattern': _DECIMAL_20_10_STR_PATTERN},
-    mode='validation',
-)
-_OPTIONAL_DECIMAL_38_18_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
-    {
-        'anyOf': [
-            {'type': 'string', 'pattern': _DECIMAL_38_18_STR_PATTERN},
-            {'type': 'null'},
-        ]
-    },
-    mode='validation',
-)
-_OPTIONAL_DECIMAL_20_10_STR_SCHEMA: WithJsonSchema = WithJsonSchema(
-    {
-        'anyOf': [
-            {'type': 'string', 'pattern': _DECIMAL_20_10_STR_PATTERN},
-            {'type': 'null'},
-        ]
-    },
-    mode='validation',
-)
+The ``*WriteDecimal38_18`` aliases accept fewer digits on purpose (see
+``DECIMAL_38_18_WRITE_DIGITS``); do not "unify" the two constants.
+"""
+
+DECIMAL_38_18_WRITE_DIGITS: int = 35
+"""Total digits accepted by the ``*WriteDecimal38_18`` aliases: **17 integer + 18
+fractional digits**, three fewer than the ``NUMERIC(38, 18)`` column.
+
+The three-digit gap is headroom for ``SUM()``: if a single row may be as large
+as the column, a sum of rows can overflow it. With rows capped at 35 digits and
+sums read through ``SignedSumDecimal38_18`` (the full 38 digits),
+``10^(38-18) / 10^(35-18) = 1000`` maximal rows must be added before the sum
+reaches the column width.
+
+The factor of 1000 is headroom, not a guarantee: summing far more than 1000
+rows that are all close to the per-row limit can still overflow.
+"""
+
+DECIMAL_38_18_PLACES: int = 18
+"""Fractional digits of ``NUMERIC(38, 18)`` (matches the EVM wei = 1e-18 ether
+de-facto standard). Identical on the write and the sum side."""
+
+_WHOLE_DIGITS_38_18: int = DECIMAL_38_18_COLUMN_DIGITS - DECIMAL_38_18_PLACES
+"""Integer digits of the full-width ``*Decimal38_18`` and ``SignedSumDecimal38_18`` aliases (20)"""
+
+_WRITE_WHOLE_DIGITS_38_18: int = DECIMAL_38_18_WRITE_DIGITS - DECIMAL_38_18_PLACES
+"""Integer digits of the ``*WriteDecimal38_18`` aliases (17)"""
+
+
+def _decimal_str_pattern(whole_digits: int, places: int) -> str:
+    """Build the OpenAPI validation pattern for a string-form Decimal.
+
+    Exists so that the digit counts are written once, at the call site: a
+    hand-written pattern next to ``max_digits`` drifts when only one of them is
+    changed, and the published schema then misstates the accepted input set.
+
+    Known limitation: the integer-only branch ``\\d{0,N}`` has no end anchor,
+    and a JSON Schema ``pattern`` matches partially, so any string starting
+    with a digit matches (e.g. an over-long integer, ``"123abc"``,
+    ``"1.2.3"``). **The digit limits are enforced by ``max_digits`` /
+    ``decimal_places``, not by this pattern**; the pattern's job is to declare
+    the schema type as ``string`` rather than ``number``.
+
+    :param whole_digits: Maximum digits before the decimal point
+    :param places: Maximum digits after the decimal point
+    :returns: A regex matching "optional sign + optional leading zeros + decimal literal"
+    """
+    max_chars = whole_digits + 1 + places
+    return (
+        rf'^(?!^[-+.]*$)[+-]?0*(?:\d{{0,{whole_digits}}}'
+        rf'|(?=[\d.]{{1,{max_chars}}}0*$)\d{{0,{whole_digits}}}\.\d{{0,{places}}}0*$)'
+    )
+
+
+_DECIMAL_38_18_STR_PATTERN = _decimal_str_pattern(_WHOLE_DIGITS_38_18, DECIMAL_38_18_PLACES)
+_DECIMAL_WRITE_38_18_STR_PATTERN = _decimal_str_pattern(_WRITE_WHOLE_DIGITS_38_18, DECIMAL_38_18_PLACES)
+_DECIMAL_20_10_STR_PATTERN = _decimal_str_pattern(10, 10)
+
+
+def _str_schema(pattern: str) -> WithJsonSchema:
+    """Validation-mode schema: a pattern-constrained string."""
+    return WithJsonSchema({'type': 'string', 'pattern': pattern}, mode='validation')
+
+
+def _optional_str_schema(pattern: str) -> WithJsonSchema:
+    """Validation-mode schema: a pattern-constrained string or null."""
+    return WithJsonSchema(
+        {'anyOf': [{'type': 'string', 'pattern': pattern}, {'type': 'null'}]},
+        mode='validation',
+    )
+
+
+_DECIMAL_38_18_STR_SCHEMA = _str_schema(_DECIMAL_38_18_STR_PATTERN)
+_DECIMAL_WRITE_38_18_STR_SCHEMA = _str_schema(_DECIMAL_WRITE_38_18_STR_PATTERN)
+_DECIMAL_20_10_STR_SCHEMA = _str_schema(_DECIMAL_20_10_STR_PATTERN)
+_OPTIONAL_DECIMAL_38_18_STR_SCHEMA = _optional_str_schema(_DECIMAL_38_18_STR_PATTERN)
+_OPTIONAL_DECIMAL_WRITE_38_18_STR_SCHEMA = _optional_str_schema(_DECIMAL_WRITE_38_18_STR_PATTERN)
+_OPTIONAL_DECIMAL_20_10_STR_SCHEMA = _optional_str_schema(_DECIMAL_20_10_STR_PATTERN)
+
+# ---------------------------------------------------------------------------
+#  Metadata order: ``_REJECT_FLOAT`` must come AFTER ``Field(max_digits=...)``
+#
+#  ``Annotated`` metadata is applied left to right. With the ``BeforeValidator``
+#  first, Pydantic cannot inline the numeric constraints into the ``decimal``
+#  core schema and falls back to Python validators that check only the total
+#  digits and the decimal places -- **not the integer digits**. For example
+#  ``Annotated[Decimal, BeforeValidator(...), Field(max_digits=20,
+#  decimal_places=10)]`` accepts a 15-digit integer, leaving the database
+#  column as the only guard.
+#
+#  With ``Field`` first, the constraints are inlined as
+#  ``function-before(decimal{max_digits, decimal_places})`` and pydantic-core
+#  checks all three (total digits, decimal places, integer digits). The float
+#  / bool rejection is unaffected by the order.
+#
+#  The ``Optional*`` aliases keep ``_REJECT_FLOAT`` on the outer layer: their
+#  numeric constraints live on the inner ``Annotated[Decimal, ...]`` and are
+#  inlined there regardless.
+# ---------------------------------------------------------------------------
 
 # NUMERIC(38, 18) — 20 integer digits + 18 fractional digits (matches the EVM
 # wei = 1e-18 ether de-facto standard for high-precision amounts)
 
 SignedDecimal38_18: TypeAlias = Annotated[
     Decimal,
-    _REJECT_FLOAT,
     Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_38_18_STR_SCHEMA,
 ]
@@ -432,13 +726,13 @@ SignedDecimal38_18: TypeAlias = Annotated[
 
 NonNegativeDecimal38_18: TypeAlias = Annotated[
     Decimal,
-    _REJECT_FLOAT,
     Ge(Decimal(0)),
     # pyright ignore targets ``sa_type`` only (the SQLModel stub annotates it
     # ``type[Any]`` but the runtime accepts SA type instances like
     # ``Numeric(38, 18)``); ``ge`` is expressed as ``Ge(Decimal(0))`` via
     # annotated_types so the ignore scope stays minimal.
     Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_38_18_STR_SCHEMA,
 ]
@@ -446,10 +740,10 @@ NonNegativeDecimal38_18: TypeAlias = Annotated[
 
 PositiveDecimal38_18: TypeAlias = Annotated[
     Decimal,
-    _REJECT_FLOAT,
     Gt(Decimal(0)),
     # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_38_18_STR_SCHEMA,
 ]
@@ -470,13 +764,143 @@ OptionalNonNegativeDecimal38_18: TypeAlias = Annotated[
 ]
 """NUMERIC(38, 18) Decimal, >= 0 or None"""
 
+OptionalSignedDecimal38_18: TypeAlias = Annotated[
+    # Nested Annotated (see OptionalNonNegativeDecimal38_18); the only
+    # difference is the missing ``Ge(Decimal(0))`` -- negatives are allowed.
+    Annotated[Decimal, Field(max_digits=38, decimal_places=18)] | None,
+    _REJECT_FLOAT,
+    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
+    Field(default=None, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    _DECIMAL_TO_JSON_STR,
+    _OPTIONAL_DECIMAL_38_18_STR_SCHEMA,
+]
+"""NUMERIC(38, 18) Decimal, positive, negative or None"""
+
+# ---------------------------------------------------------------------------
+#  NUMERIC(38, 18) columns with SUM() headroom: write 35 digits, sum 38
+#
+#  If a single row may hold as many digits as the column, a ``SUM()`` over rows
+#  can exceed the column width -- and reading that sum back through a
+#  38-digit Decimal type fails validation. Values that will be aggregated
+#  should therefore be *written* through the ``*WriteDecimal38_18`` aliases
+#  (35 digits: 17 integer + 18 fractional; the column stays NUMERIC(38, 18))
+#  and the aggregate *read* through ``SignedSumDecimal38_18`` (the full 38
+#  digits). See ``DECIMAL_38_18_WRITE_DIGITS`` for the headroom arithmetic.
+#
+#  ``sa_type=Numeric(38, 18)`` is explicit on purpose: without it SQLModel
+#  derives the column precision from ``max_digits`` and the column would
+#  shrink to NUMERIC(35, 18).
+# ---------------------------------------------------------------------------
+
+SignedWriteDecimal38_18: TypeAlias = Annotated[
+    Decimal,
+    Field(
+        max_digits=DECIMAL_38_18_WRITE_DIGITS,
+        decimal_places=DECIMAL_38_18_PLACES,
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+    ),
+    _REJECT_FLOAT,
+    _DECIMAL_TO_JSON_STR,
+    _DECIMAL_WRITE_38_18_STR_SCHEMA,
+]
+"""NUMERIC(38, 18) column, writes limited to 35 digits (17 integer + 18
+fractional), positive or negative. Leaves 1000x headroom for ``SUM()``; read
+sums through ``SignedSumDecimal38_18``."""
+
+NonNegativeWriteDecimal38_18: TypeAlias = Annotated[
+    Decimal,
+    Ge(Decimal(0)),
+    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
+    Field(
+        max_digits=DECIMAL_38_18_WRITE_DIGITS,
+        decimal_places=DECIMAL_38_18_PLACES,
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+    ),
+    _REJECT_FLOAT,
+    _DECIMAL_TO_JSON_STR,
+    _DECIMAL_WRITE_38_18_STR_SCHEMA,
+]
+"""NUMERIC(38, 18) column, writes limited to 35 digits, >= 0 (SUM() headroom,
+see ``SignedWriteDecimal38_18``)"""
+
+PositiveWriteDecimal38_18: TypeAlias = Annotated[
+    Decimal,
+    Gt(Decimal(0)),
+    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
+    Field(
+        max_digits=DECIMAL_38_18_WRITE_DIGITS,
+        decimal_places=DECIMAL_38_18_PLACES,
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+    ),
+    _REJECT_FLOAT,
+    _DECIMAL_TO_JSON_STR,
+    _DECIMAL_WRITE_38_18_STR_SCHEMA,
+]
+"""NUMERIC(38, 18) column, writes limited to 35 digits, > 0 (SUM() headroom,
+see ``SignedWriteDecimal38_18``)"""
+
+OptionalNonNegativeWriteDecimal38_18: TypeAlias = Annotated[
+    # Nested Annotated (see OptionalNonNegativeDecimal38_18)
+    Annotated[
+        Decimal,
+        Ge(Decimal(0)),
+        Field(max_digits=DECIMAL_38_18_WRITE_DIGITS, decimal_places=DECIMAL_38_18_PLACES),
+    ] | None,
+    _REJECT_FLOAT,
+    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
+    Field(
+        default=None,
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+    ),
+    _DECIMAL_TO_JSON_STR,
+    _OPTIONAL_DECIMAL_WRITE_38_18_STR_SCHEMA,
+]
+"""NUMERIC(38, 18) column, writes limited to 35 digits, >= 0 or None (SUM()
+headroom, see ``SignedWriteDecimal38_18``)"""
+
+OptionalSignedWriteDecimal38_18: TypeAlias = Annotated[
+    # Nested Annotated (see OptionalNonNegativeDecimal38_18)
+    Annotated[
+        Decimal,
+        Field(max_digits=DECIMAL_38_18_WRITE_DIGITS, decimal_places=DECIMAL_38_18_PLACES),
+    ] | None,
+    _REJECT_FLOAT,
+    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
+    Field(
+        default=None,
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+    ),
+    _DECIMAL_TO_JSON_STR,
+    _OPTIONAL_DECIMAL_WRITE_38_18_STR_SCHEMA,
+]
+"""NUMERIC(38, 18) column, writes limited to 35 digits, positive, negative or
+None (SUM() headroom, see ``SignedWriteDecimal38_18``)"""
+
+SignedSumDecimal38_18: TypeAlias = Annotated[
+    Decimal,
+    Field(max_digits=DECIMAL_38_18_COLUMN_DIGITS, decimal_places=DECIMAL_38_18_PLACES),
+    _REJECT_FLOAT,
+    _DECIMAL_TO_JSON_STR,
+    _DECIMAL_38_18_STR_SCHEMA,
+]
+"""Result of ``SUM()`` over ``*WriteDecimal38_18`` values: 38 digits (20 integer
++ 18 fractional), positive or negative, **no ``sa_type``** -- a DTO-only type
+that is never stored.
+
+Three digits wider than the write side, so 1000 maximal rows still sum to a
+representable value. Do not annotate aggregates with a write-side alias:
+"per-row limit == sum limit" is exactly the shape that lets a sum overflow.
+Do not use it as a column type either: a pre-aggregated column is storage and
+needs its own width decision.
+"""
+
 # NUMERIC(20, 10) — 10 integer digits + 10 fractional digits (conversion
 # factors, ratios, exchange rates and other medium-precision scenarios)
 
 SignedDecimal20_10: TypeAlias = Annotated[
     Decimal,
-    _REJECT_FLOAT,
     Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_20_10_STR_SCHEMA,
 ]
@@ -484,10 +908,10 @@ SignedDecimal20_10: TypeAlias = Annotated[
 
 NonNegativeDecimal20_10: TypeAlias = Annotated[
     Decimal,
-    _REJECT_FLOAT,
     Ge(Decimal(0)),
     # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_20_10_STR_SCHEMA,
 ]
@@ -503,6 +927,23 @@ OptionalNonNegativeDecimal20_10: TypeAlias = Annotated[
     _OPTIONAL_DECIMAL_20_10_STR_SCHEMA,
 ]
 """NUMERIC(20, 10) Decimal, >= 0 or None"""
+
+NullableNonNegativeDecimal20_10: TypeAlias = Annotated[
+    # Nested Annotated (see OptionalNonNegativeDecimal38_18). The only
+    # difference from ``OptionalNonNegativeDecimal20_10`` is the missing
+    # default: in a validated model (DTO / request body) the key is required,
+    # though its value may be null. ``table=True`` models skip Pydantic
+    # validation on construction, so omitting it there stores NULL. Suited to
+    # nullable settings where a default would hide a caller forgetting the field.
+    Annotated[Decimal, Ge(Decimal(0)), Field(max_digits=20, decimal_places=10)] | None,
+    _REJECT_FLOAT,
+    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
+    Field(sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    _DECIMAL_TO_JSON_STR,
+    _OPTIONAL_DECIMAL_20_10_STR_SCHEMA,
+]
+"""NUMERIC(20, 10) Decimal, >= 0 or None, **without** a default (required key in
+validated models; the only difference from ``OptionalNonNegativeDecimal20_10``)"""
 
 # ---------------------------------------------------------------------------
 #  Bounded-Length List Types (named aliases List<N>[T], consistent with

@@ -3,18 +3,71 @@ Pagination and time filtering request models.
 
 These DTO classes carry query parameters for list endpoints.
 SQL clause construction is handled by TableBaseMixin.
+
+Class hierarchy::
+
+    PageWindowRequest            offset / limit / desc
+      └── PaginationRequest      + order / after_id (keyset cursor)
+    TimeFilterRequest            created_* / updated_* time bounds
+    TableViewRequest             TimeFilterRequest + PaginationRequest
 """
-from datetime import datetime
+import uuid
 from typing import TypeVar, Literal, Generic, Any
 
-# ListResponse uses BaseModel due to SQLModel Generic[T] schema generation bug
-# See: https://github.com/fastapi/sqlmodel/discussions/1002
-from pydantic import BaseModel, ConfigDict
+# Generic container choice:
+# - A generic container used as a FastAPI **response_model** (ListResponse)
+#   must inherit pydantic ``BaseModel``: SQLModel + Generic still produces a
+#   broken JSON schema for the parametrized field (``{"items": {}}`` instead
+#   of a ``$ref``). See https://github.com/fastapi/sqlmodel/discussions/1002
+#   and https://github.com/fastapi/sqlmodel/pull/1275.
+# - A generic container that is only a method return value and never enters
+#   OpenAPI (``GroupSumRow``) is unaffected by that bug and inherits
+#   ``SQLModelBase`` like every other data carrier.
+from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
 from sqlmodel import Field
 
 from sqlmodel_ext.base import SQLModelBase
+from sqlmodel_ext.field_types import JS_MAX_SAFE_INTEGER
 
 ItemT = TypeVar("ItemT")
+
+DEFAULT_PAGE_SIZE: int = 50
+"""Default ``limit`` of ``PageWindowRequest``."""
+
+MAX_PAGE_SIZE: int = 100
+"""Upper bound of ``PageWindowRequest.limit``."""
+
+MAX_SHARED_PAGE_WINDOW: int = 1000
+"""The largest page window (``limit``) any ``PageWindowRequest`` subclass may allow.
+
+Subclasses may widen ``limit`` beyond ``MAX_PAGE_SIZE``; ``MAX_TABLE_VIEW_OFFSET``
+reserves this much headroom so that ``offset + limit`` never exceeds
+``JS_MAX_SAFE_INTEGER``. A subclass that widens ``limit`` above this value must
+also lower its own ``offset`` bound."""
+
+MAX_TABLE_VIEW_OFFSET: int = JS_MAX_SAFE_INTEGER - MAX_SHARED_PAGE_WINDOW
+"""Upper bound of ``PageWindowRequest.offset``.
+
+Why a bound at all: Python ``int`` has arbitrary precision; with only ``ge=0``
+an ``offset=10**100`` passes validation and fails later at the database driver
+(``bigint out of range``) -- at query time instead of validation time.
+
+Why ``2**53 - 1`` rather than the int8 maximum: the bound is published as the
+OpenAPI ``maximum`` and becomes part of the API contract, while most JS/TS
+clients map ``integer`` to an IEEE-754 double whose exact integer range ends
+at ``Number.MAX_SAFE_INTEGER``.
+
+Why one window less: callers routinely compute the next page as
+``offset + limit``; reserving ``MAX_SHARED_PAGE_WINDOW`` keeps that addition in
+range without per-call overflow checks."""
+
+if DEFAULT_PAGE_SIZE > MAX_PAGE_SIZE:
+    # Import-time fail-fast: Pydantic does not validate defaults, so a default
+    # outside its own declared range would make "omitted" valid while passing
+    # the same value explicitly is rejected.
+    raise RuntimeError(
+        f"pagination invariant broken: DEFAULT_PAGE_SIZE({DEFAULT_PAGE_SIZE}) > MAX_PAGE_SIZE({MAX_PAGE_SIZE})"
+    )
 
 
 class ListResponse(BaseModel, Generic[ItemT]):
@@ -31,8 +84,10 @@ class ListResponse(BaseModel, Generic[ItemT]):
             return await Character.get_with_count(session, table_view=table_view)
 
     Note:
-        Inherits BaseModel instead of SQLModelBase because SQLModel's metaclass
-        conflicts with Generic. See module docstring for details.
+        Inherits ``BaseModel`` instead of ``SQLModelBase`` because this class
+        is used as a **response_model** and SQLModel + Generic still generates
+        a broken JSON schema for the parametrized field. See the module-level
+        comment.
     """
     model_config = ConfigDict(use_attribute_docstrings=True)
 
@@ -51,19 +106,23 @@ class TimeFilterRequest(SQLModelBase):
     Pure data class -- only carries parameters; SQL clause building is
     handled by TableBaseMixin.
 
+    All bounds are ``AwareDatetime``: a naive datetime cannot be compared
+    with timezone-aware database values (a naive value would silently be
+    interpreted in the database's timezone), so it is rejected at validation.
+
     :raises ValueError: Invalid time range
     """
-    created_after_datetime: datetime | None = None
-    """Filter created_at >= datetime (None means no limit)"""
+    created_after_datetime: AwareDatetime | None = None
+    """Filter created_at >= datetime (None means no limit). Must carry a timezone."""
 
-    created_before_datetime: datetime | None = None
-    """Filter created_at < datetime (None means no limit)"""
+    created_before_datetime: AwareDatetime | None = None
+    """Filter created_at < datetime (None means no limit). Must carry a timezone."""
 
-    updated_after_datetime: datetime | None = None
-    """Filter updated_at >= datetime (None means no limit)"""
+    updated_after_datetime: AwareDatetime | None = None
+    """Filter updated_at >= datetime (None means no limit). Must carry a timezone."""
 
-    updated_before_datetime: datetime | None = None
-    """Filter updated_at < datetime (None means no limit)"""
+    updated_before_datetime: AwareDatetime | None = None
+    """Filter updated_at < datetime (None means no limit). Must carry a timezone."""
 
     def model_post_init(self, __context: Any) -> None:
         """
@@ -88,23 +147,95 @@ class TimeFilterRequest(SQLModelBase):
                 )
 
 
-class PaginationRequest(SQLModelBase):
+class PageWindowRequest(SQLModelBase):
     """
-    Pagination and sorting request parameters.
+    Page window request parameters (the lowest layer: offset / limit / desc).
 
-    Pure data class -- SQL clause building is handled by TableBaseMixin.
+    For consumers whose sort order is fixed by their own domain semantics
+    (they choose the order column and only need a window + direction).
+    It deliberately carries no ``order`` / ``after_id``: inheriting the full
+    ``PaginationRequest`` would expose fields that nothing consumes in the
+    public schema, only to be silently dropped. Pure data class.
     """
-    offset: int | None = Field(default=0, ge=0)
-    """Offset (skip first N records), must be non-negative"""
+    offset: int | None = Field(default=0, ge=0, le=MAX_TABLE_VIEW_OFFSET)
+    """Offset (skip first N records), non-negative and at most ``MAX_TABLE_VIEW_OFFSET``."""
 
-    limit: int | None = Field(ge=1, default=50, le=100)
-    """Page size (return at most N records), min 1, default 50, max 100"""
+    limit: int | None = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    """Page size (return at most N records), min 1, default ``DEFAULT_PAGE_SIZE`` (50), max ``MAX_PAGE_SIZE`` (100)"""
 
     desc: bool | None = True
     """Sort descending (True: descending, False: ascending)"""
 
-    order: Literal["created_at", "updated_at"] | None = "created_at"
-    """Sort field (created_at or updated_at)"""
+
+class PaginationRequest(PageWindowRequest):
+    """
+    Pagination and sorting request parameters (window + order column + keyset cursor).
+
+    For consumers that honor both ``order`` and ``after_id``.
+    Pure data class -- SQL clause building is handled by TableBaseMixin.
+    """
+    order: Literal["created_at", "updated_at", "id"] | None = "created_at"
+    """Sort field (created_at, updated_at or id).
+
+    Subclasses may override the ``Literal`` to add domain sort columns --
+    ``get()`` resolves the column by name, so every value must be a real
+    column of the model.
+    """
+
+    after_id: uuid.UUID | None = None
+    """Keyset cursor: only return records sorted **after** this record (pass the id of the last item of the previous page).
+
+    Unlike ``offset``, a keyset cursor anchors on the last record read, so
+    concurrent inserts/deletes in the already-read prefix do not shift the
+    next page (except for the anchor itself -- see below). Use it for
+    sequential traversal; ``offset`` remains suitable for random access.
+
+    Ordering is always the composite ``(order column, id)`` (``id`` breaks
+    ties, so rows sharing a timestamp are split across pages without gaps or
+    duplicates). The anchor's sort value is looked up server-side from
+    ``after_id``, so clients never round-trip timestamps.
+
+    Constraints: ``order`` must be ``created_at`` (default) or ``id`` -- both
+    immutable; a mutable column (``updated_at`` or domain columns) would move
+    the anchor after an update and break the no-gap/no-duplicate guarantee,
+    so it is rejected at validation. The anchor must still be visible to the
+    query (condition + filter + STI filter); if it was deleted or no longer
+    matches, ``get()`` raises ``KeysetCursorInvalidError`` instead of returning
+    an empty page that looks like the end. ``after_id`` is only supported on
+    UUID primary-key tables.
+    """
+
+    @model_validator(mode='after')
+    def _validate_keyset_anchor_column(self) -> 'PaginationRequest':
+        """``after_id`` may only anchor an immutable sort column (see ``after_id``)."""
+        if self.after_id is not None and self.order not in ('created_at', 'id', None):
+            raise ValueError(
+                f"after_id keyset cursor does not support order={self.order}: a mutable sort "
+                "column moves rows after updates and breaks the no-gap/no-duplicate "
+                "guarantee; use an immutable sort column (e.g. order=created_at)"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _reject_keyset_with_offset(self) -> 'PaginationRequest':
+        """``after_id`` and a non-zero ``offset`` are **mutually exclusive** -- they would stack, not alternate.
+
+        ``get()`` adds the keyset condition to ``WHERE`` ("after the anchor")
+        and still applies ``OFFSET``, meaning "skip N more records after the
+        anchor". With records A B C D E F, anchor B and a leftover
+        ``offset=2``, the query returns E F -- C and D are never shown and
+        become unreachable, silently. ``offset`` defaults to 0, so "forgot to
+        reset it" is the most natural misuse; the combination is therefore
+        made unrepresentable at construction.
+        """
+        if self.after_id is not None and self.offset:
+            raise ValueError(
+                "after_id and offset cannot be combined: the keyset cursor already means "
+                f"'continue after the anchor'; adding offset={self.offset} would additionally "
+                f"skip {self.offset} records after the anchor (they would become unreachable). "
+                "Pass only after_id and omit offset when paging."
+            )
+        return self
 
 
 class TableViewRequest(TimeFilterRequest, PaginationRequest):

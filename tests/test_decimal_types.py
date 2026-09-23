@@ -16,6 +16,11 @@ Covers (based on ``NonNegativeDecimal38_18`` and friends from
 6. **Optional null parsing**: the nested-Annotated structure of
    ``OptionalNonNegativeDecimal38_18`` must accept JSON ``null`` (regression:
    constraints on the outer layer crash Pydantic on None).
+7. **Integer-digit limit**: every alias rejects one integer digit too many
+   (regression: ``_REJECT_FLOAT`` before ``Field`` disabled that check).
+8. **Write (35-digit) / sum (38-digit) aliases** for NUMERIC(38, 18) columns
+   that are aggregated with ``SUM()``.
+9. **OpenAPI validation pattern** generated from the digit counts.
 
 Pure Pydantic-layer tests -- no DB, near-zero run cost.
 """
@@ -23,10 +28,14 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from typing import Annotated, Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BeforeValidator, TypeAdapter, ValidationError
+from sqlalchemy import Numeric
+from sqlmodel import Field
 
+import sqlmodel_ext.field_types as _ft
 from sqlmodel_ext import (
     NonNegativeDecimal20_10,
     NonNegativeDecimal38_18,
@@ -254,3 +263,169 @@ def test_20_10_fixed_point_and_null() -> None:
         '{"rate": "1", "signed_rate": "0", "optional_rate": null}'
     )
     assert restored.optional_rate is None
+
+
+# ============================================================
+# 7. Integer-digit limit is enforced (metadata order regression)
+# ============================================================
+
+# (alias name, max integer digits)
+_DECIMAL_ALIASES: list[tuple[str, int]] = [
+    ('SignedDecimal38_18', 20),
+    ('NonNegativeDecimal38_18', 20),
+    ('PositiveDecimal38_18', 20),
+    ('OptionalNonNegativeDecimal38_18', 20),
+    ('OptionalSignedDecimal38_18', 20),
+    ('SignedWriteDecimal38_18', 17),
+    ('NonNegativeWriteDecimal38_18', 17),
+    ('PositiveWriteDecimal38_18', 17),
+    ('OptionalNonNegativeWriteDecimal38_18', 17),
+    ('OptionalSignedWriteDecimal38_18', 17),
+    ('SignedSumDecimal38_18', 20),
+    ('SignedDecimal20_10', 10),
+    ('NonNegativeDecimal20_10', 10),
+    ('OptionalNonNegativeDecimal20_10', 10),
+    ('NullableNonNegativeDecimal20_10', 10),
+]
+
+
+@pytest.mark.parametrize('name, whole_digits', _DECIMAL_ALIASES)
+def test_integer_digit_limit_enforced(name: str, whole_digits: int) -> None:
+    """Every Decimal alias rejects one integer digit too many.
+
+    Regression: with ``_REJECT_FLOAT`` placed before ``Field(max_digits=...)``
+    Pydantic falls back to validators that check only total digits and decimal
+    places, so e.g. a 15-digit integer passed a NUMERIC(20, 10) alias.
+    """
+    adapter = TypeAdapter(getattr(_ft, name))
+    at_limit = Decimal('9' * whole_digits)
+    assert adapter.validate_python(at_limit) == at_limit
+    with pytest.raises(ValidationError, match='before the decimal point'):
+        adapter.validate_python(Decimal('9' * (whole_digits + 1)))
+
+
+@pytest.mark.parametrize('name, whole_digits', _DECIMAL_ALIASES)
+def test_every_alias_still_rejects_float_and_bool(name: str, whole_digits: int) -> None:
+    """Moving ``_REJECT_FLOAT`` after ``Field`` keeps the float / bool rejection."""
+    adapter = TypeAdapter(getattr(_ft, name))
+    with pytest.raises(ValidationError, match='[Ff]loat'):
+        adapter.validate_python(1.5)
+    with pytest.raises(ValidationError, match='[Bb]oolean'):
+        adapter.validate_python(True)
+    assert adapter.validate_python('1.5') == Decimal('1.5')
+    assert adapter.validate_python(1) == Decimal(1)
+
+
+def test_before_validator_first_would_skip_integer_digit_check() -> None:
+    """Pins the Pydantic behaviour the ordering rule exists for.
+
+    If Pydantic ever enforces integer digits regardless of order, this test
+    fails and the ordering comment in ``field_types`` can be relaxed.
+    """
+    mutated: Any = Annotated[
+        Decimal,
+        BeforeValidator(lambda value: value),
+        Field(max_digits=20, decimal_places=10),
+    ]
+    assert TypeAdapter(mutated).validate_python(Decimal('9' * 15)) == Decimal('9' * 15)
+
+
+# ============================================================
+# 8. Write-side (35 digits) / sum-side (38 digits) aliases
+# ============================================================
+
+def test_write_digit_constants() -> None:
+    assert _ft.DECIMAL_38_18_COLUMN_DIGITS == 38
+    assert _ft.DECIMAL_38_18_WRITE_DIGITS == 35
+    assert _ft.DECIMAL_38_18_PLACES == 18
+
+
+def test_write_side_accepts_35_digits_and_18_places() -> None:
+    adapter = TypeAdapter(_ft.SignedWriteDecimal38_18)
+    extreme = Decimal('99999999999999999.999999999999999999')
+    assert adapter.validate_python(extreme) == extreme
+    negative = Decimal('-99999999999999999.999999999999999999')  # literal: unary minus rounds to prec=28
+    assert adapter.validate_python(negative) == negative
+    assert json.loads(adapter.dump_json(extreme)) == '99999999999999999.999999999999999999'
+
+
+def test_sum_side_accepts_what_write_side_rejects() -> None:
+    """1000 maximal write-side rows still sum to a valid ``SignedSumDecimal38_18``."""
+    # row * 1000, written as a literal: Decimal arithmetic would round to the
+    # default context precision (28 digits)
+    total = Decimal('99999999999999999999.999999999999999000')
+    with pytest.raises(ValidationError):
+        TypeAdapter(_ft.SignedWriteDecimal38_18).validate_python(total)
+    assert TypeAdapter(_ft.SignedSumDecimal38_18).validate_python(total) == total
+
+
+@pytest.mark.parametrize('name', [
+    'SignedWriteDecimal38_18',
+    'NonNegativeWriteDecimal38_18',
+    'PositiveWriteDecimal38_18',
+    'OptionalNonNegativeWriteDecimal38_18',
+    'OptionalSignedWriteDecimal38_18',
+])
+def test_write_side_column_stays_numeric_38_18(name: str) -> None:
+    """The column is NUMERIC(38, 18) even though Pydantic accepts only 35 digits.
+
+    Without an explicit ``sa_type`` SQLModel would derive NUMERIC(35, 18) from
+    ``max_digits``.
+    """
+    sa_types = [
+        m.sa_type for m in getattr(_ft, name).__metadata__
+        if isinstance(getattr(m, 'sa_type', None), Numeric)
+    ]
+    assert len(sa_types) == 1
+    assert (sa_types[0].precision, sa_types[0].scale) == (38, 18)
+
+
+def test_sum_side_has_no_sa_type() -> None:
+    assert not any(
+        isinstance(getattr(m, 'sa_type', None), Numeric)
+        for m in _ft.SignedSumDecimal38_18.__metadata__
+    )
+
+
+def test_optional_write_side_accepts_none_and_bounds_values() -> None:
+    signed = TypeAdapter(_ft.OptionalSignedWriteDecimal38_18)
+    non_negative = TypeAdapter(_ft.OptionalNonNegativeWriteDecimal38_18)
+    assert signed.validate_json('null') is None
+    assert signed.validate_json('"-1"') == Decimal('-1')
+    assert non_negative.validate_json('null') is None
+    with pytest.raises(ValidationError):
+        non_negative.validate_json('"-1"')
+
+
+def test_nullable_20_10_is_required_but_accepts_null() -> None:
+    class FtNullableRate(SQLModelBase):
+        rate: _ft.NullableNonNegativeDecimal20_10
+
+    with pytest.raises(ValidationError, match='[Ff]ield required'):
+        FtNullableRate.model_validate({})
+    assert FtNullableRate.model_validate({'rate': None}).rate is None
+    assert FtNullableRate.model_validate({'rate': '1.5'}).rate == Decimal('1.5')
+
+
+# ============================================================
+# 9. OpenAPI validation pattern (single source of truth)
+# ============================================================
+
+def test_pattern_generator_reproduces_original_literals() -> None:
+    assert _ft._decimal_str_pattern(20, 18) == (
+        r'^(?!^[-+.]*$)[+-]?0*(?:\d{0,20}|(?=[\d.]{1,39}0*$)\d{0,20}\.\d{0,18}0*$)'
+    )
+    assert _ft._decimal_str_pattern(10, 10) == (
+        r'^(?!^[-+.]*$)[+-]?0*(?:\d{0,10}|(?=[\d.]{1,21}0*$)\d{0,10}\.\d{0,10}0*$)'
+    )
+
+
+@pytest.mark.parametrize('name, whole_digits, places', [
+    ('SignedDecimal38_18', 20, 18),
+    ('SignedWriteDecimal38_18', 17, 18),
+    ('SignedSumDecimal38_18', 20, 18),
+    ('SignedDecimal20_10', 10, 10),
+])
+def test_validation_schema_is_string_with_matching_pattern(name: str, whole_digits: int, places: int) -> None:
+    schema = TypeAdapter(getattr(_ft, name)).json_schema(mode='validation')
+    assert schema == {'type': 'string', 'pattern': _ft._decimal_str_pattern(whole_digits, places)}

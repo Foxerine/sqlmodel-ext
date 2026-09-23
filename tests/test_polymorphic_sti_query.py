@@ -416,3 +416,57 @@ class TestCompatibleSharedColumn:
         # exactly one physical column backs both subclasses
         table = PolyConflictRoot.__table__  # pyright: ignore[reportAttributeAccessIssue]
         assert len([c for c in table.columns if c.name == 'shared_val']) == 1
+
+
+@pytest.mark.asyncio
+class TestStiAggregatesAndKeyset:
+    """distinct_column / group_sum / count(distinct_column=) / keyset anchors apply the STI filter."""
+
+    async def _seed(self, session: AsyncSession) -> dict[str, object]:
+        ids: dict[str, object] = {}
+        ids['dog'] = (await PolyStiDog(name='rex', breed='lab').save(session)).id
+        ids['puppy'] = (await PolyStiPuppy(name='bit', breed='pug', toy='ball').save(session)).id
+        ids['cat'] = (await PolyStiCat(name='tom', mood=PolyStiMood.happy).save(session)).id
+        return ids
+
+    async def test_distinct_column_respects_subclass(self, session: AsyncSession) -> None:
+        await self._seed(session)
+        names = await PolyStiDog.distinct_column(session, col(PolyStiAnimal.name))
+        assert sorted(names) == ['bit', 'rex']  # dog + puppy, never the cat
+        all_names = await PolyStiAnimal.distinct_column(session, col(PolyStiAnimal.name))
+        assert sorted(all_names) == ['bit', 'rex', 'tom']
+
+    async def test_group_sum_and_distinct_count_respect_subclass(self, session: AsyncSession) -> None:
+        await self._seed(session)
+        from decimal import Decimal
+        from sqlalchemy import func
+
+        rows = await PolyStiDog.group_sum(session, [func.length(col(PolyStiAnimal.name))])
+        assert rows[0].count == 2
+        assert rows[0].totals == [Decimal(6)]  # len('rex') + len('bit'); the cat is excluded
+        with pytest.raises(ValueError, match="at least one sum column"):
+            await PolyStiDog.group_sum(session, [])
+        assert await PolyStiCat.count(session, distinct_column=col(PolyStiAnimal.name)) == 1
+
+    async def test_keyset_anchor_from_sibling_is_invisible(self, session: AsyncSession) -> None:
+        from sqlmodel_ext import TableViewRequest
+        from sqlmodel_ext.mixins import KeysetCursorInvalidError
+
+        ids = await self._seed(session)
+        with pytest.raises(KeysetCursorInvalidError):
+            await PolyStiDog.get(
+                session, fetch_mode='all',
+                table_view=TableViewRequest(after_id=ids['cat']),
+            )
+
+
+class TestStiSharedColumnNullability:
+    """Registered STI shared columns are nullable with no default (documented invariant)."""
+
+    def test_shared_columns_nullable_without_defaults(self) -> None:
+        table = PolyStiAnimal.__table__  # pyright: ignore[reportAttributeAccessIssue]
+        for name in ('breed', 'toy', 'mood', 'wing_span'):
+            column = table.c[name]
+            assert column.nullable is True
+            assert column.default is None
+            assert column.server_default is None

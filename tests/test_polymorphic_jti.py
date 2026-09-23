@@ -28,12 +28,14 @@ the registration phases detect and skip them).
 """
 from __future__ import annotations
 
-import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import class_mapper
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+from sqlmodel_ext.mixins import uuid7
 
 from sqlmodel_ext import (
     AutoPolymorphicIdentityMixin,
@@ -138,7 +140,9 @@ class TestCreateSubclassIdMixin:
         field_info = PolyJtiVehicleIdMixin.model_fields['id']
         assert getattr(field_info, 'foreign_key', None) == 'polyjtivehicle.id'
         assert getattr(field_info, 'primary_key', None) is True
-        assert field_info.default_factory is uuid.uuid4
+        assert field_info.default_factory is uuid7
+        # Must stay identical to UUIDTableBaseMixin's factory.
+        assert PolyJtiVehicle.model_fields['id'].default_factory is uuid7
 
 
 # ==================== DB-level behavior ====================
@@ -258,6 +262,38 @@ class TestJtiCrud:
         assert deleted == 1
         assert await _count_rows(session, parent_t) == 0
         assert await _count_rows(session, child_t) == 0
+
+    async def test_save_of_child_only_column_bumps_parent_updated_at(
+        self, session: AsyncSession,
+    ) -> None:
+        # updated_at lives on the parent table; an update touching only the
+        # child table would never fire the parent's column-level onupdate.
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        car = await PolyJtiCar(name='ts', num_doors=2, created_at=old, updated_at=old).save(session)
+        car.num_doors = 3
+        car = await car.save(session)
+        assert car.updated_at.replace(tzinfo=timezone.utc) > old
+
+    async def test_update_of_child_only_column_bumps_parent_updated_at(
+        self, session: AsyncSession,
+    ) -> None:
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        car = await PolyJtiCar(name='ts', num_doors=2, created_at=old, updated_at=old).save(session)
+        car = await car.update(session, _CarDoorsPatch(num_doors=5))
+        assert car.num_doors == 5
+        assert car.updated_at.replace(tzinfo=timezone.utc) > old
+
+    async def test_save_without_changes_keeps_updated_at(
+        self, session: AsyncSession,
+    ) -> None:
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        car = await PolyJtiCar(name='ts', num_doors=2, created_at=old, updated_at=old).save(session)
+        car = await car.save(session)
+        assert car.updated_at.replace(tzinfo=timezone.utc) == old
+
+
+class _CarDoorsPatch(SQLModelBase):
+    num_doors: int
 
     async def test_delete_one_sibling_leaves_other_intact(
         self, session: AsyncSession,

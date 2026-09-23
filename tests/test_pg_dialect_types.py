@@ -9,7 +9,8 @@ Covers ``sqlmodel_ext.field_types.dialects.postgresql``:
 2. ``JSON100K`` / ``JSONList100K``: dict/list passthrough, JSON-string
    parsing, the 100K input-length limit (boundary: exactly 100_000 passes,
    100_001 fails), wrong-JSON-root rejection, invalid JSON rejection,
-   serialization to a JSON string, and the JSONB sa_type metadata.
+   object-in / object-out serialization, and the JSONB sa_type metadata
+   (limits for dict/list input live in ``test_field_types_jsonb_limits.py``).
 3. ``NumpyVector``: type-factory caching, invalid parameters, Pydantic
    validation of list/tuple/ndarray/string/base64-dict inputs, dimension and
    dtype enforcement (``VectorDimensionError`` / ``VectorDTypeError`` /
@@ -235,15 +236,17 @@ class TestJson100K:
         with pytest.raises(ValidationError, match="object"):
             FtJsonModel(canvas="[1, 2, 3]")
 
-    def test_serializes_to_json_string(self) -> None:
+    def test_serializes_as_object_in_every_mode(self) -> None:
+        # Object in, object out: never a JSON string. The negative isinstance
+        # assertion is the core -- a re-introduced string serializer would
+        # still round-trip through orjson.loads.
         m = FtJsonModel(canvas={"a": 1})
-        dumped = m.model_dump()
-        assert isinstance(dumped["canvas"], str)
-        assert orjson.loads(dumped["canvas"]) == {"a": 1}
-        # json mode: the field is a JSON string embedded in the payload
+        assert m.model_dump()["canvas"] == {"a": 1}
+        json_dumped = m.model_dump(mode="json")["canvas"]
+        assert json_dumped == {"a": 1}
+        assert not isinstance(json_dumped, str)
         parsed = json.loads(m.model_dump_json())
-        assert isinstance(parsed["canvas"], str)
-        assert orjson.loads(parsed["canvas"]) == {"a": 1}
+        assert parsed["canvas"] == {"a": 1}
 
     def test_sa_type_metadata_is_jsonb(self) -> None:
         schema = JSON100K.__get_pydantic_core_schema__(JSON100K, None)
@@ -268,11 +271,13 @@ class TestJsonList100K:
         with pytest.raises(ValidationError):
             FtJsonModel(messages=oversized)
 
-    def test_serializes_to_json_string(self) -> None:
+    def test_serializes_as_array_in_every_mode(self) -> None:
         m = FtJsonModel(messages=[{"a": 1}])
-        dumped = m.model_dump()
-        assert isinstance(dumped["messages"], str)
-        assert orjson.loads(dumped["messages"]) == [{"a": 1}]
+        assert m.model_dump()["messages"] == [{"a": 1}]
+        json_dumped = m.model_dump(mode="json")["messages"]
+        assert json_dumped == [{"a": 1}]
+        assert not isinstance(json_dumped, str)
+        assert orjson.loads(m.model_dump_json())["messages"] == [{"a": 1}]
 
 
 # ============================================================

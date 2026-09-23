@@ -1,7 +1,15 @@
-"""IP address type compatible with Pydantic and SQLModel."""
-import typing
+"""IP address types compatible with Pydantic and SQLModel.
 
-from pydantic import IPvAnyAddress, GetCoreSchemaHandler
+- :class:`IPAddress`: a **storage column** type (VARCHAR, behaves like ``str``)
+- :data:`ClientIPAddress`: a **parse-time** type that validates untrusted text
+  (e.g. a reverse-proxy request header) into ``IPv4Address | IPv6Address`` --
+  Pydantic ``IPvAnyAddress`` plus rejection of IPv6 zone IDs
+"""
+import ipaddress
+import typing
+from typing import Annotated, TypeAlias
+
+from pydantic import AfterValidator, IPvAnyAddress, GetCoreSchemaHandler
 from pydantic_core import core_schema
 
 
@@ -48,3 +56,31 @@ class IPAddress(str):
     def is_private(self) -> bool:
         """Check if this IP address is a private address."""
         return IPvAnyAddress(self).is_private
+
+
+def _reject_ipv6_scope_id(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Reject IPv6 addresses carrying a zone ID (``fe80::1%eth0``).
+
+    A zone ID names a local interface; it is not part of a network address.
+    ``ipaddress`` also places no length limit on it (``'fe80::1%'`` followed by
+    16,000 characters is accepted by ``IPvAnyAddress``), so on untrusted input it
+    is an unbounded injection / resource-exhaustion channel.
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip.scope_id is not None:
+        raise ValueError("an IPv6 zone ID is not part of a client address")
+    return ip
+
+
+ClientIPAddress: TypeAlias = Annotated[IPvAnyAddress, AfterValidator(_reject_ipv6_scope_id)]
+"""A client IP literal parsed from **untrusted text** (reverse-proxy headers etc.).
+
+Pydantic ``IPvAnyAddress`` performs the structural validation (IPv4 / IPv6 /
+IPv4-mapped IPv6; brackets, port suffixes, leading zeros, whitespace and
+oversized input are rejected), then IPv6 zone IDs are rejected on top. The
+validated value is an ``IPv4Address | IPv6Address``; ``str()`` of it is the
+normalized text (compressed form for IPv6).
+
+Use :class:`IPAddress` for the database column that stores the result.
+"""

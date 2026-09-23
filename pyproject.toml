@@ -29,14 +29,22 @@ classifiers = [
 ]
 dependencies = [
     "sqlmodel>=0.0.32",
-    "pydantic>=2.0",
+    # 2.12 is the first release shipping ``pydantic.experimental.missing_sentinel.MISSING``
+    # (the object ``Unset`` is) and ``Field(exclude_if=...)`` (behind ``EXCLUDE_IF_NONE``).
+    "pydantic>=2.12",
     "sqlalchemy>=2.0",
+    # ``sqlmodel_ext.unset`` imports ``typing_extensions.Sentinel`` directly (to register
+    # its deepcopy reducer); pydantic 2.12 already requires this floor transitively.
+    "typing-extensions>=4.14.1",
 ]
 
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.100.0"]
 cache = ["redis>=5.0", "orjson>=3.0"]
 postgresql = ["orjson>=3.0"]
+# ``run_pending_migration_cache_invalidations`` can discover pending tasks from
+# alembic revision scripts; without alembic, pass ``tasks=`` explicitly.
+alembic = ["alembic>=1.13"]
 pgvector = [
     "sqlmodel-ext[postgresql]",
     "numpy>=1.24",
@@ -53,6 +61,9 @@ dev = [
     "aiosqlite>=0.20",
     "ruff>=0.4",
     "fakeredis>=2.20",
+    # The library is developed and gated against basedpyright; 1.40.1 is the first
+    # release that narrows ``x is Unset`` correctly.
+    "basedpyright>=1.40.1",
 ]
 
 [project.urls]

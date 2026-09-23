@@ -32,10 +32,18 @@ from datetime import datetime
 import fakeredis.aioredis
 import pytest
 import pytest_asyncio
-from sqlalchemy import event as sa_event
+from sqlalchemy import event as sa_event, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlmodel import col, select
 
-from sqlmodel_ext import AsyncSession, CachedTableBaseMixin, SQLModelBase, UUIDTableBaseMixin
+from sqlmodel_ext import (
+    AsyncSession,
+    CachedTableBaseMixin,
+    OptimisticLockMixin,
+    SQLModelBase,
+    TableViewRequest,
+    UUIDTableBaseMixin,
+)
 from sqlmodel_ext.mixins.cached_table import _SESSION_PENDING_CACHE_KEY
 
 
@@ -511,3 +519,221 @@ async def test_transient_redis_errors_fall_back_to_db(
         assert updated.quantity == 12
     finally:
         CachedTableBaseMixin._redis_client = previous
+
+
+# ---------------------------------------------------------------------------
+# Cache transparency: identity-map adoption, uncommitted-write guard,
+# raw DML registration, keyset cache keys, authoritative reads
+# ---------------------------------------------------------------------------
+
+class CacheOwner(SQLModelBase, UUIDTableBaseMixin, table=True):
+    """Non-cached table referenced from a subquery in a cached query's condition."""
+    label: str
+
+
+class CacheOwnedItem(SQLModelBase, CachedTableBaseMixin, UUIDTableBaseMixin, table=True):
+    """Cached model whose query conditions reference CacheOwner through a subquery."""
+    name: str
+    owner_id: uuid.UUID | None = None
+
+
+class CacheLockedDoc(SQLModelBase, OptimisticLockMixin, CachedTableBaseMixin, UUIDTableBaseMixin, table=True):
+    """Cached model with optimistic locking (oplock_version must survive the cache)."""
+    name: str
+    quantity: int = 0
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_never_overwrites_uncommitted_change(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+) -> None:
+    gid = (await CacheGadget(name="orig", quantity=1).save(cache_session)).id
+    await _drain()
+    obj = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    assert obj is not None
+    obj.quantity = 42  # uncommitted, not flushed
+    again = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    assert again is obj
+    assert again.quantity == 42
+
+
+@pytest.mark.asyncio
+async def test_partially_expired_object_is_not_patched_from_cache(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+    sql_log: list[str],
+) -> None:
+    gid = (await CacheGadget(name="orig", quantity=1).save(cache_session)).id
+    await _drain()
+    obj = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    assert obj is not None
+    # Make the cached payload stale on purpose, then expire only one column:
+    # the loaded columns must not be replaced by the cached payload.
+    obj_name = obj.name
+    cache_session.expire(obj, ['quantity'])
+    sql_log.clear()
+    again = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    assert again is obj and again.name == obj_name
+    assert _select_count(sql_log) >= 1, "partially expired object must fall back to the DB"
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_write_on_subquery_table_skips_cache(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+) -> None:
+    owner = await CacheOwner(label="committed").save(cache_session)
+    owner_id = owner.id
+    await CacheOwnedItem(name="item", owner_id=owner_id).save(cache_session)
+    await _drain()
+    await fake_redis.flushdb()
+
+    # Uncommitted rename of the owner (flushed, so a DB read would see it).
+    owner = await CacheOwner.get(cache_session, CacheOwner.id == owner_id)
+    owner.label = "uncommitted"
+    await owner.save(cache_session, commit=False, refresh=False)
+
+    subquery = select(col(CacheOwner.id)).where(col(CacheOwner.label) == "uncommitted")
+    rows = await CacheOwnedItem.get(
+        cache_session, col(CacheOwnedItem.owner_id).in_(subquery), fetch_mode="all",
+    )
+    assert [r.name for r in rows] == ["item"]
+    # The result depends on an uncommitted value of another table: never cached.
+    assert await fake_redis.keys("query:CacheOwnedItem:*") == []
+    await cache_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_flushed_uncommitted_write_is_not_published(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+) -> None:
+    gid = (await CacheGadget(name="g", quantity=1).save(cache_session)).id
+    await _drain()
+    await fake_redis.flushdb()
+    obj = await CacheGadget.get(cache_session, CacheGadget.id == gid)  # caches the committed row
+    obj.quantity = 77
+    await cache_session.flush()  # sent to the DB, but not committed
+    cache_session.expire(obj)
+    got = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    assert got.quantity == 77  # read-your-own-writes from the DB
+    cached = await fake_redis.get(_id_key(CacheGadget, gid))
+    assert b'"quantity":1' in cached.replace(b" ", b""), "the uncommitted value must never reach Redis"
+    await cache_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_raw_dml_makes_dependent_queries_skip_cache(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+) -> None:
+    gid = (await CacheGadget(name="g", quantity=1).save(cache_session)).id
+    await _drain()
+    await fake_redis.flushdb()
+    table = CacheGadget.__table__  # type: ignore[attr-defined]
+    await cache_session.exec(sa_update(table).values(quantity=5))
+    got = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    assert got.quantity == 5
+    assert await fake_redis.keys("*") == [], "uncommitted raw DML result must not be cached"
+    await cache_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_on_commit_runs_after_commit(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+) -> None:
+    gid = (await CacheGadget(name="g", quantity=1).save(cache_session)).id
+    await _drain()
+    assert await fake_redis.exists(_id_key(CacheGadget, gid)) == 1
+    CacheGadget.invalidate_on_commit(cache_session, gid)
+    assert await fake_redis.exists(_id_key(CacheGadget, gid)) == 1  # not yet
+    await cache_session.commit()
+    await _drain()
+    assert await fake_redis.exists(_id_key(CacheGadget, gid)) == 0
+
+
+@pytest.mark.asyncio
+async def test_invalidate_all_strict_raises_default_swallows() -> None:
+    previous = CachedTableBaseMixin._redis_client
+    CachedTableBaseMixin.configure_redis(_BrokenRedis())
+    try:
+        await CacheGadget.invalidate_all()  # swallowed
+        with pytest.raises(ConnectionError):
+            await CacheGadget.invalidate_all(strict=True)
+        with pytest.raises(ConnectionError):
+            await CacheGadget._bump_query_version()
+    finally:
+        CachedTableBaseMixin._redis_client = previous
+
+
+@pytest.mark.asyncio
+async def test_after_id_is_part_of_the_query_cache_key(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+) -> None:
+    ids = []
+    for i in range(4):
+        ids.append((await CacheGadget(name=f"k{i}", quantity=i).save(cache_session)).id)
+    await _drain()
+    first = await CacheGadget.get(
+        cache_session, fetch_mode="all", table_view=TableViewRequest(limit=10, desc=False, after_id=ids[0]),
+    )
+    second = await CacheGadget.get(
+        cache_session, fetch_mode="all", table_view=TableViewRequest(limit=10, desc=False, after_id=ids[1]),
+    )
+    assert [g.name for g in first] == ["k1", "k2", "k3"]
+    assert [g.name for g in second] == ["k2", "k3"]
+    assert len(await fake_redis.keys("query:CacheGadget:*")) == 2
+
+
+@pytest.mark.asyncio
+async def test_authoritative_read_skips_cache(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+    sql_log: list[str],
+) -> None:
+    gid = (await CacheGadget(name="auth", quantity=1).save(cache_session)).id
+    await _drain()
+    sql_log.clear()
+    got = await CacheGadget.get_one(cache_session, gid, authoritative=True)
+    assert got.name == "auth"
+    assert _select_count(sql_log) >= 1, "authoritative read must hit the database"
+
+
+@pytest.mark.asyncio
+async def test_refresh_reads_the_database_not_the_cache(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cache_session: AsyncSession,
+    engine: AsyncEngine,
+) -> None:
+    gid = (await CacheGadget(name="r", quantity=1).save(cache_session)).id
+    await _drain()
+    obj = await CacheGadget.get(cache_session, CacheGadget.id == gid)
+    # Change the row behind the cache's back (raw SQL in another connection).
+    async with engine.begin() as conn:
+        await conn.execute(sa_update(CacheGadget.__table__).values(quantity=9))  # type: ignore[attr-defined]
+    await cache_session.refresh(obj)
+    assert obj.quantity == 9
+
+
+@pytest.mark.asyncio
+async def test_oplock_version_survives_cache_roundtrip(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    engine: AsyncEngine,
+) -> None:
+    async with AsyncSession(engine) as s1:
+        doc = await CacheLockedDoc(name="v").save(s1)
+        doc.quantity = 1
+        doc = await doc.save(s1)  # oplock_version == 2, backfilled into the ID cache
+        gid = doc.id
+    await _drain()
+    assert await fake_redis.exists(_id_key(CacheLockedDoc, gid)) == 1
+    async with AsyncSession(engine) as s2:
+        cached = await CacheLockedDoc.get(s2, CacheLockedDoc.id == gid)  # served from Redis
+        assert cached.oplock_version == 2
+        cached.quantity = 2
+        saved = await cached.save(s2, optimistic_retry_count=0)  # stale version would conflict
+        assert saved.quantity == 2
+        assert saved.oplock_version == 3

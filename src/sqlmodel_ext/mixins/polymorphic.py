@@ -32,7 +32,6 @@ Usage Example::
 """
 import logging
 import types
-import uuid
 from abc import ABC
 from enum import StrEnum
 from typing import Annotated, Any, Union, get_args, get_origin
@@ -51,6 +50,7 @@ from sqlmodel_ext.base import (
     SQLModelBase,
     _classes_with_custom_table_args,
 )
+from sqlmodel_ext.mixins._uuid import uuid7
 
 logger = logging.getLogger(__name__)
 
@@ -392,7 +392,7 @@ def create_subclass_id_mixin(parent_table_name: str) -> type['SQLModelBase']:
     parent table's primary key. This function generates a mixin providing that FK field.
 
     :param parent_table_name: Parent table name (e.g. 'asr', 'tts', 'tool')
-    :returns: A mixin class with an id field (FK + PK + default_factory=uuid.uuid4)
+    :returns: A mixin class with an id field (FK + PK + ``default_factory=uuid7``)
 
     Example::
 
@@ -413,8 +413,12 @@ def create_subclass_id_mixin(parent_table_name: str) -> type['SQLModelBase']:
     _parent_table_name = parent_table_name
 
     class SubclassIdMixin(SQLModelBase):
+        # The default_factory must stay identical to UUIDTableBaseMixin.id's
+        # (uuid7): this mixin overrides the parent's id field through the MRO,
+        # and a divergence would silently give JTI subclasses a different UUID
+        # version than every other table.
         id: UUID = Field(
-            default_factory=uuid.uuid4,
+            default_factory=uuid7,
             foreign_key=f'{_parent_table_name}.id',
             primary_key=True,
         )
@@ -582,6 +586,24 @@ class AutoPolymorphicIdentityMixin:
                 # instance attribute at ``__init__`` time, and the ORM reads the
                 # value directly from the instance on flush without ever consulting
                 # Column.default.
+                #
+                # Cost of stripping the defaults: a column with neither a default
+                # nor a server default lands in SQLAlchemy's
+                # ``mapper._insert_cols_as_none``, and every INSERT of a sibling
+                # subclass then writes an **explicit NULL** into it (even though
+                # the attribute is not in the instance ``__dict__``). An explicit
+                # NULL bypasses any database-side DEFAULT (a DEFAULT only applies
+                # when the column is absent from the INSERT).
+                #
+                # Invariant that migration authors must uphold (not checked here;
+                # a violation only fails on a migrated database, while a
+                # ``create_all``-built test database has the column nullable and
+                # stays green): **an STI shared column registered here must be
+                # nullable in the database -- never add NOT NULL to it and never
+                # rely on a database DEFAULT to fill it for sibling subclasses.**
+                # To require a value only for the subclass that owns the column,
+                # use a NULL-tolerant CHECK such as
+                # ``discriminator <> 'owner_identity' OR col IS NOT NULL``.
                 column.default = None
                 column.server_default = None
 

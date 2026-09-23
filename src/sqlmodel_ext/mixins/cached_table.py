@@ -36,6 +36,13 @@ Invalidation granularity:
 
 Cache skip conditions:
 - ``no_cache=True`` (caller explicitly opts out).
+- ``authoritative=True`` (authorization read: must see the latest committed
+  row; also bypasses the identity map).
+- The current transaction has uncommitted writes on any table the query
+  depends on (returned model incl. subclasses, tables referenced by the
+  condition / filter / order_by incl. subqueries, ``load`` targets). Such a
+  result is not a committed state, so it is neither read from nor written to
+  the shared cache.
 - ``load`` contains a non-MANYTOONE or non-cacheable relationship
   (the multi-ID cache optimization cannot handle it).
 - ``options is not None`` (an ``ExecutableOption`` may change load behaviour).
@@ -89,17 +96,29 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+from uuid import UUID
+
 from pydantic import ValidationError
-from sqlalchemy import ColumnElement, event, inspect as sa_inspect, select as sa_select
+from pydantic_core import to_jsonable_python
+from sqlalchemy import ColumnElement, Table, TableClause, event, inspect as sa_inspect, select as sa_select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import NoResultFound
-from sqlalchemy.orm import InstanceState, QueryableAttribute, Session as _SyncSession, make_transient_to_detached
-from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm import (
+    InstanceState,
+    QueryableAttribute,
+    RelationshipProperty,
+    Session as _SyncSession,
+    SessionTransaction,
+    make_transient_to_detached,
+)
+from sqlalchemy.orm.attributes import instance_state, set_committed_value
 from sqlalchemy.orm.relationships import MANYTOONE  # pyright: ignore[reportPrivateImportUsage]
 from sqlalchemy.sql import operators
 from sqlalchemy.sql.base import ExecutableOption
-from sqlalchemy.sql.dml import Delete, Update
-from sqlalchemy.sql.elements import BinaryExpression
-from sqlmodel import col
+from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.elements import BinaryExpression, ClauseElement, ColumnClause, TextClause
+from sqlalchemy.sql.util import find_tables
+from sqlalchemy.sql.visitors import iterate as sa_iterate
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from sqlalchemy.sql._typing import _OnClauseArgument  # pyright: ignore[reportPrivateUsage]
@@ -129,6 +148,33 @@ _SESSION_PENDING_CACHE_KEY = '_pending_cache_invalidation_types'
 _SESSION_SYNCED_CACHE_KEY = '_synced_cache_invalidation_types'
 _SESSION_CASCADE_DELETED_KEY = '_cascade_deleted_for_sync_invalidation'
 
+# Tables touched by writes that were already sent to the DB connection in this
+# transaction but are NOT yet committed -- a set[TableClause] fed by two entry
+# points: ``after_flush`` (ORM flush) and ``register_raw_dml_write`` (raw DML
+# via execute/exec/scalar/stream/stream_scalars). It is one of the three
+# sources of ``_tables_with_uncommitted_writes``: pending invalidations and
+# session.new/dirty/deleted only cover "not flushed yet", while a DB-backed
+# query autoflushes -- afterwards the objects look clean although the
+# transaction has not committed.
+# Tracked per *table* (not per model type, not a bool): whether a query result
+# may enter the shared cache depends on the set of tables the query depends on
+# (returned model + tables referenced by subqueries in the condition + ``load``
+# targets), not merely on the returned model's family -- a condition such as
+# ``x IN (SELECT other.id WHERE <uncommitted value>)`` makes the result depend
+# on ``other``.
+# Lifetime: cleared ONLY by _on_outermost_transaction_end, the
+# common exit of commit / rollback / close / reset / invalidate (patching each
+# method by name always misses an entry point).
+_SESSION_FLUSHED_TABLES = '_flushed_uncommitted_tables'
+
+_COMPENSATE_TASKS: set[asyncio.Task[None]] = set()
+"""Strong references to fire-and-forget compensation tasks.
+
+The event loop only keeps weak references to tasks; without this set a
+compensation task could be garbage-collected mid-flight. Each task removes
+itself via ``add_done_callback`` when finished.
+"""
+
 # Sentinel -- add() scenario: new rows do not need ID-cache invalidation, only
 # the query cache must be bumped.
 _QUERY_ONLY_INVALIDATION = object()
@@ -139,11 +185,60 @@ _FULL_MODEL_INVALIDATION = object()
 
 # Sentinel returned by _try_load_from_id_caches() for "cache miss"
 # (distinct from a cached None result).
+#
+# There is deliberately only one miss sentinel: when the transaction has
+# uncommitted writes on any table the query depends on, ``get()`` skips the
+# cache entirely (read AND write) *before* querying (see
+# ``_has_uncommitted_writes``), so this path is never reached in that state and
+# "may this miss be written back?" never needs to be distinguished here.
 _LOAD_CACHE_MISS = object()
 
+
+def _referenced_tables(clause: ClauseElement) -> set[TableClause] | None:
+    """Collect every *table* a SQL expression references (including those inside subqueries / aliases / CTEs).
+
+    Used by ``CachedTableBaseMixin._query_dependency_tables`` to decide which
+    tables a query's result set depends on: a cross-table reference such as
+    ``x IN (SELECT other.id WHERE ...)`` makes the result change with
+    uncommitted writes to *another* table, so the dependency set must include
+    tables inside subqueries too.
+
+    :returns: the table set, or ``None`` = untraceable (the expression contains
+        ``text()`` / ``literal_column`` / a bare ``column()`` / a lightweight
+        ``table()`` without metadata -- those can reference any table by name).
+        Callers must treat ``None`` **fail-closed** (depends on every table).
+    """
+    for element in sa_iterate(clause):
+        if isinstance(element, TextClause):
+            return None
+        if isinstance(element, ColumnClause) and element.table is None:
+            return None
+    tables: set[TableClause] = set()
+    for item in find_tables(clause, check_columns=True):
+        if isinstance(item, Table):
+            tables.add(item)
+        elif isinstance(item, TableClause):
+            return None
+        # Anything else (Alias / Subquery / None) is only an intermediate
+        # carrier of column.table; the Tables inside it were already collected
+        # by the same find_tables traversal.
+    return tables
+
+
 # Raw DML statement types (hoisted to a module constant so
-# _warn_raw_dml_on_cached does not rebuild the tuple on every execute()).
-_DML_TYPES: tuple[type, ...] = (Update, Delete)
+# register_raw_dml_write does not rebuild the tuple on every execute()).
+_DML_TYPES: tuple[type, ...] = (Update, Delete, Insert)
+
+# A raw ``text()`` statement whose first keyword is in this set is treated as
+# read-only and does not register write-side tables; everything else registers
+# ALL tables (fail-closed).
+# This is a coarse keyword check (it stops carelessness, not deliberate
+# construction): a writing CTE such as ``WITH ... AS (UPDATE ...)`` is not in
+# the read-only set and is conservatively registered; a ``SELECT`` calling a
+# writing SQL function is invisible -- both are known limitations.
+# ``EXPLAIN`` is deliberately absent: ``EXPLAIN ANALYZE UPDATE ...`` actually
+# executes the write in PostgreSQL.
+_READ_ONLY_TEXT_KEYWORDS: frozenset[str] = frozenset({'SELECT', 'SHOW', 'SET'})
 
 # Cache invalidation methods that subclasses must not call directly.
 # check_cache_config() walks subclass method bodies with AST to prevent
@@ -155,6 +250,29 @@ _FORBIDDEN_DIRECT_CALLS: frozenset[str] = frozenset({
     '_invalidate_id_cache',
     '_invalidate_query_caches',
 })
+
+
+def _on_outermost_transaction_end(session: _SyncSession, transaction: SessionTransaction) -> None:
+    """Clear the "tables with uncommitted writes" set when the outermost transaction ends.
+
+    ``transaction.parent is None`` is the *common exit* of commit / rollback /
+    ``close()`` / ``reset()`` / ``invalidate()`` -- all of them dispatch this
+    event via ``SessionTransaction.close()``. The set is cleared **only here**,
+    not in after_commit / after_rollback / ``_clear_session_cache_state``:
+    ``close()``/``reset()`` do not fire after_rollback, and the async
+    ``invalidate()`` calls ``sync_session.invalidate`` directly, so per-method
+    cleanup always misses an entry point. Nested savepoints and the
+    SUBTRANSACTION of a flush (``parent`` set) are ignored.
+
+    Registered at import time (not by ``_register_session_commit_hook``):
+    ``register_raw_dml_write`` fills the set for every session, cached models
+    or not, so its lifetime must not depend on cache configuration.
+    """
+    if transaction.parent is None:
+        session.info.pop(_SESSION_FLUSHED_TABLES, None)
+
+
+event.listen(_SyncSession, "after_transaction_end", _on_outermost_transaction_end)
 
 
 class CachedTableBaseMixin(TableBaseMixin):
@@ -211,9 +329,14 @@ class CachedTableBaseMixin(TableBaseMixin):
 
         Must be called once at application startup before any cache operations.
 
+        Also installs the session event hooks (idempotent; ``check_cache_config()``
+        installs them too), so the uncommitted-write tracking that guards the
+        cache is active as soon as a client is configured.
+
         :param client: A redis.asyncio.Redis instance (decode_responses=False)
         """
         cls._redis_client = client
+        cls._register_session_commit_hook()
 
     @classmethod
     def _get_client(cls) -> Any:
@@ -316,16 +439,18 @@ class CachedTableBaseMixin(TableBaseMixin):
         query keys at the previous version expire naturally via TTL; no proactive
         cleanup is required.
 
-        :return: the new version (0 on failure).
+        :return: the new version.
+        :raises Exception: a failing Redis ``INCR`` **propagates** and is not
+            swallowed here. This is the lowest link of the invalidation chain:
+            swallowing and returning 0 would let "SCAN/DEL succeeded but INCR
+            failed" look like success to the caller while old query-cache
+            entries stay reachable. The default fire-and-forget semantics are
+            provided by the outer ``invalidate_all()`` / ``invalidate_by_id()``
+            catch; ``invalidate_all(strict=True)`` and the migration
+            invalidation path rely on seeing the failure so they can retry.
         """
-        try:
-            new_ver: int = await cls._get_client().incr(cls._build_version_key())
-            return new_ver
-        except RuntimeError:
-            raise
-        except Exception as e:
-            logger.error(f"Redis version bump error ({cls.__name__}): {e}")
-            return 0
+        new_ver: int = await cls._get_client().incr(cls._build_version_key())
+        return new_ver
 
     # ================================================================
     #  Static checks
@@ -444,7 +569,17 @@ class CachedTableBaseMixin(TableBaseMixin):
         ``after_rollback``: drop the queued invalidations (rows were rolled
         back, nothing to invalidate).
 
-        Idempotent: repeated calls install the hooks only once.
+        Savepoints: a nested RELEASE / ROLLBACK TO also fires these events;
+        both are deferred to the outermost transaction (pendings are neither
+        consumed nor dropped at the savepoint level).
+
+        ``after_flush``: record the tables touched by the flush as "written
+        but uncommitted" (see ``_tables_with_uncommitted_writes``).
+
+        ``persistent_to_deleted``: register cascade-deleted children.
+
+        Idempotent: repeated calls install the hooks only once (also called
+        by ``configure_redis()``).
 
         Limitation (fire-and-forget): ``after_commit`` handlers are synchronous
         by SQLAlchemy contract and cannot ``await`` async invalidation.
@@ -459,6 +594,24 @@ class CachedTableBaseMixin(TableBaseMixin):
             return
 
         def _after_commit_handler(session: _SyncSession) -> None:
+            # SAVEPOINT awareness: SQLAlchemy also fires after_commit when a
+            # nested (savepoint) transaction is RELEASEd. At that point the
+            # data has only been merged into the outer transaction -- it is
+            # NOT yet visible to other sessions, and the outer transaction may
+            # still ROLLBACK. Consuming pendings + invalidating now would (1)
+            # let other sessions back-fill the old DB values while the outer
+            # transaction is uncommitted, and (2) pop the pendings early so
+            # the real outer commit has nothing to invalidate -> stale cache.
+            # So a nested commit defers everything to the outer transaction:
+            # no pop, no invalidation, no lock clearing. (Inside this handler
+            # ``in_nested_transaction()`` still points at the nested one.)
+            # (FOR UPDATE lock tracking is handled by the always-on listeners
+            # in ``sqlmodel_ext.mixins.table``, independently of caching.)
+            if session.in_nested_transaction():
+                return
+            # The "tables with uncommitted writes" set is NOT cleared here; it
+            # is cleared centrally by _on_outermost_transaction_end (the
+            # common exit of commit / rollback / close / reset / invalidate).
             pending: dict[type, set[Any]] | None = session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
             if not pending:
                 return
@@ -492,8 +645,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                             # compensate at the model level now.
                             try:
                                 await model_type._invalidate_for_model()
-                            except Exception as e:
-                                logger.error(f"post-commit model-level invalidation failed ({model_type.__name__}): {e}")
+                            except Exception:
+                                logger.exception(f"post-commit model-level invalidation failed ({model_type.__name__})")
                             continue
                         # Compensate only the ID caches that the sync path missed.
                         remaining = pending_ids - synced_ids - sentinels
@@ -501,8 +654,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                             try:
                                 for _id in remaining:
                                     await model_type._invalidate_id_cache(_id)
-                            except Exception as e:
-                                logger.error(f"post-commit ID-cache invalidation failed ({model_type.__name__}): {e}")
+                            except Exception:
+                                logger.exception(f"post-commit ID-cache invalidation failed ({model_type.__name__})")
                         continue
 
                     # This type was not touched by the sync path at all — full
@@ -528,18 +681,58 @@ class CachedTableBaseMixin(TableBaseMixin):
                                 await model_type._invalidate_query_caches()
                             else:
                                 await model_type._invalidate_for_model()
-                    except Exception as e:
-                        logger.error(f"post-commit compensation failed ({model_type.__name__}): {e}")
+                    except Exception:
+                        logger.exception(f"post-commit compensation failed ({model_type.__name__})")
 
             # fire-and-forget: instance_ids handled by the sync path get deduped
             # via `synced`; only commit=False accumulations that were not
             # sync-invalidated end up being compensated here.
-            _ = loop.create_task(_compensate(pending, synced))
+            _task = loop.create_task(_compensate(pending, synced))
+            _COMPENSATE_TASKS.add(_task)
+            _task.add_done_callback(_COMPENSATE_TASKS.discard)
 
         def _after_rollback_handler(session: _SyncSession) -> None:
+            # SAVEPOINT awareness: ROLLBACK TO SAVEPOINT also fires after_rollback.
+            # (FOR UPDATE lock tracking is handled by the always-on listeners
+            # in ``sqlmodel_ext.mixins.table``.)
+            if session.in_nested_transaction():
+                # Pendings: only the savepoint's changes are discarded; the
+                # outer transaction continues (including changes made before
+                # the savepoint). The flat pending dict does not distinguish
+                # savepoint levels, and clearing it would also drop pendings of
+                # changes the outer transaction will commit -> stale cache. So
+                # pendings are KEPT (the outer commit invalidates them; for the
+                # rolled-back savepoint entries that is one extra
+                # invalidation -- safe, the cache is a rebuildable copy).
+                return
+            # Outermost rollback: everything was rolled back, nothing to
+            # invalidate; clear pendings.
             session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
             session.info.pop(_SESSION_SYNCED_CACHE_KEY, None)
             session.info.pop(_SESSION_CASCADE_DELETED_KEY, None)
+            # The "tables with uncommitted writes" set is cleared centrally in
+            # _on_outermost_transaction_end.
+
+        def _after_flush_handler(session: _SyncSession, _flush_context: object) -> None:
+            """A flush sent writes to the DB connection but has **not committed** them.
+
+            Afterwards ``new/dirty/deleted`` are empty although the transaction
+            is still open. Record the *tables* touched by this flush in
+            ``_SESSION_FLUSHED_TABLES`` for ``_tables_with_uncommitted_writes``;
+            they are cleared when the outermost transaction ends.
+
+            SQLAlchemy dispatches this event **before**
+            ``finalize_flush_changes()``, so ``new/dirty/deleted`` still hold
+            the pre-flush sets here. A flush inside a nested savepoint is
+            registered too (after RELEASE the writes are still uncommitted in
+            the outer transaction); after a savepoint *rollback* the entry is
+            kept (over-strict: queries on those tables keep skipping the cache
+            for the rest of the transaction -- the safe direction).
+            """
+            flushed: set[TableClause] = session.info.setdefault(_SESSION_FLUSHED_TABLES, set())
+            for collection in (session.new, session.dirty, session.deleted):
+                for obj in collection:
+                    flushed.update(instance_state(obj).mapper.tables)
 
         def _on_persistent_to_deleted(session: _SyncSession, instance: object) -> None:
             """Cascade delete cache invalidation -- listen for the
@@ -570,6 +763,7 @@ class CachedTableBaseMixin(TableBaseMixin):
 
         event.listen(_SyncSession, "after_commit", _after_commit_handler)
         event.listen(_SyncSession, "after_rollback", _after_rollback_handler)
+        event.listen(_SyncSession, "after_flush", _after_flush_handler)
         event.listen(_SyncSession, "persistent_to_deleted", _on_persistent_to_deleted)
 
         cls._commit_hook_registered = True
@@ -606,15 +800,133 @@ class CachedTableBaseMixin(TableBaseMixin):
     # ================================================================
 
     @classmethod
-    def _has_pending_invalidation(cls, session: AsyncSession) -> bool:
-        """Return True when the session has pending invalidations related to ``cls``."""
-        pending: dict[type, set[Any]] | None = session.info.get(_SESSION_PENDING_CACHE_KEY)
-        if not pending:
+    def _mapped_tables(cls) -> set[TableClause]:
+        """Tables mapped by ``cls`` and all its subclasses -- a query on ``cls`` may return subclass rows (STI shares the table, JTI adds subclass tables)."""
+        mapper = sa_inspect(cls, raiseerr=True)
+        return {table for m in mapper.self_and_descendants for table in m.tables}
+
+    @staticmethod
+    def _tables_with_uncommitted_writes(session: AsyncSession) -> set[TableClause]:
+        """The set of *tables* this transaction has written but not yet committed.
+
+        The Redis cache is shared across sessions, while a query result inside
+        this transaction includes read-your-own-writes (a DB round trip
+        autoflushes) -- it is **not any committed state** and must never become
+        cache content, **no matter when it would be published**: deferring
+        publication to commit does not help either, because a mid-transaction
+        snapshot can differ from the finally committed value (another change
+        before commit, a savepoint rollback). The only correct handling is not
+        to publish.
+
+        All three sources are required (the first two only cover "not flushed
+        yet"; after an autoflush the objects look clean although the
+        transaction is still open):
+
+        - ``_SESSION_PENDING_CACHE_KEY``: pendings registered by the CRUD
+          methods (``save``/``update``/``delete``, cascade deletes)
+        - ``session.new / dirty / deleted``: bare ``add`` / attribute
+          assignment / ``delete`` that has not been flushed
+        - ``_SESSION_FLUSHED_TABLES``: already sent to the DB connection, not
+          committed -- registered by the ORM flush (``after_flush``) and by raw
+          ``execute`` / ``exec`` DML (``register_raw_dml_write``)
+
+        Known limitations (all fail in the "publish uncommitted state"
+        direction unless noted):
+
+        1. raw ``text()`` is classified read/write by its first keyword only
+           (non-read-only statements register every table -- fail-closed);
+        2. writes that bypass the enhanced ``sqlmodel_ext.AsyncSession``
+           (executing on a raw connection) are invisible;
+        3. M2M ``secondary`` tables are not part of ``mapper.tables``, so
+           association rows written through a relationship collection
+           ``append`` are registered by neither ORM source;
+        4. child tables deleted by a DB-level ``passive_deletes='all'`` cascade
+           are unknown to the ORM.
+        """
+        sync = session.sync_session
+        tables: set[TableClause] = set()
+        flushed: set[TableClause] | None = sync.info.get(_SESSION_FLUSHED_TABLES)
+        if flushed:
+            tables.update(flushed)
+        pending: dict[type, set[Any]] | None = sync.info.get(_SESSION_PENDING_CACHE_KEY)
+        if pending:
+            for model_type in pending:
+                tables.update(sa_inspect(model_type).tables)
+        for collection in (sync.new, sync.dirty, sync.deleted):
+            for obj in collection:
+                tables.update(instance_state(obj).mapper.tables)
+        return tables
+
+    @classmethod
+    def _query_dependency_tables(
+            cls,
+            condition: Any,
+            filter_expr: Any,
+            order_by: Any,
+            load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None,
+    ) -> set[TableClause]:
+        """Every table the result set of this ``get()`` depends on -- the reach of the "may it be cached" decision.
+
+        = the tables of ``cls`` (including subclasses) ∪ tables referenced by
+        ``condition`` / ``filter`` / ``order_by`` (including subqueries,
+        aliases and CTEs, see ``_referenced_tables``) ∪ the tables of every
+        ``load`` target (including subclasses).
+
+        The reach cannot be just "the returned model's family": a condition
+        such as ``owner_id IN (SELECT owner.id WHERE name = <uncommitted
+        value>)`` makes the result depend on uncommitted writes to ``owner``
+        while the returned model itself is untouched. ``load`` targets
+        likewise: the write side would publish the target's uncommitted
+        payload into its own ID cache.
+
+        **fail-closed**: if any expression is untraceable
+        (``_referenced_tables`` returns ``None``), return **every** table in
+        the metadata -- any uncommitted write then skips the cache.
+        ``join`` is not considered here: ``join is not None`` already skips
+        the cache entirely.
+        """
+        tables = cls._mapped_tables()
+        clauses: list[Any] = [condition, filter_expr]
+        if order_by is not None:
+            clauses.extend(order_by)
+        for clause in clauses:
+            if clause is None or isinstance(clause, bool):
+                continue
+            referenced = _referenced_tables(clause)
+            if referenced is None:
+                return set(SQLModelBase.metadata.tables.values())
+            tables.update(referenced)
+        if load is not None:
+            for attr in (load if isinstance(load, list) else [load]):
+                prop = attr.property
+                if isinstance(prop, RelationshipProperty):
+                    tables.update(t for m in prop.mapper.self_and_descendants for t in m.tables)
+        return tables
+
+    @classmethod
+    def _has_uncommitted_writes(
+            cls,
+            session: AsyncSession,
+            dependency_tables: set[TableClause] | None = None,
+    ) -> bool:
+        """Whether this transaction has uncommitted writes on any table of ``dependency_tables``.
+
+        ``dependency_tables`` defaults to the tables of ``cls`` itself
+        (including subclasses). This is the single criterion deciding whether
+        ``get()`` may use the cache (read **and** write), evaluated *before*
+        the query: when true, this ``get()`` neither reads the cache nor writes
+        its result into it. ``get()`` passes the full reach computed by
+        ``_query_dependency_tables``.
+
+        Decided per *table* rather than per transaction: modifying model A does
+        not make queries on model B skip the cache (hit rate), unless B's query
+        references A's table in its condition (correctness).
+        """
+        touched = cls._tables_with_uncommitted_writes(session)
+        if not touched:
             return False
-        return any(
-            issubclass(pending_type, cls) or issubclass(cls, pending_type)
-            for pending_type in pending
-        )
+        tables = cls._mapped_tables() if dependency_tables is None else dependency_tables
+        return not touched.isdisjoint(tables)
 
     @classmethod
     def _analyze_load_relations(
@@ -675,8 +987,8 @@ class CachedTableBaseMixin(TableBaseMixin):
         1. Read the main model's ID cache and deserialize.
         2. For each entry in ``rel_info``, look up the related model's ID cache
            by the main row's FK value.
-        3. If everything hits, merge into the session via
-           ``session.merge(load=False)`` plus ``set_committed_value`` and return.
+        3. If everything hits, adopt into the session via
+           ``_adopt_cached_instance`` plus ``set_committed_value`` and return.
         4. If any key misses, return ``_LOAD_CACHE_MISS`` so the caller can fall
            back to the database.
 
@@ -704,19 +1016,27 @@ class CachedTableBaseMixin(TableBaseMixin):
         # 2. Collect the related FKs, build the cache key list, and fetch them
         #    in a single pipeline mget call. (N relationships go from N+1 Redis
         #    RTTs down to 2: one GET for the main model + one MGET for all relations.)
-        rel_entries: list[tuple[str, 'type[CachedTableBaseMixin]', str | None]] = []
-        """(rel_name, target_cls, cache_key | None)"""
+        rel_entries: list[tuple[str, 'type[CachedTableBaseMixin]', str | None, str, Any]] = []
+        """(rel_name, target_cls, cache_key | None, fk_attr_name, fk_value_used)
+
+        ``fk_value_used`` is the FK read from the **cached payload**; the
+        relationship cache key is built from it. After the main object is
+        adopted it must be checked against the object's *current* FK (see the
+        FK consistency check below).
+        """
         pipeline_keys: list[str] = []
 
         for rel_name, target_cls, fk_attr_name in rel_info:
             fk_value = getattr(main_obj, fk_attr_name, None)
             if fk_value is None:
-                rel_entries.append((rel_name, target_cls, None))
+                rel_entries.append((rel_name, target_cls, None, fk_attr_name, None))
                 continue
-            if target_cls._has_pending_invalidation(session):
-                return _LOAD_CACHE_MISS
+            # Uncommitted writes on the relationship target's table are not
+            # checked here: ``get()`` already includes the load targets in the
+            # reach of ``_query_dependency_tables`` and skips the cache
+            # entirely in that case, so this method is never called.
             rel_cache_key = target_cls._build_id_cache_key(fk_value)
-            rel_entries.append((rel_name, target_cls, rel_cache_key))
+            rel_entries.append((rel_name, target_cls, rel_cache_key, fk_attr_name, fk_value))
             pipeline_keys.append(rel_cache_key)
 
         # Batch-read every relationship cache in a single RTT.
@@ -732,10 +1052,11 @@ class CachedTableBaseMixin(TableBaseMixin):
 
         # 3. Deserialize the related objects.
         pipeline_idx = 0
-        rel_objects: list[tuple[str, Any]] = []
-        for rel_name, target_cls, cache_key in rel_entries:
+        rel_objects: list[tuple[str, Any, 'type[CachedTableBaseMixin] | None']] = []
+        """(rel_name, rel_obj | None, target_cls | None) -- target_cls is reused for adoption"""
+        for rel_name, target_cls, cache_key, _fk_attr, _fk_used in rel_entries:
             if cache_key is None:
-                rel_objects.append((rel_name, None))
+                rel_objects.append((rel_name, None, None))
                 continue
 
             rel_raw = pipeline_results[pipeline_idx]
@@ -752,20 +1073,61 @@ class CachedTableBaseMixin(TableBaseMixin):
                     pass
                 return _LOAD_CACHE_MISS
 
-            rel_objects.append((rel_name, rel_obj))
+            rel_objects.append((rel_name, rel_obj, target_cls))
 
-        # 4. All caches hit -- merge into the session identity map.
-        # Merge related objects first.
+        # 4. All caches hit -- adopt into the session identity map.
+        #
+        # Both the main object and the related objects go through
+        # ``_adopt_cached_instance``: an unconditional ``merge(load=False)``
+        # overwrites the *loaded columns* of an object already in the identity
+        # map and can silently discard uncommitted modifications.
+        # (Do not call ``make_transient_to_detached`` here --
+        # ``_adopt_cached_instance`` does it; calling it twice corrupts the
+        # object state.)
+        # Every rejection returns the plain ``_LOAD_CACHE_MISS``.
+        adopted_main = await cls._adopt_cached_instance(session, main_obj)
+        if adopted_main is None:
+            return _LOAD_CACHE_MISS
+
+        # FK consistency check: the relationship cache keys were built from the
+        # *cached payload's* FK, while the adopted main object may carry a
+        # different (newer) FK. If they differ, the related objects were
+        # fetched for the old FK and the final ``set_committed_value`` would
+        # re-attach the relationship to the old target.
+        # (Do not approximate this with ``modified``: a *clean* object can
+        # carry a new FK, e.g. right after an ``authoritative`` read refreshed
+        # it.)
+        #
+        # The FK comparison does NOT replace the second check: after
+        # ``obj.rel = new_target`` and *before* flush, SQLAlchemy has not yet
+        # synchronized the FK, so the FK still equals the old value and the
+        # comparison passes, while ``set_committed_value`` would swap the
+        # relationship back to the cached old target and record it as
+        # committed. So also reject when the relationship attribute itself has
+        # an uncommitted assignment (more precise than a whole-object
+        # ``modified``: changing other columns does not disable the
+        # optimization).
+        main_state = instance_state(adopted_main)
+        for rel_name, _tc, _ck, fk_attr_name, fk_value_used in rel_entries:
+            if getattr(adopted_main, fk_attr_name, None) != fk_value_used:
+                return _LOAD_CACHE_MISS
+            if rel_name in main_state.committed_state:
+                return _LOAD_CACHE_MISS
+        main_obj = adopted_main
+
+        # Related objects go through the same adoption rules; any rejection
+        # abandons the whole optimization. A related object's own uncommitted
+        # changes are protected by ``_adopt_cached_instance`` (it returns the
+        # existing instance for a fully loaded object and never merges into a
+        # dirty one).
         merged_rels: list[tuple[str, Any]] = []
-        for rel_name, rel_obj in rel_objects:
-            if rel_obj is not None:
-                make_transient_to_detached(rel_obj)
-                rel_obj = await session.merge(rel_obj, load=False)
+        for rel_name, rel_obj, rel_target_cls in rel_objects:
+            if rel_obj is not None and rel_target_cls is not None:
+                adopted_rel = await rel_target_cls._adopt_cached_instance(session, rel_obj)
+                if adopted_rel is None:
+                    return _LOAD_CACHE_MISS
+                rel_obj = adopted_rel
             merged_rels.append((rel_name, rel_obj))
-
-        # Then merge the main object.
-        make_transient_to_detached(main_obj)
-        main_obj = await session.merge(main_obj, load=False)
 
         # Install the relationship attributes without tracking them as changes.
         for rel_name, rel_obj in merged_rels:
@@ -785,6 +1147,11 @@ class CachedTableBaseMixin(TableBaseMixin):
         Main models and related models are cached independently (each has
         its own ID cache key and TTL), and are invalidated independently
         (each ``save``/``update``/``delete`` naturally invalidates its own cache).
+
+        This method does not inspect the transaction state: ``get()`` already
+        includes the main model and **every** load target in the reach of
+        ``_query_dependency_tables``; if any of them has uncommitted writes the
+        cache is skipped entirely and this method is never called.
         """
         if result is None:
             return
@@ -802,8 +1169,12 @@ class CachedTableBaseMixin(TableBaseMixin):
                     cache_key = cls._build_id_cache_key(item_id)
                     serialized = cls._serialize_result(item)
                     await cls._cache_set(cache_key, serialized, cls.__cache_ttl__)
-                except Exception as e:
-                    logger.error(f"main-model cache write failed ({cls.__name__}:{item_id}): {e}")
+                except Exception:
+                    # Redis I/O failures never reach this handler -- ``_cache_set``
+                    # already swallows everything except RuntimeError. What is
+                    # caught here is key construction / serialization / an
+                    # unconfigured client: programming errors, so log the traceback.
+                    logger.exception(f"main-model cache write failed ({cls.__name__}:{item_id})")
 
             # Write each relationship model to its target class's ID cache.
             for rel_name, target_cls, _fk_attr in rel_info:
@@ -820,8 +1191,9 @@ class CachedTableBaseMixin(TableBaseMixin):
                     cache_key = target_cls._build_id_cache_key(rel_id)
                     serialized = target_cls._serialize_result(rel_obj)
                     await target_cls._cache_set(cache_key, serialized, target_cls.__cache_ttl__)
-                except Exception as e:
-                    logger.error(f"relationship-model cache write failed ({target_cls.__name__}:{rel_id}): {e}")
+                except Exception:
+                    # Same as above: Redis failures are swallowed by ``_cache_set``.
+                    logger.exception(f"relationship-model cache write failed ({target_cls.__name__}:{rel_id})")
 
     # ================================================================
     #  Cache key construction
@@ -857,7 +1229,6 @@ class CachedTableBaseMixin(TableBaseMixin):
         Format: ``{_CACHE_KEY_PREFIX}:{ModelName}:v{version}:{md5_hash[:_CACHE_KEY_HASH_LENGTH]}``.
         """
         try:
-            from sqlalchemy.dialects import postgresql
             _dialect = postgresql.dialect()
         except Exception:
             _dialect = None
@@ -903,6 +1274,11 @@ class CachedTableBaseMixin(TableBaseMixin):
             parts_order = None
 
         parts: list[str] = [fetch_mode]
+
+        # The keyset cursor must be part of the key: different after_id values
+        # are different pages; omitting it would let two cursors share an entry.
+        if table_view is not None and table_view.after_id is not None:
+            parts.append(f"aid={table_view.after_id}")
 
         # condition → SQL string
         if condition is None:
@@ -974,6 +1350,13 @@ class CachedTableBaseMixin(TableBaseMixin):
             mapper = sa_inspect(type(item))
             column_fields: set[str] = {prop.key for prop in mapper.column_attrs}
             item_dict: dict[str, Any] = item.model_dump(mode='json', include=column_fields)
+            # Columns declared with ``Field(exclude=True)`` (e.g. the optimistic
+            # lock ``oplock_version``) are dropped by model_dump even when
+            # included -- but they are real column state: a cached copy
+            # without them would deserialize with the default value (a stale
+            # version would make the next UPDATE conflict). Add them back.
+            for missing_key in column_fields - item_dict.keys():
+                item_dict[missing_key] = to_jsonable_python(getattr(item, missing_key))
             item_dict[_WRAPPER_CLASS_KEY] = type(item).__name__
             return _json_dumps(item_dict)
         return _json_dumps(item)
@@ -1044,6 +1427,100 @@ class CachedTableBaseMixin(TableBaseMixin):
         class_name = item_data.pop(_WRAPPER_CLASS_KEY, None)
         actual_cls = cls._resolve_subclass(class_name)
         return actual_cls.model_validate(item_data)
+
+    @classmethod
+    async def _adopt_cached_instance(cls, session: AsyncSession, item: Self) -> Self | None:
+        """Adopt an instance deserialized from the cache into the session -- identity map first, never overwriting uncommitted state.
+
+        Purpose: whether a ``get()`` hits the cache must not change how an
+        object that is **already in the identity map** (and its columns) is
+        treated. Without this, the two ``get()`` branches behave oppositely:
+
+        - cache miss -> ``super().get()`` without ``populate_existing`` ->
+          standard SQLAlchemy semantics: the existing object is returned and
+          **not** overwritten;
+        - cache hit -> an unconditional ``session.merge(item, load=False)``
+          copies the cached state onto the existing object **without checking
+          whether it is dirty** -- silently discarding uncommitted
+          modifications (data loss), and making freshness depend on whether
+          the entry happened to be cached.
+
+        Scope: this only governs objects already in the identity map. When
+        the identity map has no such object the cached value is used as-is;
+        cache staleness in general is the job of the write-path invalidation,
+        not of this method.
+
+        Decision -- "would any *loaded non-primary-key column* be overwritten
+        by the cached value?":
+
+        ============================  ===========================================
+        Existing object state         Handling
+        ============================  ===========================================
+        no unloaded column            return it -- same as the cache-miss branch,
+                                      no merge
+        unloaded columns, and no      ``merge`` fills them -- the usual state
+        loaded (non-PK) column        after commit expires everything; nothing
+                                      loaded gets overwritten, saves a query
+        unloaded columns, and some    **return ``None``** -> abandon the hit and
+        loaded (non-PK) column        fall through to the DB
+        ============================  ===========================================
+
+        The third case must fall through and must NOT be patched from the
+        cache payload (neither whole-object merge nor per-column
+        ``set_committed_value``): the loaded columns may be *newer* than the
+        payload (e.g. the object was just read authoritatively and then only
+        one other column was expired).
+
+        "Unloaded column" covers all three causes with one expression
+        (``mapper.column_attrs & state.unloaded``): whole-object ``expired``,
+        partial ``session.expire(obj, ['x'])``, and ``deferred`` columns that
+        were never loaded (``expired_attributes`` is empty for those, yet
+        reading them triggers a synchronous lazy load -> ``MissingGreenlet``).
+        ``state.unloaded`` alone is not usable -- it contains unloaded
+        *relationships*, which are routinely lazy and irrelevant here.
+
+        The primary key is excluded from "loaded columns" defensively (it is
+        never rewritten by the payload since the identity key matches).
+        Composite primary keys and rewritten primary keys are not covered.
+
+        ``merge`` also wipes the object's **entire uncommitted history**
+        (``Session.merge`` calls ``_commit_all``), including pending
+        relationship assignments. So even when every column is expired, an
+        object with anything in ``committed_state`` is not merged -- and this
+        check must happen *before* the merge (afterwards ``committed_state``
+        is always empty).
+
+        Cost: an object that is *partially* expired or has uncommitted changes
+        forfeits the cache hit and costs one DB round trip -- which is exactly
+        standard SQLAlchemy behavior for re-querying such an object.
+
+        Callers that need the **latest** value must not rely on this method:
+        pass ``authoritative=True`` (skips Redis and adds
+        ``populate_existing``, see ``TableBaseMixin.get``).
+
+        :returns: the adopted instance, or ``None`` when the cache hit must be
+            abandoned in favor of a DB query.
+        """
+        make_transient_to_detached(item)
+        key = instance_state(item).key
+        existing = session.sync_session.identity_map.get(key) if key is not None else None
+        if existing is None:
+            return await session.merge(item, load=False)
+
+        st = instance_state(existing)
+        column_keys = {attr.key for attr in st.mapper.column_attrs}
+        unloaded_cols = column_keys & st.unloaded
+        if not unloaded_cols:
+            return cast(Self, existing)
+
+        pk_cols = set(st.mapper.primary_key)
+        pk_keys = {p.key for p in st.mapper.column_attrs if set(p.columns) & pk_cols}
+        if (column_keys - unloaded_cols) - pk_keys:
+            return None
+
+        if st.committed_state:
+            return None
+        return await session.merge(item, load=False)
 
     @classmethod
     def _deserialize_result(cls, raw: bytes, _fetch_mode: str) -> Any:
@@ -1167,19 +1644,55 @@ class CachedTableBaseMixin(TableBaseMixin):
             for _id in _ids:
                 await cls._invalidate_id_cache(_id)
             await cls._invalidate_query_caches()
-        except Exception as e:
-            logger.error(f"invalidate_by_id() Redis failure ({cls.__name__}, ids={_ids}): {e}")
+        except Exception:
+            logger.exception(f"invalidate_by_id() Redis failure ({cls.__name__}, ids={_ids})")
 
     @classmethod
-    async def invalidate_all(cls) -> None:
+    def invalidate_on_commit(cls, session: AsyncSession, *ids: int | UUID) -> None:
+        """Public API -- register row-level invalidation to run after the next commit.
+
+        Unlike ``invalidate_by_id`` (immediate), this registers pending
+        invalidations on the session; the enhanced ``AsyncSession`` executes
+        them right after ``commit()``. Use it when a DB-side write (trigger /
+        raw SQL) is coupled to the ORM transaction: the invalidation must
+        happen *after* commit, otherwise a concurrent reader could back-fill
+        the cache with the old value before the commit lands.
+
+        - ``ids`` accepts real primary keys only (``int`` / ``UUID``); the
+          model-level / query-level sentinels are internal.
+        - With ``commit=False`` callers the invalidation naturally waits for
+          the eventual ``session.commit()``.
+        - ``session.reset()`` / rollback drop the pendings -- a retry path
+          must call this method again.
+        """
+        for _id in ids:
+            cls._register_pending_invalidation(session, cls, _id)
+
+    @classmethod
+    async def invalidate_all(cls, *, strict: bool = False) -> None:
         """Public API -- invalidate every cache entry for this model (id: + query:).
 
-        Redis errors are logged and swallowed (same contract as ``invalidate_by_id``).
+        :param strict: behavior on Redis errors --
+
+            - ``False`` (default): log and **swallow** (fire-and-forget, same
+              contract as ``invalidate_by_id``) -- for callers where
+              invalidation is best-effort and must not break the business flow.
+            - ``True``: log and **re-raise**, so the caller can tell success
+              from failure. Used by the migration cache invalidation: a failed
+              invalidation must be noticed, otherwise its sentinel would be
+              written and the cache would stay stale forever.
         """
         try:
             await cls._invalidate_for_model()
         except Exception as e:
-            logger.error(f"invalidate_all() Redis failure ({cls.__name__}): {e}")
+            # Swallowed -> this is the final boundary, log the traceback.
+            # Re-raised -> the caller logs it; keep only a breadcrumb here to
+            # avoid a duplicated traceback.
+            if strict:
+                logger.error(f"invalidate_all() Redis failure ({cls.__name__}): {e}")
+                raise
+            else:
+                logger.exception(f"invalidate_all() Redis failure ({cls.__name__})")
 
     # ================================================================
     #  get() override -- cache read path
@@ -1201,10 +1714,12 @@ class CachedTableBaseMixin(TableBaseMixin):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -1227,10 +1742,12 @@ class CachedTableBaseMixin(TableBaseMixin):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -1253,10 +1770,12 @@ class CachedTableBaseMixin(TableBaseMixin):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -1278,10 +1797,12 @@ class CachedTableBaseMixin(TableBaseMixin):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -1292,16 +1813,25 @@ class CachedTableBaseMixin(TableBaseMixin):
 
         - ``no_cache`` only exists on this mixin; passing it to a non-cached
           model raises ``TypeError`` (explicit failure).
-        - If the transaction has uncommitted changes (``commit=False`` CRUD),
-          the cache is skipped for both reads and writes.
-        - Cache hits are merged into the identity map via
-          ``session.merge(load=False)``.
+        - ``authoritative=True`` (the single switch for authorization reads,
+          see ``TableBaseMixin.get``) additionally skips Redis on cached
+          models; the base class adds ``populate_existing``. Callers pass only
+          this one argument -- each model knows how many layers to bypass.
+        - If this transaction has uncommitted writes on **any table the query
+          depends on** (returned model incl. subclasses, tables referenced by
+          ``condition`` / ``filter`` / ``order_by`` incl. subqueries, ``load``
+          targets), the cache is skipped for both reads and writes -- such a
+          result is not a committed state and must never be published.
+        - Cache hits are adopted into the identity map via
+          ``_adopt_cached_instance`` (never overwrites loaded / uncommitted
+          state; falls back to the DB when it cannot adopt safely).
         - When ``load`` specifies a MANYTOONE cacheable relationship, a
           multi-ID union lookup is attempted (zero SQL).
         - Full skip conditions are documented at the top of the module.
         """
         skip_cache = (
             no_cache
+            or authoritative
             or options is not None
             or with_for_update
             or populate_existing
@@ -1310,8 +1840,13 @@ class CachedTableBaseMixin(TableBaseMixin):
             or join is not None
         )
 
-        # Uncommitted changes in the transaction -> skip cache (both read and write).
-        if not skip_cache and cls._has_pending_invalidation(session):
+        # Uncommitted writes on any table this query depends on -> skip the
+        # cache (both read and write). This is the single guard that keeps
+        # uncommitted values out of the shared cache; it is evaluated before
+        # the query. Untraceable expressions fail closed (all tables).
+        if not skip_cache and cls._has_uncommitted_writes(
+                session, cls._query_dependency_tables(condition, filter, order_by, load),
+        ):
             skip_cache = True
 
         # ---- load query: multi-ID cache union optimization ----
@@ -1357,9 +1892,10 @@ class CachedTableBaseMixin(TableBaseMixin):
                 offset=offset, limit=limit, fetch_mode=fetch_mode,
                 join=join, options=options, load=load,
                 order_by=order_by, filter=filter,
-                with_for_update=with_for_update, table_view=table_view,
+                with_for_update=with_for_update, skip_locked=skip_locked, table_view=table_view,
                 jti_subclasses=jti_subclasses,
                 populate_existing=populate_existing,
+                authoritative=authoritative,  # the base class adds populate_existing for it
                 created_before_datetime=created_before_datetime,
                 created_after_datetime=created_after_datetime,
                 updated_before_datetime=updated_before_datetime,
@@ -1417,15 +1953,15 @@ class CachedTableBaseMixin(TableBaseMixin):
                     )
                     try:
                         await cls._cache_delete(cache_key)
-                    except Exception as del_err:
-                        logger.error(f"bad-cache cleanup failed key='{cache_key}': {del_err}")
+                    except Exception:
+                        logger.exception(f"bad-cache cleanup failed key='{cache_key}'")
                     # fall through to DB query below
                 else:
-                    # Phase 2: merge into the session identity map to preserve
-                    # the same semantics as a DB query.
-                    if cls.on_cache_hit is not None:
-                        cls.on_cache_hit(cls.__name__)
+                    # Phase 2: adopt into the session identity map with the
+                    # same semantics as a DB query.
                     if result is None:
+                        if cls.on_cache_hit is not None:
+                            cls.on_cache_hit(cls.__name__)
                         if fetch_mode == 'one':
                             # ``fetch_mode='one'`` type contract guarantees raise (not None);
                             # raise on cache hit to mirror the SQL path's ``result.one()`` behavior.
@@ -1433,16 +1969,28 @@ class CachedTableBaseMixin(TableBaseMixin):
                                 f"No row was found when one was required: {cls.__name__}"
                             )
                         return result
+                    adopted: Any = None
                     if isinstance(result, list):
-                        merged_list: list[Self] = []
+                        adopted_list: list[Self] = []
                         for item in result:
-                            make_transient_to_detached(item)
-                            merged_list.append(await session.merge(item, load=False))
-                        return merged_list
+                            one = await cls._adopt_cached_instance(session, item)
+                            if one is None:
+                                break
+                            adopted_list.append(one)
+                        else:
+                            adopted = adopted_list
                     else:
-                        make_transient_to_detached(result)
-                        result = await session.merge(result, load=False)
-                    return result
+                        adopted = await cls._adopt_cached_instance(session, result)
+                    if adopted is not None:
+                        if cls.on_cache_hit is not None:
+                            cls.on_cache_hit(cls.__name__)
+                        return adopted
+                    # Some object cannot be adopted safely (unloaded columns
+                    # next to loaded ones / uncommitted changes, see
+                    # _adopt_cached_instance) -> abandon the hit and fall
+                    # through to the DB query. Write-back is still allowed:
+                    # whether a result may be cached was already decided
+                    # before the query by _has_uncommitted_writes.
 
         # Cache miss callback (only when Redis was actually queried, not skip_cache path)
         if cache_key is not None and cls.on_cache_miss is not None:
@@ -1455,22 +2003,28 @@ class CachedTableBaseMixin(TableBaseMixin):
             offset=offset, limit=limit, fetch_mode=fetch_mode,
             join=join, options=options, load=load,
             order_by=order_by, filter=filter,
-            with_for_update=with_for_update, table_view=table_view,
+            with_for_update=with_for_update, skip_locked=skip_locked, table_view=table_view,
             jti_subclasses=jti_subclasses,
             populate_existing=populate_existing,
+            authoritative=authoritative,  # must be forwarded: the base class adds populate_existing
             created_before_datetime=created_before_datetime,
             created_after_datetime=created_after_datetime,
             updated_before_datetime=updated_before_datetime,
             updated_after_datetime=updated_after_datetime,
         )
 
-        # Write through to the cache (unless we were told to skip).
+        # Write through to the cache unless skipped. ``skip_cache`` already
+        # covers "this transaction has uncommitted writes on a table the query
+        # depends on" -- such a result is not a committed state and is never
+        # written (not even deferred).
         if not skip_cache and cache_key is not None:
             try:
                 serialized = cls._serialize_result(result)
                 await cls._cache_set(cache_key, serialized, cls.__cache_ttl__)
             except Exception as e:
-                logger.error(f"cache serialize/write failed: {type(e).__name__}: {e}")
+                # Redis failures are swallowed by ``_cache_set``; only
+                # programming errors reach this point.
+                logger.exception(f"cache serialize/write failed: {type(e).__name__}")
 
         return result
 
@@ -1520,7 +2074,7 @@ class CachedTableBaseMixin(TableBaseMixin):
             refresh: bool = True,
             commit: bool = True,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
-            optimistic_retry_count: int = 0,
+            optimistic_retry_count: int | None = None,
     ) -> Self:  # MRO override TableBaseMixin.save()
         """``save()`` invalidates the cache first, then refreshes via ``get()``
         so that ``get()`` cannot hit stale data.
@@ -1596,8 +2150,10 @@ class CachedTableBaseMixin(TableBaseMixin):
                     for refill_cls in classes_to_refill:
                         cache_key = refill_cls._build_id_cache_key(instance_id)
                         await refill_cls._cache_set(cache_key, serialized, refill_cls.__cache_ttl__)
-                except Exception as e:
-                    logger.error(f"save() post-commit cache backfill failed ({model_type.__name__}): {e}")
+                except Exception:
+                    # Redis failures are swallowed by the primitives; only
+                    # programming errors reach this point.
+                    logger.exception(f"save() post-commit cache backfill failed ({model_type.__name__})")
 
         return result  # noqa: RLC007  callers with refresh=False explicitly accept the expired object
 
@@ -1616,7 +2172,7 @@ class CachedTableBaseMixin(TableBaseMixin):
             refresh: bool = True,
             commit: bool = True,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
-            optimistic_retry_count: int = 0,
+            optimistic_retry_count: int | None = None,
     ) -> Self:  # MRO override
         """``update()`` invalidates the cache first, then refreshes via ``get()``.
         Mirrors the ``save()`` flow."""
@@ -1674,8 +2230,10 @@ class CachedTableBaseMixin(TableBaseMixin):
                     for refill_cls in classes_to_refill:
                         cache_key = refill_cls._build_id_cache_key(instance_id)
                         await refill_cls._cache_set(cache_key, serialized, refill_cls.__cache_ttl__)
-                except Exception as e:
-                    logger.error(f"update() post-commit cache backfill failed ({model_type.__name__}): {e}")
+                except Exception:
+                    # Redis failures are swallowed by the primitives; only
+                    # programming errors reach this point.
+                    logger.exception(f"update() post-commit cache backfill failed ({model_type.__name__})")
 
         return result  # noqa: RLC007  callers with refresh=False explicitly accept the expired object
 
@@ -1860,8 +2418,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                             cache_key = cls._build_id_cache_key(_inst_id)
                             serialized = cls._serialize_result(r)
                             await cls._cache_set(cache_key, serialized, cls.__cache_ttl__)
-                        except Exception as e:
-                            logger.error(f"add() post-commit cache backfill failed ({cls.__name__}): {e}")
+                        except Exception:
+                            logger.exception(f"add() post-commit cache backfill failed ({cls.__name__})")
                     refreshed.append(r)
                 return refreshed
             else:
@@ -1875,8 +2433,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                         cache_key = cls._build_id_cache_key(_result_id)
                         serialized = cls._serialize_result(r)
                         await cls._cache_set(cache_key, serialized, cls.__cache_ttl__)
-                    except Exception as e:
-                        logger.error(f"add() post-commit cache backfill failed ({cls.__name__}): {e}")
+                    except Exception:
+                        logger.exception(f"add() post-commit cache backfill failed ({cls.__name__})")
                 return r
 
         return result
@@ -1936,8 +2494,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                 await cls._invalidate_query_caches()
             elif _QUERY_ONLY_INVALIDATION in captured_ids:
                 await cls._invalidate_query_caches()
-        except Exception as e:
-            logger.error(f"sync cache invalidation failed ({cls.__name__}): {e}")
+        except Exception:
+            logger.exception(f"sync cache invalidation failed ({cls.__name__})")
 
     # ================================================================
     #  Session-level invalidation helpers
@@ -2017,12 +2575,18 @@ class CachedTableBaseMixin(TableBaseMixin):
 
     @staticmethod
     def _clear_session_cache_state(session: AsyncSession) -> None:
-        """Clear cache-invalidation tracking state from ``session.info`` (called by ``reset()``).
+        """Clear cache-invalidation tracking state from ``session.info`` (called by the enhanced ``close()`` / ``reset()``).
 
-        The ``after_rollback`` triggered by ``reset()``'s internal rollback
-        already clears these three keys; this is an idempotent second pass
-        covering edges where ``after_rollback`` never fires (reset without an
-        active transaction, the startup window before event registration).
+        This is **not** the common exit of transaction termination:
+        ``close()`` / ``reset()`` do not dispatch ``after_rollback``, and the
+        async ``invalidate()`` bypasses them entirely. Transaction-level state
+        (such as ``_SESSION_FLUSHED_TABLES``) is therefore cleared in the
+        always-on ``_on_outermost_transaction_end`` listener -- do not
+        add more keys here. The three invalidation-tracking keys cleared here
+        are normally consumed by ``after_commit`` / cleared by
+        ``after_rollback``; this is an idempotent fallback for a reset without
+        an active transaction and for the startup window before the event
+        hooks are installed.
         """
         session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
         session.info.pop(_SESSION_SYNCED_CACHE_KEY, None)
@@ -2072,30 +2636,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                 if _id is not None:
                     CachedTableBaseMixin._register_pending_invalidation(session, type(inst), _id)
 
-    @staticmethod
-    async def _refresh_via_cache(session: AsyncSession, instance: Any) -> bool:
-        """Cache-aware refresh: reload ``instance`` through ``Model.get()`` (Redis cache + STI polymorphic loading).
-
-        When the instance is in the identity map, ``get()``'s internal
-        ``session.merge(load=False)`` updates its column values in place --
-        avoiding a bare ``session.refresh()`` that bypasses the Redis cache
-        (always hits the DB) and skips STI subclass columns.
-
-        :return: True = refreshed via the cache path; False = not possible
-            (transient / no PK), caller falls back to the native refresh.
-        """
-        insp = cast(InstanceState[Any], sa_inspect(instance))
-        if insp.identity is None:
-            return False
-        cls = type(instance)
-        # get() with a Redis hit is O(0) DB work; a miss queries the DB and
-        # backfills the cache. The return value is discarded -- merge already
-        # updated the identity-map instance in place.
-        await cls.get(session, col(cls.id) == insp.identity[0])
-        return True
-
     _cached_tablename_index: ClassVar[dict[str, list[type['CachedTableBaseMixin']]] | None] = None
-    """Lazily-built {SQL table name: [cached model classes mapped to it]} index for _warn_raw_dml_on_cached."""
+    """Lazily-built {SQL table name: [cached model classes mapped to it]} index for register_raw_dml_write."""
 
     @classmethod
     def _build_cached_tablename_index(cls) -> dict[str, list[type['CachedTableBaseMixin']]]:
@@ -2117,19 +2659,51 @@ class CachedTableBaseMixin(TableBaseMixin):
         return CachedTableBaseMixin._cached_tablename_index
 
     @staticmethod
-    def _warn_raw_dml_on_cached(session: AsyncSession, statement: Any) -> None:
-        """Warn when a bare ``execute(UPDATE/DELETE)`` hits a cached table without registered invalidation.
+    def register_raw_dml_write(session: AsyncSession, statement: Any) -> None:
+        """Write-side observation point for raw statements: **register** the tables they write + **warn** on cache bypass.
 
-        CRUD's ``delete(condition=...)`` also goes through ``execute(Delete)``,
-        but it calls ``_register_pending_invalidation`` before executing -- so
-        the warning only fires when **none** of the cached classes mapped to
-        the table has a pending registration, avoiding false positives on
-        legitimate CRUD paths. Non-DML statements (SELECT etc.) early-return
-        with negligible overhead.
+        Registration: raw DML (``update(...)`` / ``delete(...)`` /
+        ``insert(...)`` / ``text()``) does not go through ORM state -- it never
+        enters ``new/dirty/deleted`` and never fires ``after_flush`` -- so
+        without this ``_tables_with_uncommitted_writes`` cannot see it, and a
+        query in the same transaction that depends on the table would publish
+        uncommitted state into the shared cache. The target table is recorded
+        in the transaction's uncommitted-write set; a ``text()`` statement is
+        untraceable, so unless its first keyword is in
+        ``_READ_ONLY_TEXT_KEYWORDS`` **every** metadata table is registered
+        (fail-closed).
+
+        The enhanced ``sqlmodel_ext.AsyncSession`` calls this from **five**
+        overrides: ``execute`` / ``exec`` / ``scalar`` / ``stream`` /
+        ``stream_scalars`` (the last three do not route through ``execute``
+        in SQLAlchemy's ``AsyncSession``; ``scalars()`` does and needs no
+        separate hook). Call it yourself only if you execute DML through some
+        other path on the same transaction. Writes issued on a raw connection
+        that bypass the session remain invisible.
+
+        Warning: an ``UPDATE`` / ``DELETE`` hitting a cached table without a
+        registered invalidation logs a warning (it bypasses cache
+        invalidation). CRUD's ``delete(condition=...)`` also executes a
+        ``Delete`` but registers its pending invalidation first, so the
+        warning only fires when **none** of the cached classes mapped to the
+        table has a pending registration. ``INSERT`` is only registered, not
+        warned about. Non-DML statements (SELECT etc.) return immediately.
         """
+        if isinstance(statement, TextClause):
+            words = statement.text.lstrip().split(maxsplit=1)
+            if not words or words[0].upper() not in _READ_ONLY_TEXT_KEYWORDS:
+                flushed_all: set[TableClause] = session.info.setdefault(_SESSION_FLUSHED_TABLES, set())
+                flushed_all.update(SQLModelBase.metadata.tables.values())
+            return
         if not isinstance(statement, _DML_TYPES):
             return
-        tablename = getattr(getattr(statement, 'table', None), 'name', None)
+        table = getattr(statement, 'table', None)
+        if isinstance(table, TableClause):
+            flushed: set[TableClause] = session.info.setdefault(_SESSION_FLUSHED_TABLES, set())
+            flushed.add(table)
+        if isinstance(statement, Insert):
+            return
+        tablename = getattr(table, 'name', None)
         if not isinstance(tablename, str):
             return
         classes = CachedTableBaseMixin._build_cached_tablename_index().get(tablename)

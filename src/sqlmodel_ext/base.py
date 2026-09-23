@@ -7,25 +7,28 @@ Provides a smart metaclass that handles:
 - Joined Table Inheritance (JTI) support
 - Single Table Inheritance (STI) via registry.map_imperatively()
 - Annotated sa_type extraction and injection
+- ``partial=True`` PATCH DTOs with tri-state (``Unset | T``) fields
+- Opt-in ``omitted_sentinel`` wire value for callers that cannot omit keys
 - Python 3.14 (PEP 649) compatibility
 """
 import ast
 import copy
+import dataclasses
 import logging
 import re
 import sys
-import types
 import typing
+from collections.abc import Mapping
 from typing import Any, Self, Sequence, get_args, get_origin
 
-import annotated_types as at
-from pydantic import ConfigDict, model_validator
+from pydantic import AliasChoices, BaseModel, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined as Undefined
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Mapped, declared_attr, relationship as sa_relationship
 from sqlmodel import Field, SQLModel
 from sqlmodel.main import (
+    SQLModelConfig,
     SQLModelMetaclass,
     is_table_model_class,
     get_relationship_to,
@@ -55,6 +58,32 @@ from sqlmodel_ext._sa_type import (
     _resolve_annotations,
     _evaluate_annotation_from_string,
 )
+from sqlmodel_ext.constants import OPTIMISTIC_LOCK_VERSION_COLUMN
+from sqlmodel_ext.unset import (
+    OMITTED_SENTINEL,
+    SCHEMA_ANNOTATION_KEYS,
+    SENTINEL_SCHEMA_BRANCH,
+    Unset,
+)
+
+# JSON100K / JSONList100K need the optional ``orjson`` dependency
+# (``sqlmodel-ext[postgresql]``). Without it those types cannot be used at all,
+# so there is nothing to check. Only a missing ``orjson`` is tolerated -- any
+# other import failure is a bug and must surface.
+try:
+    from sqlmodel_ext.field_types.dialects.postgresql.jsonb_types import (
+        JSON100K,
+        JSONList100K,
+        ensure_json_within_limits,
+    )
+except ModuleNotFoundError as _exc:
+    if _exc.name != 'orjson':
+        raise
+    _ORJSON_CHECKED_TYPES: tuple[type, ...] = ()
+    _ensure_json_within_limits: typing.Callable[[Any], None] | None = None
+else:
+    _ORJSON_CHECKED_TYPES = (JSON100K, JSONList100K)
+    _ensure_json_within_limits = ensure_json_within_limits
 
 # Python 3.14+ support
 if sys.version_info >= (3, 14):
@@ -65,14 +94,46 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _merge_field_info_attrs(target: SQLModelFieldInfo, source: SQLModelFieldInfo) -> None:
+_ATTRS_WHERE_NONE_IS_A_REAL_VALUE = frozenset({'default'})
+"""
+FieldInfo attributes on which ``None`` is an explicit, legitimate value rather than "not set".
+
+For ``default``, ``None`` and ``PydanticUndefined`` mean opposite things:
+the former is "the default value is None" (the field is optional), the latter
+is "there is no default" (the field is required). Any loop that skips
+"unset" attributes with ``if value is None: continue`` must exempt the
+attributes listed here; otherwise an explicit ``default=None`` is dropped and
+the field silently becomes required.
+
+.. warning::
+
+   This set is a registry of attributes **confirmed** to need the exemption,
+   not a claim that ``None`` means "unset" for every other attribute. For
+   example, in plain Pydantic ``Field(alias=None)`` placed after
+   ``Field(alias='old')`` clears the alias. Verify an attribute's ``None``
+   semantics (both in plain Pydantic and through this metaclass) before
+   adding it here.
+"""
+
+
+def _merge_field_info_attrs(target: SQLModelFieldInfo, source: FieldInfo) -> None:
     """
     Merge explicitly-set attributes from ``source`` into ``target``.
 
     Used when ``Annotated[Str64, Field(unique=True)]`` expands to multiple FieldInfo:
-    ``Annotated[str, Field(max_length=64), Field(unique=True)]``.
+    ``Annotated[str, Field(max_length=64), Field(unique=True)]``, and when a
+    right-hand-side ``= Field(...)`` coexists with a FieldInfo inside the annotation.
     Merges attributes dynamically (via ``__slots__`` / ``__annotations__`` / ``__dict__``),
     no hardcoded attribute names — upstream additions are handled automatically.
+
+    ``source`` is typed as Pydantic's base ``FieldInfo``: it is only read, and
+    callers may hand in either flavor. ``target`` is written and must be a
+    ``SQLModelFieldInfo``.
+
+    Skipped source values: ``PydanticUndefined``; ``None`` (except for the
+    attributes in ``_ATTRS_WHERE_NONE_IS_A_REAL_VALUE``); empty containers; and
+    ``False`` for a boolean flag that is already ``True`` on the target (so
+    ``unique=False`` never switches off an inherited ``unique=True``).
     """
     attr_names: set[str] = set()
     for klass in type(source).__mro__:
@@ -95,7 +156,11 @@ def _merge_field_info_attrs(target: SQLModelFieldInfo, source: SQLModelFieldInfo
         except AttributeError:
             continue
 
-        if val is None or val is Undefined:
+        # ``default=None`` is an explicit value, not "unset" -- skipping it
+        # would make ``Annotated[X, Field(...), Field(default=None)]`` required.
+        if val is Undefined:
+            continue
+        if val is None and attr_name not in _ATTRS_WHERE_NONE_IS_A_REAL_VALUE:
             continue
         if isinstance(val, (list, dict, set)) and not val:
             continue
@@ -114,8 +179,50 @@ def _merge_field_info_attrs(target: SQLModelFieldInfo, source: SQLModelFieldInfo
     # Merge metadata lists (Pydantic validator metadata like MaxLen, etc.)
     source_meta = getattr(source, 'metadata', None)
     if source_meta:
-        target_meta = getattr(target, 'metadata', None) or []
-        target.metadata = list(target_meta) + list(source_meta)
+        raw_target_meta = getattr(target, 'metadata', None)
+        target_meta = list(raw_target_meta) if raw_target_meta is not None else []
+        target.metadata = _merge_sqlmodel_metadata_carrier(target_meta, list(source_meta))
+
+
+def _merge_sqlmodel_metadata_carrier(
+        target_meta: list[Any],
+        source_meta: list[Any],
+) -> list[Any]:
+    """
+    Concatenate two FieldInfo ``metadata`` lists, folding SQLModel's ``FieldInfoMetadata`` carriers into one.
+
+    Since sqlmodel 0.0.32, ``Field(primary_key=..., sa_type=..., ...)`` stores the
+    SQLModel-specific attributes in a ``FieldInfoMetadata`` entry of
+    ``metadata``, and SQLModel reads only the **first** such entry. Plain
+    concatenation would therefore let an earlier, all-unset carrier (e.g. the
+    one inside a constrained alias like ``NonNegativeInt``) shadow the values
+    set by the later, more specific source (e.g. a right-hand
+    ``= Field(primary_key=True)``).
+
+    Set values of the source carrier are folded into a **copy** of the target
+    carrier (carriers inside type aliases are shared singletons and must not be
+    mutated), using the same rule as ``_merge_field_info_attrs``: ``False`` never
+    overwrites ``True``. All other metadata is concatenated unchanged.
+    """
+    target_fim_index = next(
+        (i for i, m in enumerate(target_meta) if isinstance(m, FieldInfoMetadata)), None,
+    )
+    merged = list(target_meta)
+    for item in source_meta:
+        if not isinstance(item, FieldInfoMetadata) or target_fim_index is None:
+            merged.append(item)
+            continue
+        folded = copy.copy(merged[target_fim_index])
+        for fim_field in dataclasses.fields(item):
+            value = getattr(item, fim_field.name)
+            if value is _FIM_UNSET_SA_TYPE:
+                continue
+            current = getattr(folded, fim_field.name)
+            if value is False and current is True:
+                continue
+            setattr(folded, fim_field.name, value)
+        merged[target_fim_index] = folded
+    return merged
 
 
 def _find_field_info_in_annotated(annotation: Any) -> SQLModelFieldInfo | None:
@@ -202,190 +309,146 @@ def _durably_set_sa_type(field_info: Any, sa_type: Any) -> None:
             pass
 
 
-_FIELDINFO_NON_CONSTRAINT_ATTRS = (
-    'default', 'default_factory', 'alias', 'serialization_alias', 'validation_alias',
-    'title', 'description', 'examples', 'json_schema_extra',
-    'exclude', 'repr', 'init', 'init_var', 'kw_only', 'discriminator',
-    'frozen', 'validate_default',
-    'primary_key', 'foreign_key', 'unique', 'nullable', 'index',
-    'sa_type', 'sa_column', 'sa_column_args', 'sa_column_kwargs',
-    'ondelete', 'schema_extra',
+def _annotation_contains_orjson_checked_type(annotation: Any) -> bool:
+    """
+    Whether the annotation tree contains ``JSON100K`` / ``JSONList100K``.
+
+    Looks through ``Annotated`` / unions / generic containers. Used by
+    ``SQLModelBase.__pydantic_init_subclass__`` to discover, at class creation,
+    the fields that need a construction-time serializability check -- the
+    type annotation is the declaration, no manual registration needed.
+    Always ``False`` when ``orjson`` is not installed.
+    """
+    if any(annotation is checked for checked in _ORJSON_CHECKED_TYPES):
+        return True
+    return any(_annotation_contains_orjson_checked_type(arg) for arg in get_args(annotation))
+
+
+optional_dto_registry: list[type] = []
+"""
+Every class created with ``partial=True``, in creation order.
+
+Public so that tooling (diagnostics, code generators, contract tests) can
+enumerate the derived PATCH models -- for example to assert that each one
+constructs from an empty payload and dumps to ``{}``.
+"""
+
+
+_UNION_INCOMPATIBLE_FIELD_ATTRS: typing.Final = (
+    'exclude', 'alias', 'validation_alias', 'serialization_alias',
+    'discriminator', 'repr', 'frozen',
 )
-"""Non-constraint attributes on FieldInfo -- sa/orm/default/alias/docs, safe to keep in the outer Annotated.
+"""
+``FieldInfo`` attributes that have no effect on a union member and must be hoisted outside the union.
 
-See the ``_split_metadata_for_optional`` docstring for semantics.
-Constraint-related attributes (ge/le/gt/lt/multiple_of/max_digits/decimal_places/
-min_length/max_length/pattern/strict) have already been expanded by Pydantic into
-``Ge/Le/Gt/Lt/MultipleOf/_PydanticGeneralMetadata/MinLen/MaxLen/Predicate`` markers
-inside ``FieldInfo.metadata``, so they need no re-detection on the FieldInfo attrs."""
+Excluded on purpose:
+
+- ``default`` / ``default_factory``: ``partial`` sets the class attribute to
+  ``Unset`` (the default); an outer FieldInfo that also carried a
+  ``default_factory`` would make Pydantic raise
+  ``TypeError: cannot specify both default and default_factory``.
+- constraints (``ge`` / ``max_length`` / ...): they keep working on the union
+  member, and hoisting them would apply them to the sentinel as well.
+"""
 
 
-def _split_metadata_for_optional(
-        metadata: tuple[typing.Any, ...],
-) -> tuple[list[typing.Any], list[typing.Any]]:
-    """Split the metadata of ``Annotated[T, *metadata]`` into (inner_constraints, outer_safe).
-
-    **Why**: Pydantic constraint markers (``Ge/Le/MultipleOf/_PydanticGeneralMetadata``
-    etc.) raise ``TypeError: Unable to apply constraint ... to supplied value None`` on
-    None -- so the constraint markers of a ``T | None`` field must be wrapped inside the
-    inner ``Annotated[T, ...]`` so Pydantic only applies them when the value is not
-    None. Schema markers (``PlainSerializer/BeforeValidator`` etc.) and ORM markers
-    (``sa_type``/``default`` etc.) are None-safe and may stay in the outer layer. This
-    is the essence behind the hand-written nested-Annotated form of optional
-    constrained aliases like ``OptionalNonNegativeDecimal38_18``.
-
-    Classification rules:
-
-    - ``annotated_types.BaseMetadata`` subclasses (``Ge/Le/Gt/Lt/MultipleOf/MinLen/
-      MaxLen/Predicate`` etc.) -> inner (all constraint validators, crash on None)
-    - Pydantic ``FieldInfo`` -> split: ``fi.metadata`` (the constraint marker sequence
-      Pydantic already expanded) -> inner; the remaining schema/orm attrs are rebuilt
-      into a fresh FieldInfo -> outer
-    - objects with ``max_digits`` / ``decimal_places`` / ``pattern`` attributes that are
-      not FieldInfo (i.e. ``_PydanticGeneralMetadata``) -> inner
-    - everything else (``PlainSerializer/WrapSerializer/BeforeValidator/AfterValidator/
-      PlainValidator/WrapValidator`` etc.) -> outer (validators are expected to be
-      None-safe, like a reject-float BeforeValidator)
+def _hoist_field_metadata(union_ann: typing.Any, original_ann: typing.Any) -> typing.Any:
     """
-    inner: list[typing.Any] = []
-    outer: list[typing.Any] = []
-    for m in metadata:
-        if isinstance(m, at.BaseMetadata):
-            inner.append(m)
-        elif isinstance(m, FieldInfo):
-            inner.extend(m.metadata)
-            outer_fi = _strip_constraint_metadata_from_field_info(m)
-            if outer_fi is not None:
-                outer.append(outer_fi)
-        elif isinstance(m, at.GroupedMetadata):
-            # GroupedMetadata protocol (``pydantic.StringConstraints`` etc.):
-            # iterating yields a sequence of _PydanticGeneralMetadata /
-            # annotated_types markers; all go inner.
-            inner.extend(list(m))
-        elif hasattr(m, 'max_digits') or hasattr(m, 'decimal_places') or hasattr(m, 'pattern'):
-            # _PydanticGeneralMetadata (private, duck-typed): max_digits/decimal_places/pattern
-            inner.append(m)
-        else:
-            outer.append(m)
-    return inner, outer
+    Hoist field-level ``FieldInfo`` attributes from ``original_ann`` to outside the union.
 
+    In ``Unset | Annotated[T, *meta]`` the metadata is attached to one union
+    member. ``annotated_types`` constraints (``Ge`` / ``MaxLen`` ...) still work
+    there, but Pydantic's *field-level* attributes (``exclude`` / ``alias`` /
+    ``repr`` ...) do not -- Pydantic only emits an
+    ``UnsupportedFieldAttributeWarning`` and silently drops them.
 
-def _strip_constraint_metadata_from_field_info(fi: FieldInfo) -> FieldInfo | None:
-    """Copy an outer-layer version of a FieldInfo: drop ``fi.metadata`` (constraint markers,
-    moved inner), keep sa_type/default/alias/description and other schema/orm attrs.
-    Returns None when no non-constraint attrs remain."""
-    new_kwargs: dict[str, typing.Any] = {}
-    for attr in _FIELDINFO_NON_CONSTRAINT_ATTRS:
-        v = getattr(fi, attr, Undefined)
-        if v is None or v is Undefined:
+    This returns ``Annotated[Unset | Annotated[T, *meta], Field(<hoisted>)]``:
+    Pydantic picks the field-level attributes up from the outer layer, while
+    the inner layer is untouched (constraints stay bound to the real value type).
+
+    Only attributes of ``FieldInfo`` metadata are hoisted. Other metadata such as
+    custom schema handlers must stay where they are: their
+    ``__get_pydantic_core_schema__`` expects ``source_type`` to be their own
+    alias, not a union.
+
+    :param union_ann: the already-built ``Unset | original_ann``
+    :param original_ann: the original annotation, to read metadata from
+    :returns: ``union_ann`` unchanged when there is nothing to hoist, otherwise
+        ``union_ann`` wrapped in ``Annotated`` with a ``Field`` carrying the hoisted attributes
+    """
+    if get_origin(original_ann) is not typing.Annotated:
+        return union_ann
+    carried: dict[str, typing.Any] = {}
+    for meta in get_args(original_ann)[1:]:
+        if not isinstance(meta, FieldInfo):
             continue
-        new_kwargs[attr] = v
-    if not new_kwargs:
-        return None
-    return Field(**new_kwargs)
+        for attr in _UNION_INCOMPATIBLE_FIELD_ATTRS:
+            value = getattr(meta, attr, None)
+            if value is not None:
+                carried[attr] = value
+    if not carried:
+        return union_ann
+    return typing.Annotated[tuple([union_ann, Field(**carried)])]
 
 
-def _make_annotation_optional(annotation: typing.Any) -> typing.Any:
-    """
-    Convert type annotation to optional: ``T → T | None``
-
-    Places ``| None`` inside ``Annotated[]`` to preserve Field metadata.
-
-    **Key constraint** (isomorphic to ``OptionalNonNegativeDecimal38_18``): when ``T``
-    carries constraint validators (``Ge/Le/MultipleOf/MaxDigits/DecimalPlaces`` etc.),
-    the constraints **must** be nested into the inner ``Annotated[T, *constraints]``,
-    otherwise Pydantic crashes parsing JSON ``null`` with
-    ``TypeError: Unable to apply constraint 'ge' to supplied value None``.
-    Schema/serializer/ORM markers (``PlainSerializer/sa_type/default`` etc.) are
-    None-safe and stay outer.
-
-    Examples::
-
-        str → str | None
-        Annotated[float, Ge(0)] → Annotated[Annotated[float, Ge(0)] | None]
-        Annotated[Decimal, Field(ge=0, sa_type=...), PlainSerializer(...)]
-            → Annotated[Annotated[Decimal, Ge(0)] | None, Field(sa_type=...), PlainSerializer(...)]
-        str | None → str | None  (already optional, unchanged)
-    """
-    origin = get_origin(annotation)
-
-    # Annotated[T, metadata...]: split constraint/schema metadata, then build
-    # the nested optional annotation.
-    if origin is typing.Annotated:
-        args = get_args(annotation)
-        inner_type = args[0]
-        metadata = args[1:]
-        inner_meta, outer_meta = _split_metadata_for_optional(metadata)
-        # Recurse into inner_type: it may itself be Annotated (nested aliases).
-        recursed_inner_type = _maybe_recurse_into_annotated(inner_type)
-        if inner_meta:
-            inner_annotated = typing.Annotated[tuple([recursed_inner_type, *inner_meta])]
-        else:
-            inner_annotated = recursed_inner_type
-        # ``typing.Union[X, None]`` is equivalent to PEP 604 ``X | None``, but type
-        # checkers can correctly infer ``inner_annotated`` is ``Annotated[...]``
-        # (a dynamic type without static ``__or__`` support).
-        optional_inner = typing.Union[inner_annotated, type(None)]  # pyright: ignore[reportGeneralTypeIssues]
-        if outer_meta:
-            return typing.Annotated[tuple([optional_inner, *outer_meta])]
-        return optional_inner
-
-    # Union / UnionType already contains None → unchanged
-    if origin is typing.Union or isinstance(annotation, types.UnionType):
-        args = get_args(annotation)
-        if type(None) in args:
-            return annotation
-
-    # T → T | None
-    return annotation | None
-
-
-def _maybe_recurse_into_annotated(annotation: typing.Any) -> typing.Any:
-    """For nested Annotated (``Annotated[Annotated[T, ...], ...]``), split the inner
-    layer's constraints too. Non-Annotated values are returned unchanged."""
-    if get_origin(annotation) is typing.Annotated:
-        args = get_args(annotation)
-        inner_type = args[0]
-        metadata = args[1:]
-        inner_meta, outer_meta = _split_metadata_for_optional(metadata)
-        # This layer is already at the outer position or wrapped as inner --
-        # keep its structure: the constraints are in inner_meta, reassemble
-        # into Annotated without appending | None (the parent caller does that).
-        recursed = _maybe_recurse_into_annotated(inner_type)
-        all_meta = list(inner_meta) + list(outer_meta)
-        if all_meta:
-            return typing.Annotated[tuple([recursed, *all_meta])]
-        return recursed
-    return annotation
-
-
-def _apply_all_fields_optional(
+def _apply_partial(
         annotations: dict[str, typing.Any],
         attrs: dict[str, typing.Any],
         bases: tuple[type, ...],
+        own_names: frozenset[str],
 ) -> None:
     """
-    Automatically convert inherited fields to optional.
+    Turn inherited fields into **omissible** fields (``Unset | T = Unset``) -- the PATCH DTO shape.
 
-    Two-step strategy (same MRO traversal pattern as ``_recover_annotated_sqlmodel_fields``):
+    The name is ``partial`` (as in TypeScript's ``Partial<T>``) rather than
+    "optional": in Python "optional" means ``Optional[T]`` = ``T | None``
+    (nullable), whereas this makes fields *omissible*. Nullability is carried
+    over unchanged:
 
-    1. Collect data field names from base ``model_fields`` (filtering ClassVar/Relationship)
-    2. Get original type annotations from base MRO ``__annotations__`` (preserving ``Annotated`` metadata)
+    - base ``T``          -> ``Unset | T``        (``null`` rejected)
+    - base ``T | None``   -> ``Unset | T | None`` (``null`` is a real value)
 
-    Ensures ``Annotated[float, Field(ge=0.0)]`` constraints are not lost.
+    Two-step strategy (same MRO traversal as ``_recover_annotated_sqlmodel_fields``):
+
+    1. Collect data field names from base ``model_fields`` (ClassVar/Relationship excluded)
+    2. Take the original annotation from base MRO ``__annotations__`` (keeps ``Annotated`` metadata)
+
+    Constraints are preserved: ``Unset`` is validated by pydantic-core's
+    dedicated missing-sentinel branch and never reaches constraint validators,
+    so ``Unset | Annotated[int, Field(ge=0)]`` needs no special nesting.
+
+    ``default_factory`` needs no special handling either: the ``Unset`` class
+    attribute becomes the default and Pydantic drops the factory, so an omitted
+    list field is ``Unset``, not ``[]``.
+
+    Skipped fields:
+
+    - fields the class declares itself (``own_names``): the author's
+      declaration wins;
+    - ``Literal`` fields (e.g. discriminators): ``Unset | Literal[...]`` would
+      break discriminated unions.
+
+    Note that the resulting annotations are created at runtime, so static type
+    checkers still see the base class annotations on the derived class.
+
+    :param annotations: class annotations (modified in place)
+    :param attrs: class namespace (modified in place)
+    :param bases: base classes
+    :param own_names: names the class body annotates itself, snapshotted before
+        any annotation injection
     """
-    # 1. Collect all base class data field names
     field_names: set[str] = set()
     for base in bases:
         base_model_fields = getattr(base, 'model_fields', None)
         if base_model_fields:
             field_names.update(base_model_fields.keys())
 
-    # 2. For each field, get original annotation from MRO and make optional
     for field_name in field_names:
-        if field_name in annotations:
+        # The criterion is "did the author declare it in this class body", not
+        # "is it in ``annotations``" -- those are different questions once
+        # anything injects inherited annotations.
+        if field_name in own_names:
             continue
-        # Find original annotation from MRO (preserves Annotated metadata)
         original_ann: typing.Any = None
         for base in bases:
             for cls in base.__mro__:
@@ -404,16 +467,11 @@ def _apply_all_fields_optional(
         if original_ann is None:
             continue
 
-        # Bug fix: when a field is declared as ``field: T = Field(gt=..., le=...)`` (non-Annotated form),
-        # MRO ``__annotations__`` only stores the bare ``T``. The ``Field(...)`` constraint metadata
-        # lives on the right-hand-side assignment, so all_fields_optional-derived UpdateRequest classes
-        # lose those constraints (e.g. UFT-style "missing range" warnings fire on derived fields that
-        # had constraints in the source class). Patch: when ``original_ann`` is not already Annotated,
-        # pull constraints from the base class's resolved ``model_fields[name].metadata`` (Pydantic
-        # stores them there as ``[Gt(0), Le(600), ...]``) and re-wrap into ``Annotated[T, *metadata]``,
-        # letting downstream ``_make_annotation_optional`` preserve the constraints when converting
-        # to ``T | None``. The root recommended fix is still to declare fields in Annotated form at
-        # the source; this patch is defense-in-depth for legacy ``field: T = Field(...)`` declarations.
+        # When a field is declared as ``field: T = Field(gt=..., le=...)`` (non-Annotated form),
+        # MRO ``__annotations__`` only stores the bare ``T``; the constraints live on the
+        # right-hand-side assignment. Pull them from the base class's resolved
+        # ``model_fields[name].metadata`` (``[Gt(0), Le(600), ...]``) and re-wrap into
+        # ``Annotated[T, *metadata]`` so the derived field keeps them.
         if get_origin(original_ann) is not typing.Annotated:
             for base in bases:
                 base_model_fields = getattr(base, 'model_fields', None)
@@ -425,35 +483,19 @@ def _apply_all_fields_optional(
                 original_ann = typing.Annotated[original_ann, *base_field_info.metadata]
                 break
 
-        # Skip Literal type fields (e.g. discriminator):
-        # Literal['text'] | None breaks Pydantic discriminated union
+        # Skip Literal fields (e.g. discriminators): making them omissible breaks
+        # Pydantic discriminated unions.
         raw_type = original_ann
         if get_origin(raw_type) is typing.Annotated:
             raw_type = get_args(raw_type)[0]
         if get_origin(raw_type) is typing.Literal:
             continue
 
-        optional_ann = _make_annotation_optional(original_ann)
-
-        # Replace default_factory with default=None for Annotated[T, Field(default_factory=...)]
-        # Unified behavior: all_fields_optional fields all default to None, no factory retained.
-        if get_origin(optional_ann) is typing.Annotated:
-            ann_args = list(get_args(optional_ann))
-            for i, meta in enumerate(ann_args[1:], 1):
-                if isinstance(meta, FieldInfo) and meta.default_factory is not None:
-                    new_fi = meta._copy() if hasattr(meta, '_copy') else copy.copy(meta)
-                    new_fi.default_factory = None
-                    new_fi.default = None
-                    new_fi._attributes_set = dict(new_fi._attributes_set)
-                    new_fi._attributes_set.pop('default_factory', None)
-                    new_fi._attributes_set['default'] = None
-                    ann_args[i] = new_fi
-                    optional_ann = typing.Annotated[tuple(ann_args)]
-                    break
-
-        annotations[field_name] = optional_ann
+        # Field-level attributes (exclude / alias / ...) do not work on a union
+        # member and would be silently dropped -- hoist them outside the union.
+        annotations[field_name] = _hoist_field_metadata(Unset | original_ann, original_ann)
         if field_name not in attrs:
-            attrs[field_name] = None
+            attrs[field_name] = Unset
 
 
 def _recover_annotated_sqlmodel_fields(
@@ -562,6 +604,21 @@ def _recover_annotated_sqlmodel_fields(
         existing_default = attrs.get(field_name, Undefined)
         if existing_default is not Undefined and not isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
             sqlmodel_fi.default = existing_default
+        elif isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
+            # A right-hand-side ``= Field(...)`` coexists with the FieldInfo inside
+            # the annotation, e.g.
+            # ``value: NonNegativeBigInt | None = Field(default=None, sa_type=BigInteger)``.
+            # Without this branch the right-hand FieldInfo would be discarded
+            # (overwritten by ``attrs[field_name] = sqlmodel_fi`` below) and an
+            # explicit ``default=None`` would vanish, silently making the field
+            # required.
+            #
+            # The right-hand side is more specific than the type alias, so it is
+            # merged in as ``source``. Caveat: ``_merge_field_info_attrs`` never
+            # lets ``False`` overwrite ``True`` on boolean flags, so
+            # ``Annotated[int, Field(unique=True)] = Field(unique=False)`` stays
+            # ``unique=True``.
+            _merge_field_info_attrs(sqlmodel_fi, existing_default)
         elif existing_default is Undefined:
             # Inherit default from parent model_fields, but only when FieldInfo has no default/factory
             if sqlmodel_fi.default is Undefined and sqlmodel_fi.default_factory is None:
@@ -710,7 +767,7 @@ def _make_sti_fk_resolver(
     Solution: convert to callable so configure_mappers() calls it to resolve
     Column objects directly from the table's columns collection (Phase 1 already added them).
 
-    :param fk_string: String-format foreign_keys, e.g. '[NanoBananaFunction.flash_llm_id]'
+    :param fk_string: String-format foreign_keys, e.g. '[Order.billing_address_id]'
     :param sa_registry: SQLAlchemy registry for class-name lookup
     :return: callable returning list of Column objects
     """
@@ -867,9 +924,10 @@ class __DeclarativeMeta(SQLModelMetaclass):
             existing.update(collected_mapper_args)
             attrs['__mapper_args__'] = existing
 
-        # 3.5. OptimisticLockMixin wiring: register the mixin's ``version``
-        # column as SQLAlchemy's ``version_id_col`` so every UPDATE emits
-        # ``SET version = version + 1 WHERE ... AND version = :current`` and a
+        # 3.5. OptimisticLockMixin wiring: register the mixin's
+        # ``OPTIMISTIC_LOCK_VERSION_COLUMN`` (``oplock_version``) column as
+        # SQLAlchemy's ``version_id_col`` so every UPDATE emits
+        # ``SET oplock_version = oplock_version + 1 WHERE ... AND oplock_version = :current`` and a
         # lost update surfaces as StaleDataError. The Column object only exists
         # after the Table is built, so this must be a ``declared_attr`` that
         # declarative evaluates late. Only applied to the root table class --
@@ -881,7 +939,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
 
                 def _mapper_args_with_version_col(target_cls, _static=_static_mapper_args):
                     merged = dict(_static)
-                    merged['version_id_col'] = target_cls.__table__.c.version
+                    merged['version_id_col'] = target_cls.__table__.c[OPTIMISTIC_LOCK_VERSION_COLUMN]
                     return merged
 
                 # ``.directive`` is SQLAlchemy 2.0's spelling for declarative
@@ -918,17 +976,56 @@ class __DeclarativeMeta(SQLModelMetaclass):
         # 4. Extract sa_type from Annotated metadata and inject into Field
         annotations, annotation_strings, eval_globals, eval_locals = _resolve_annotations(attrs)
 
+        # Snapshot the names this class body declares itself. Must be taken
+        # before _recover_annotated_sqlmodel_fields, which injects inherited
+        # Annotated fields into ``annotations`` (after that, "declared here" and
+        # "inherited + injected" are indistinguishable).
+        _own_annotation_names = frozenset(annotations)
+
         # 4.5. Fix Annotated[T, Field(foreign_key=...)] where SQLModel FieldInfo gets replaced
         # by Pydantic FieldInfo. Must run before super().__new__() because SQLModel calls
         # get_column_from_field() during __new__. Only for table classes; non-table classes
         # keep original Annotated annotations for child table classes to inherit.
         _recover_annotated_sqlmodel_fields(annotations, attrs, bases, will_be_table)
 
-        # 4.6. all_fields_optional: automatically convert inherited fields to optional (T | None = None)
-        # Used for UpdateRequest DTOs to avoid manually overriding each field.
-        is_all_optional = kwargs.pop('all_fields_optional', False)
-        if is_all_optional:
-            _apply_all_fields_optional(annotations, attrs, bases)
+        # 4.5.b The optimistic-lock version column name is globally reserved:
+        # any class that declares it in its own body fails fast, whether or not
+        # it enables optimistic locking. Reserving it only for classes with the
+        # lock enabled would let a class without the lock declare a domain
+        # column of that name, which a descendant re-enabling the lock would
+        # then silently wire up as ``version_id_col``. Classes that merely
+        # *inherit* the column from OptimisticLockMixin are not in the own-name
+        # snapshot and pass.
+        if OPTIMISTIC_LOCK_VERSION_COLUMN in _own_annotation_names:
+            raise TypeError(
+                f"{name}: '{OPTIMISTIC_LOCK_VERSION_COLUMN}' is reserved for "
+                f"OptimisticLockMixin's version_id_col and cannot be declared by a model. "
+                f"Use another name (e.g. 'version' or 'revision') for a domain version field."
+            )
+
+        # 4.6. partial: turn inherited fields into omissible fields (Unset | T = Unset).
+        # Used for PATCH DTOs to avoid re-declaring every field.
+        if 'all_fields_optional' in kwargs:
+            raise TypeError(
+                f"{name}: the 'all_fields_optional' class keyword was removed in "
+                f"sqlmodel-ext 0.5.0. Use 'partial=True' instead. The semantics changed: "
+                f"omitted fields are now 'Unset' (pydantic's MISSING sentinel), not None, "
+                f"and explicit null is only accepted where the base field allows None. "
+                f"Replace 'x is not None' / 'x is None' checks on such fields with "
+                f"'x is not Unset' / 'x is Unset' (from sqlmodel_ext import Unset); "
+                f"Unset fields are already excluded from model_dump()."
+            )
+        is_partial = kwargs.pop('partial', False)
+        if is_partial:
+            # ``partial`` and ``table`` are mutually exclusive: the partial
+            # default is ``Unset``, a sentinel that cannot be persisted.
+            if will_be_table:
+                raise TypeError(
+                    f"{name}: 'partial=True' cannot be combined with 'table=True' -- the "
+                    f"partial default is 'Unset', which cannot be stored. Use a separate "
+                    f"non-table DTO class for PATCH payloads."
+                )
+            _apply_partial(annotations, attrs, bases, _own_annotation_names)
 
         if annotations:
             attrs['__annotations__'] = annotations
@@ -1047,7 +1144,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
         # 10. Inherit parent field descriptions (use_attribute_docstrings fix)
         # Pydantic's use_attribute_docstrings parses docstrings from source AST.
         # When a subclass overrides a field (e.g. UpdateRequest changes `name: str`
-        # to `name: str | None = None`) or all_fields_optional programmatically
+        # to `name: str | None = None`) or ``partial=True`` programmatically
         # generates annotations, there is no docstring in source → description lost.
         # Fix: inherit missing descriptions from parent's model_fields via MRO.
         needs_rebuild = False
@@ -1080,6 +1177,10 @@ class __DeclarativeMeta(SQLModelMetaclass):
         # Rebuild Pydantic schema (description inheritance or Relationship removal)
         if needs_rebuild and hasattr(result, 'model_rebuild'):
             result.model_rebuild(force=True)
+
+        # 12. Register partial classes (see ``optional_dto_registry``)
+        if is_partial:
+            optional_dto_registry.append(result)
 
         return result
 
@@ -1367,7 +1468,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
                     }
                     if polymorphic_identity is not None:
                         map_kwargs['polymorphic_identity'] = polymorphic_identity
-                    # Abstract intermediate classes (e.g. TencentCompatibleLLM)
+                    # Abstract intermediate classes (polymorphic_abstract=True)
                     # need polymorphic_abstract=True forwarded to map_imperatively
                     if mapper_args.get('polymorphic_abstract'):
                         map_kwargs['polymorphic_abstract'] = True
@@ -1433,6 +1534,44 @@ class __DeclarativeMeta(SQLModelMetaclass):
             setattr(cls, rel_name, rel_value)
 
 
+class SQLModelExtConfig(SQLModelConfig, total=False):
+    """
+    ``SQLModelConfig`` plus sqlmodel-ext's own configuration keys.
+
+    A ``total=False`` TypedDict like upstream: an absent key means "use the
+    default". All upstream keys remain available::
+
+        class ToolArguments(SQLModelBase):
+            model_config = SQLModelExtConfig(omitted_sentinel=True)
+    """
+
+    omitted_sentinel: bool
+    """
+    Whether this model exposes a fillable wire value for **omissible** fields (annotation contains ``Unset``).
+
+    **Off by default.** Pydantic's ``MISSING`` assumes the caller can omit
+    keys, so its branch never appears in the JSON Schema. Some schema
+    consumers require every key to be present (e.g. LLM function calling in
+    strict mode) and would otherwise have to send ``null``, which means
+    "clear" rather than "leave alone". When enabled:
+
+    - inbound dict payloads have every occurrence of
+      :data:`~sqlmodel_ext.unset.OMITTED_SENTINEL` (``'__omitted__'``) replaced
+      by ``Unset`` before validation, at any nesting depth;
+    - ``model_json_schema()`` adds a ``{"const": "__omitted__", "type": "string"}``
+      branch (and ``"default": "__omitted__"``) to every omissible field of the
+      model and of nested models reachable from its fields.
+
+    Whether a caller can omit keys is a property of the caller, and callers are
+    distinguished by model, so the switch is per model: the same domain DTO
+    keeps a clean schema when a REST model inherits it and gains the sentinel
+    branch when a strict-mode model inherits it.
+
+    With the switch on, string fields of the model can no longer hold the
+    literal ``'__omitted__'`` itself.
+    """
+
+
 class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
     """
     Base class for all SQLModel models in sqlmodel_ext.
@@ -1440,7 +1579,215 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
     Must be used together with TableBaseMixin or UUIDTableBaseMixin for table models.
     """
 
-    model_config = ConfigDict(use_attribute_docstrings=True, validate_by_name=True, extra='forbid')
+    model_config = SQLModelExtConfig(
+        use_attribute_docstrings=True, validate_by_name=True, extra='forbid',
+    )
+
+    __orjson_checked_fields__: typing.ClassVar[tuple[str, ...]] = ()
+    """
+    Names of this model's ``JSON100K`` / ``JSONList100K`` fields, filled in by ``__pydantic_init_subclass__``.
+
+    ``table=True`` models skip all Pydantic validators (a known SQLModel
+    behavior), so the serializability invariant of these fields is enforced in
+    ``model_post_init`` instead -- the field annotation is the declaration, no
+    per-model hook to forget. See ``ensure_json_within_limits`` for the exact
+    limits.
+
+    Contract: subclasses overriding ``model_post_init`` must call
+    ``super().model_post_init(context)``, otherwise the check is silently skipped.
+    """
+
+    @staticmethod
+    def annotation_is_omissible(annotation: Any) -> bool:
+        """
+        Whether the annotation accepts ``Unset``, i.e. whether the field can be left unprovided.
+
+        The criterion is the **annotation**, not whether the default happens to
+        be ``Unset``: "can this field be omitted" is answered by the type, while
+        the default answers a different question ("what do I get when it is
+        omitted").
+
+        A ``staticmethod`` because it is also needed where only a bare
+        annotation is at hand; use :meth:`field_is_omissible` when you have a
+        field name.
+
+        :param annotation: field annotation; ``Annotated[...]`` and nested unions
+            are searched recursively (constrained fields are wrapped in
+            ``Annotated``, so looking one level deep is not enough)
+        """
+        pending: list[Any] = [annotation]
+        while pending:
+            node = pending.pop()
+            if node is Unset:
+                return True
+            pending.extend(get_args(node))
+        return False
+
+    @classmethod
+    def field_is_omissible(cls, field_name: str) -> bool:
+        """
+        Whether this model's field can be left unprovided -- orthogonal to whether it may be ``null``.
+
+        Under tri-state semantics these are two independent questions:
+        ``Unset`` answers the first, ``| None`` the second.
+
+        :param field_name: field name; returns ``False`` (does not raise) for
+            unknown names, so it can be used while scanning fields generically
+        """
+        info = cls.model_fields.get(field_name)
+        return info is not None and cls.annotation_is_omissible(info.annotation)
+
+    @model_validator(mode='before')
+    @classmethod
+    def _normalise_omitted_sentinel(cls, data: Any) -> Any:
+        """
+        Inbound normalization: replace the wire value with ``Unset`` (only when ``omitted_sentinel`` is on).
+
+        Only dict input (the JSON path of ``model_validate``) is processed;
+        ``from_attributes`` objects and model instances pass through unchanged
+        -- the wire value only exists in inbound JSON.
+
+        The whole payload tree is walked, not just the top level: a caller that
+        cannot omit keys cannot omit them in nested items either. The wire value
+        is a literal that never occurs as a real value, so no per-field
+        decision is needed.
+
+        Replacing with ``Unset`` is enough -- no key deletion: ``MISSING`` fields
+        are excluded from serialization by Pydantic itself.
+        """
+        config = typing.cast(Mapping[str, Any], cls.model_config)
+        # ``SQLModelExtConfig`` is total=False: an absent key means "off".
+        if not config.get('omitted_sentinel', False):
+            return data
+        if not isinstance(data, dict):
+            return data
+
+        # A single pass is cheaper than "check whether it occurs, then replace":
+        # the check itself already has to walk the tree.
+        def _normalise(value: Any) -> Any:
+            if value == OMITTED_SENTINEL:
+                return Unset
+            if isinstance(value, dict):
+                return {k: _normalise(v) for k, v in typing.cast(dict[Any, Any], value).items()}
+            if isinstance(value, list):
+                return [_normalise(v) for v in typing.cast(list[Any], value)]
+            return value
+
+        return _normalise(data)
+
+    @classmethod
+    def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """
+        Add the sentinel branch to omissible fields (only when ``omitted_sentinel`` is on).
+
+        This must happen at the ``model_json_schema()`` exit, not in
+        ``__get_pydantic_json_schema__``: the latter sees an intermediate
+        product that Pydantic later re-assembles (``$ref`` resolution), and
+        edits to ``properties`` made there do not reach the final output.
+
+        Which fields are omissible can only be decided at model level: a
+        field-level ``Annotated`` hook does not see the host model's config.
+
+        Nested models reachable from the fields are processed too (their
+        ``$defs`` entries), since a caller that cannot omit keys cannot omit
+        them in nested items either. Each host's ``model_json_schema()``
+        produces its own ``$defs`` copy, so this never leaks into the schema of
+        the nested model itself or of hosts with the switch off.
+        """
+        json_schema = super().model_json_schema(*args, **kwargs)
+        config = typing.cast(Mapping[str, Any], cls.model_config)
+        if not config.get('omitted_sentinel', False):
+            return json_schema
+
+        def _inject(props: object, model: type[BaseModel]) -> None:
+            """Inject the sentinel branch into the omissible fields of ``model`` found in ``props``."""
+            if not isinstance(props, dict):
+                return
+            typed_props = typing.cast(dict[str, Any], props)
+            for field_name, field in model.model_fields.items():
+                if not cls.annotation_is_omissible(field.annotation):
+                    continue
+                # With validate_by_name the schema key may be the alias.
+                key = field.alias if field.alias in typed_props else field_name
+                field_schema = typed_props.get(key)
+                if not isinstance(field_schema, dict):
+                    continue
+                # Readability rules (the schema is read by the consumer):
+                # 1. annotation keywords (title / description ...) stay on the
+                #    outer object instead of moving into one anyOf branch;
+                # 2. an existing anyOf is extended rather than nested again.
+                typed = typing.cast(dict[str, Any], field_schema)
+                notes = {k: v for k, v in typed.items() if k in SCHEMA_ANNOTATION_KEYS}
+                constraints = {k: v for k, v in typed.items() if k not in SCHEMA_ANNOTATION_KEYS}
+                existing = constraints.pop('anyOf', None)
+                branches = list(existing) if isinstance(existing, list) else [constraints]
+                typed_props[key] = {
+                    **notes,
+                    'anyOf': [*branches, SENTINEL_SCHEMA_BRANCH],
+                    'default': OMITTED_SENTINEL,
+                }
+
+        _inject(json_schema.get('properties'), cls)
+
+        defs = json_schema.get('$defs')
+        if not isinstance(defs, dict):
+            return json_schema
+
+        # Collect nested models from the annotations and pair them with $defs by
+        # class name. ``seen`` guards against self-referencing models. The host
+        # itself is included: a self-referencing host's schema is a bare
+        # ``$ref`` into ``$defs`` with no top-level ``properties``.
+        nested_by_name: dict[str, type[BaseModel]] = {cls.__name__: cls}
+        seen: set[type[BaseModel]] = {cls}
+        stack: list[type[BaseModel]] = [cls]
+        while stack:
+            for field in stack.pop().model_fields.values():
+                pending: list[object] = [field.annotation]
+                while pending:
+                    candidate = pending.pop()
+                    pending.extend(get_args(candidate))
+                    if (isinstance(candidate, type) and issubclass(candidate, BaseModel)
+                            and candidate not in seen):
+                        seen.add(candidate)
+                        stack.append(candidate)
+                        nested_by_name[candidate.__name__] = candidate
+
+        for def_name, def_schema in typing.cast(dict[str, Any], defs).items():
+            nested = nested_by_name.get(def_name)
+            if nested is not None and isinstance(def_schema, dict):
+                _inject(typing.cast(dict[str, Any], def_schema).get('properties'), nested)
+        return json_schema
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """Discover, at class creation, the fields that need the construction-time JSON check (see ``__orjson_checked_fields__``)."""
+        super().__pydantic_init_subclass__(**kwargs)
+        cls.__orjson_checked_fields__ = tuple(
+            name for name, field_info in cls.model_fields.items()
+            if _annotation_contains_orjson_checked_type(field_info.annotation)
+        )
+
+    def model_post_init(self, context: Any, /) -> None:
+        """
+        Construction-time invariant: ``JSON100K`` / ``JSONList100K`` values must be encodable and within the size limit.
+
+        Deeply nested values (``orjson.loads`` accepts far deeper nesting than
+        the serializers do) would otherwise be stored silently and only fail
+        later in ``model_dump(mode='json')`` / flush, far from where the input
+        entered -- typically when raw external JSON is used to construct a
+        table row directly, bypassing DTO validation. See
+        ``ensure_json_within_limits``.
+
+        ORM loads from the database do not go through ``__init__`` and pay
+        nothing; models without such fields iterate an empty tuple.
+        """
+        super().model_post_init(context)
+        for field_name in self.__orjson_checked_fields__:
+            value = getattr(self, field_name)
+            # Neither ``Unset`` (not provided) nor ``None`` has content to check.
+            # Non-empty ``__orjson_checked_fields__`` implies orjson is installed.
+            if value is not Unset and value is not None and _ensure_json_within_limits is not None:
+                _ensure_json_within_limits(value)
 
     @classmethod
     def __get_pydantic_json_schema__(
@@ -1477,6 +1824,34 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
         fields = cls.model_computed_fields
         return set(fields.keys()) if fields else set()
 
+    def submitted_fields_among(self, *models: type['SQLModelBase']) -> set[str]:
+        """
+        Return the explicitly submitted fields (``model_fields_set``) that belong to any of ``models``.
+
+        Pure set arithmetic: ``self.model_fields_set`` intersected with the union
+        of the ``models``' field names. It carries no "forbidden" semantics --
+        the caller decides what a hit means. A typical use is privilege checks
+        on a shared update body: pass a model declaring the admin-only fields
+        and reject the request if a non-admin submitted any of them::
+
+            class ItemAdminOnlyFields(SQLModelBase):
+                is_featured: bool
+
+            class ItemAdminUpdate(ItemAdminOnlyFields, ItemUpdate, partial=True):
+                pass
+
+            forbidden = body.submitted_fields_among(ItemAdminOnlyFields)
+            if forbidden and not user.is_admin:
+                raise PermissionError(sorted(forbidden))
+
+        :param models: model classes providing field names (union of their ``model_fields``)
+        :returns: the matching field names (empty set = no overlap)
+        """
+        field_names: set[str] = set()
+        for model in models:
+            field_names.update(model.model_fields)
+        return self.model_fields_set & field_names
+
 
 class ExtraIgnoreModelBase(SQLModelBase):
     """
@@ -1494,7 +1869,7 @@ class ExtraIgnoreModelBase(SQLModelBase):
     (those should keep 'forbid' to catch mistakes).
     """
 
-    model_config = ConfigDict(
+    model_config = SQLModelExtConfig(
         use_attribute_docstrings=True, validate_by_name=True, extra='ignore',
     )
 
@@ -1506,6 +1881,9 @@ class ExtraIgnoreModelBase(SQLModelBase):
 
         Logs a WARNING before Pydantic's extra='ignore' discards unknown fields,
         helping developers notice third-party API changes and add field definitions.
+        Field names, ``alias`` and ``validation_alias`` (a string or every string
+        choice of an ``AliasChoices``) count as known keys; ``AliasPath`` entries
+        are nested paths, not top-level keys, and are ignored.
         """
         if not isinstance(data, dict):
             return data
@@ -1514,8 +1892,11 @@ class ExtraIgnoreModelBase(SQLModelBase):
             accepted.add(name)
             if field_info.alias:
                 accepted.add(field_info.alias)
-            if field_info.validation_alias and isinstance(field_info.validation_alias, str):
-                accepted.add(field_info.validation_alias)
+            validation_alias = field_info.validation_alias
+            if isinstance(validation_alias, str):
+                accepted.add(validation_alias)
+            elif isinstance(validation_alias, AliasChoices):
+                accepted.update(c for c in validation_alias.choices if isinstance(c, str))
         unknown = set(data.keys()) - accepted
         if unknown:
             total = len(unknown)

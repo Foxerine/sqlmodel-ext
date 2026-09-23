@@ -2,18 +2,32 @@
 Table Base Mixins -- async CRUD operations.
 
 Provides TableBaseMixin and UUIDTableBaseMixin with full async CRUD,
-pagination, polymorphic query support, relationship preloading,
-FOR UPDATE tracking, and type-safe helper functions.
+pagination (offset and ``after_id`` keyset), polymorphic query support,
+relationship preloading, FOR UPDATE tracking, aggregation helpers, and
+type-safe helper functions.
 """
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
-from typing import TypeVar, Literal, override, overload, Any, ClassVar, cast
+from decimal import Decimal
+from typing import TypeVar, Literal, override, overload, Any, ClassVar, Generic, cast
 
-from sqlalchemy import DateTime, ColumnElement, desc, asc, func, distinct, delete as sql_delete, inspect
+from sqlalchemy import DateTime, ColumnElement, desc, asc, event, func, distinct, delete as sql_delete, inspect
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import InstanceState, selectinload, with_polymorphic, QueryableAttribute, Mapper, RelationshipProperty
+from sqlalchemy.orm import (
+    InstanceState,
+    Mapped,
+    Mapper,
+    QueryableAttribute,
+    RelationshipProperty,
+    Session as _SyncSession,
+    SessionTransaction,
+    selectinload,
+    with_polymorphic,
+)
+from sqlalchemy.orm.util import AliasedClass
 from sqlalchemy.sql.base import ExecutableOption
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Field, select, col
@@ -23,12 +37,21 @@ from sqlalchemy.ext.asyncio import AsyncAttrs
 
 from sqlmodel_ext._utils import now, now_date
 from sqlmodel_ext._exceptions import RecordNotFoundError
-from sqlmodel_ext.mixins.optimistic_lock import OptimisticLockError
+from sqlmodel_ext.field_types import NonNegativeBigInt
+from sqlmodel_ext.mixins._uuid import uuid7
+from sqlmodel_ext.mixins.exceptions import (
+    FK_DELETE_RESTRICT_FALLBACK_MESSAGE,
+    KeysetCursorInvalidError,
+    KeysetCursorUnsupportedError,
+    ResourceReferencedError,
+)
+from sqlmodel_ext.mixins.optimistic_lock import OPTIMISTIC_LOCK_VERSION_COLUMN, OptimisticLockError
 from sqlmodel_ext.mixins.polymorphic import PolymorphicBaseMixin
 from sqlmodel_ext.base import SQLModelBase
 from sqlmodel_ext.pagination import (
     ListResponse,
     TimeFilterRequest,
+    PageWindowRequest,
     PaginationRequest,
     TableViewRequest,
 )
@@ -44,19 +67,109 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="TableBaseMixin")
 M = TypeVar("M", bound="SQLModelBase")
+GK = TypeVar("GK")
+"""Group key type of ``group_sum`` (str / datetime / ... depending on ``group_by``)."""
+V = TypeVar("V")
+"""Column value type of ``distinct_column`` (UUID / str / ... depending on ``column``)."""
 
 # FOR UPDATE tracking: get(with_for_update=True) records id(instance) to session.info,
 # for runtime checking by the @requires_for_update decorator.
 SESSION_FOR_UPDATE_KEY = '_for_update_locked'
-"""Key in session.info storing the set of id() values for FOR UPDATE locked instances."""
+"""Key in session.info storing the set of id() values for FOR UPDATE locked instances.
+
+Lifecycle (maintained by the session event listeners below, independent of
+caching): the outermost commit / rollback clears it (row locks are released
+with the transaction); a savepoint rollback restores the snapshot taken when
+the savepoint began (PostgreSQL releases locks acquired inside it); a
+savepoint release keeps it (PostgreSQL keeps those locks). The enhanced
+``AsyncSession.reset()`` / ``close()`` clear it as well."""
+
+SESSION_REPEATABLE_READ_KEY = '_repeatable_read_verified'
+"""Key in session.info marking "this session's isolation level has been *verified* to be REPEATABLE READ".
+
+Written by ``AsyncSession.enter_repeatable_read()`` only **after** reading the
+level back from the database: if ``session.connection(execution_options=
+{'isolation_level': ...})`` is called after the session already executed SQL,
+SQLAlchemy only emits a ``SAWarning`` and silently keeps the old level -- so
+"I requested it" must never be recorded as "it is in effect". Consumed by
+``@requires_repeatable_read``; cleared by ``AsyncSession.reset()`` / ``close()``
+(the connection returns to the pool and its isolation level is reset)."""
+
+# Savepoint-level FOR UPDATE lock snapshot stack: every nested (savepoint)
+# transaction pushes a copy of SESSION_FOR_UPDATE_KEY at its start; a nested
+# rollback restores the top snapshot (drops locks taken inside the savepoint,
+# keeps the ones held before it -- PostgreSQL's ROLLBACK TO SAVEPOINT
+# semantics); a nested commit (RELEASE) only pops (PostgreSQL keeps the locks).
+_SESSION_LOCK_SNAPSHOT_STACK = '_for_update_snapshot_stack'
+# Marks "this nested end was already handled by after_commit/after_rollback",
+# so after_transaction_end can tell a normal savepoint commit/rollback apart
+# from a savepoint closed via close() (which only fires the end event).
+_SESSION_NESTED_LOCK_HANDLED = '_nested_savepoint_lock_handled'
 
 
-# NOTE: ``safe_reset`` has been removed -- its responsibility (reset + clearing
-# the FOR UPDATE / cache-invalidation tracking keys) moved into
-# ``sqlmodel_ext.session.AsyncSession.reset()`` (the enhanced session type).
-# Callers simply ``await session.reset()``; no manual wrapper needed.
-# SESSION_FOR_UPDATE_KEY is still written by get(with_for_update=True) and
-# cleared by the enhanced reset().
+def _on_lock_tracking_commit(session: _SyncSession) -> None:
+    """``after_commit``: release (outermost) or keep (savepoint RELEASE) the tracked FOR UPDATE locks."""
+    if session.in_nested_transaction():
+        # RELEASE SAVEPOINT: PostgreSQL keeps the savepoint's row locks (they
+        # move to the parent transaction) -- only pop the snapshot stack.
+        stack: list[set[int]] = session.info.get(_SESSION_LOCK_SNAPSHOT_STACK, [])
+        if stack:
+            stack.pop()
+        session.info[_SESSION_NESTED_LOCK_HANDLED] = True
+        return
+    session.info.pop(SESSION_FOR_UPDATE_KEY, None)
+    session.info.pop(_SESSION_LOCK_SNAPSHOT_STACK, None)
+    session.info.pop(_SESSION_NESTED_LOCK_HANDLED, None)
+
+
+def _on_lock_tracking_rollback(session: _SyncSession) -> None:
+    """``after_rollback``: restore the savepoint snapshot (nested) or clear everything (outermost)."""
+    if session.in_nested_transaction():
+        # ROLLBACK TO SAVEPOINT releases locks acquired inside the savepoint
+        # and keeps earlier ones: restore the snapshot instead of clearing all
+        # (clearing would forget locks the caller took before the savepoint).
+        stack: list[set[int]] = session.info.get(_SESSION_LOCK_SNAPSHOT_STACK, [])
+        if stack:
+            session.info[SESSION_FOR_UPDATE_KEY] = stack.pop()
+        else:
+            session.info.pop(SESSION_FOR_UPDATE_KEY, None)
+        session.info[_SESSION_NESTED_LOCK_HANDLED] = True
+        return
+    session.info.pop(SESSION_FOR_UPDATE_KEY, None)
+    session.info.pop(_SESSION_LOCK_SNAPSHOT_STACK, None)
+    session.info.pop(_SESSION_NESTED_LOCK_HANDLED, None)
+
+
+def _on_lock_tracking_transaction_create(session: _SyncSession, transaction: SessionTransaction) -> None:
+    """``after_transaction_create``: snapshot the lock set when a savepoint begins."""
+    if transaction.nested:
+        stack: list[set[int]] = session.info.setdefault(_SESSION_LOCK_SNAPSHOT_STACK, [])
+        stack.append(set(session.info.get(SESSION_FOR_UPDATE_KEY, set())))
+
+
+def _on_lock_tracking_transaction_end(session: _SyncSession, transaction: SessionTransaction) -> None:
+    """``after_transaction_end``: fallback for a savepoint ended via ``close()``.
+
+    Normal savepoint commit/rollback were handled by the handlers above (they
+    set ``_SESSION_NESTED_LOCK_HANDLED``). A savepoint ended by ``close()``
+    fires only this event: restore the snapshot conservatively (drop inner
+    locks -- fail-closed, forces re-locking) and keep the stack balanced.
+    """
+    if not transaction.nested:
+        return
+    if session.info.pop(_SESSION_NESTED_LOCK_HANDLED, False):
+        return
+    stack: list[set[int]] = session.info.get(_SESSION_LOCK_SNAPSHOT_STACK, [])
+    if stack:
+        session.info[SESSION_FOR_UPDATE_KEY] = stack.pop()
+    else:
+        session.info.pop(SESSION_FOR_UPDATE_KEY, None)
+
+
+event.listen(_SyncSession, "after_commit", _on_lock_tracking_commit)
+event.listen(_SyncSession, "after_rollback", _on_lock_tracking_rollback)
+event.listen(_SyncSession, "after_transaction_create", _on_lock_tracking_transaction_create)
+event.listen(_SyncSession, "after_transaction_end", _on_lock_tracking_transaction_end)
 
 
 # NOTE(SQLModel typing): load parameter uses QueryableAttribute[Any] (InstrumentedAttribute at runtime).
@@ -104,6 +217,30 @@ def cond(expr: ColumnElement[bool] | bool) -> ColumnElement[bool]:
     return cast(ColumnElement[bool], expr)
 
 
+class GroupSumRow(SQLModelBase, Generic[GK]):
+    """One aggregated group returned by ``TableBaseMixin.group_sum`` (one row per GROUP BY group).
+
+    ``totals`` is a homogeneous ``Decimal`` list aligned **by position** with
+    the ``sum_columns`` argument of ``group_sum`` (``totals[0]`` is the sum of
+    ``sum_columns[0]`` and so on) -- a variable number of sum columns cannot
+    be named in advance, and positional alignment avoids ``.label()`` strings
+    while staying typed.
+
+    Note:
+        Inherits ``SQLModelBase`` (unlike ``ListResponse``): it is only a
+        method return value and never enters OpenAPI, so SQLModel's generic
+        JSON-schema limitation does not apply.
+    """
+    key: GK
+    """Group key value (value of the ``group_by`` column / expression); ``None`` for whole-table aggregation."""
+
+    count: NonNegativeBigInt
+    """Number of rows in the group (``COUNT(*)``)."""
+
+    totals: list[Decimal]
+    """``COALESCE(SUM(col), 0)`` of each sum column, in ``sum_columns`` order."""
+
+
 class TableBaseMixin(AsyncAttrs):
     """
     Async CRUD operations base mixin for SQLModel models.
@@ -111,7 +248,8 @@ class TableBaseMixin(AsyncAttrs):
     Must be used together with SQLModelBase.
 
     Provides ``add()``, ``save()``, ``update()``, ``delete()``, ``get()``,
-    ``get_one()``, ``get_exist_one()``, ``count()``, and ``get_with_count()`` methods.
+    ``get_one()``, ``get_exist_one()``, ``count()``, ``get_with_count()``,
+    ``distinct_column()`` and ``group_sum()`` methods.
 
     Attributes:
         id: Integer primary key, auto-increment.
@@ -120,6 +258,23 @@ class TableBaseMixin(AsyncAttrs):
     """
     _has_table_mixin: ClassVar[bool] = True
     """Internal flag marking TableBaseMixin inheritance."""
+
+    __optimistic_retry_default__: ClassVar[int] = 0
+    """Retry count used by ``save()`` / ``update()`` when ``optimistic_retry_count`` is not passed (``None``).
+
+    The base class uses **0**: on a model without optimistic locking a
+    ``StaleDataError`` can only mean "the UPDATE matched 0 rows = the row no
+    longer exists", and retrying would only re-raise "record deleted".
+
+    ``OptimisticLockMixin`` overrides it with a non-zero value -- the policy
+    lives where the capability is declared instead of relying on every call
+    site to remember the argument. MRO requirement: ``OptimisticLockMixin``
+    must come **before** ``TableBaseMixin`` / ``UUIDTableBaseMixin``.
+
+    Only ``save()`` / ``update()`` use this policy. ``delete()`` intentionally
+    never retries ("someone just changed it -- do I still want to delete it?"
+    is the caller's decision); it only normalizes a conflict into
+    ``OptimisticLockError``."""
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Accept and forward keyword arguments from subclass definitions."""
@@ -156,10 +311,31 @@ class TableBaseMixin(AsyncAttrs):
     """UNIQUE constraint name -> user-facing message"""
 
     _FOREIGN_KEY_VIOLATION_MESSAGES: ClassVar[dict[str, str]] = {}
-    """FK constraint name -> user-facing message"""
+    """FK constraint name -> user-facing message ("the referenced resource does not exist" direction)"""
 
     _CHECK_VIOLATION_MESSAGES: ClassVar[dict[str, str]] = {}
     """Declared CHECK constraint name -> user-facing message (trigger-raised check_violation does not go through here)"""
+
+    _FK_DELETE_RESTRICT_MESSAGES: ClassVar[dict[str, str]] = {}
+    """FK constraint name -> user-facing message when **deleting** this row is rejected because it is still referenced.
+
+    Not the same as ``_FOREIGN_KEY_VIOLATION_MESSAGES``: both are keyed by the
+    same constraint name but serve **opposite directions**:
+
+    ======================  ==========================================  =========
+    Direction               Trigger                                     Semantics
+    ======================  ==========================================  =========
+    points at missing row   INSERT/UPDATE a child whose FK target is    404
+                            gone
+    still referenced        DELETE a parent still referenced by a       409
+                            child (RESTRICT / NO ACTION)
+    ======================  ==========================================  =========
+
+    The driver exception is identical in both directions, so the direction
+    is decided by the **call site**: only a violation caught by
+    :meth:`TableBaseMixin.delete` (and caused by a DELETE statement) consults
+    this registry.
+    """
 
     @staticmethod
     def register_unique_violation_message(constraint_name: str, friendly_message: str) -> None:
@@ -204,6 +380,26 @@ class TableBaseMixin(AsyncAttrs):
         _ = TableBaseMixin._CHECK_VIOLATION_MESSAGES.setdefault(constraint_name, friendly_message)
 
     @staticmethod
+    def register_fk_delete_restrict_message(constraint_name: str, friendly_message: str) -> None:
+        """Declare the message returned when deleting a row is rejected because it is still referenced (409 semantics).
+
+        Call it next to the **referenced parent** model (same convention as
+        ``register_unique_violation_message``). Unregistered constraints fall
+        back to :data:`FK_DELETE_RESTRICT_FALLBACK_MESSAGE`; the registry only
+        decides *what to say*, never the direction.
+
+        :param constraint_name: FK constraint name; must match the database
+            name **exactly** -- a typo silently falls back to the generic
+            message (a lookup miss is not an error). Verify the real name from
+            the running database (e.g. the ``constraint=`` field of the
+            warning logged by ``delete()``), not from a schema created with
+            ``create_all``: migrations may have named constraints differently.
+        :param friendly_message: User-facing message; should state the next
+            actionable step and must not contain table/column names.
+        """
+        _ = TableBaseMixin._FK_DELETE_RESTRICT_MESSAGES.setdefault(constraint_name, friendly_message)
+
+    @staticmethod
     def lookup_unique_violation_message(constraint_name: str | None) -> str | None:
         """Look up the friendly message for a UNIQUE constraint; returns None if missing/unregistered."""
         if not constraint_name:
@@ -223,6 +419,17 @@ class TableBaseMixin(AsyncAttrs):
         if not constraint_name:
             return None
         return TableBaseMixin._CHECK_VIOLATION_MESSAGES.get(constraint_name)
+
+    @staticmethod
+    def lookup_fk_delete_restrict_message(constraint_name: str | None) -> str | None:
+        """Look up the "delete rejected, still referenced" message; returns None if missing/unregistered.
+
+        Only :meth:`delete` should call it -- only there is the direction
+        known to be "still referenced" (see ``_FK_DELETE_RESTRICT_MESSAGES``).
+        """
+        if not constraint_name:
+            return None
+        return TableBaseMixin._FK_DELETE_RESTRICT_MESSAGES.get(constraint_name)
 
     @staticmethod
     def extract_trigger_message(orig: BaseException) -> str:
@@ -258,6 +465,8 @@ class TableBaseMixin(AsyncAttrs):
            it directly via ``extract_trigger_message``.
         3. Fallback: log the raw error and return ``default_message``.
 
+        The registry lookup itself is :meth:`lookup_integrity_violation_message`.
+
         Note: SQLSTATE values are PostgreSQL-specific. For other databases, only
         ``default_message`` will be returned for non-trigger constraint errors.
 
@@ -266,39 +475,80 @@ class TableBaseMixin(AsyncAttrs):
             is not a trigger-raised check_violation
         :returns: A user-safe error description
         """
-        orig = e.orig
-        if orig is None:
-            logger.warning(f"Data integrity constraint error (no orig): {e}")
-            return default_message
+        friendly = TableBaseMixin.lookup_integrity_violation_message(e)
+        if friendly is not None:
+            return friendly
 
-        sqlstate = getattr(orig, 'sqlstate', None)
-        constraint = getattr(orig, 'constraint_name', None)
-
-        if sqlstate == '23505':  # UniqueViolation
-            friendly = TableBaseMixin.lookup_unique_violation_message(constraint)
-            if friendly is not None:
-                return friendly
-        elif sqlstate == '23503':  # ForeignKeyViolation
-            friendly = TableBaseMixin.lookup_foreign_key_violation_message(constraint)
-            if friendly is not None:
-                return friendly
-        elif sqlstate == '23514':  # CheckViolation
-            if constraint:
-                # Declared CheckConstraint: only return a registered friendly message;
-                # do not surface the raw message (CheckConstraint expressions may
-                # contain column names).
-                friendly = TableBaseMixin.lookup_check_violation_message(constraint)
-                if friendly is not None:
-                    return friendly
-            else:
-                # Trigger RAISE EXCEPTION: the message is already a user-facing string,
-                # surface it directly.
-                trigger_msg = TableBaseMixin.extract_trigger_message(orig)
-                if trigger_msg:
-                    return trigger_msg
-
+        sqlstate, constraint = TableBaseMixin._extract_violation_identity(e)
         logger.warning(f"Data integrity constraint error: constraint={constraint}, sqlstate={sqlstate}, orig={e}")
         return default_message
+
+    @staticmethod
+    def _extract_violation_identity(e: IntegrityError) -> tuple[str | None, str | None]:
+        """Return ``(sqlstate, constraint_name)`` of an ``IntegrityError``.
+
+        SQLAlchemy's asyncpg adapter keeps the real asyncpg exception in
+        ``orig.__cause__`` (the adapter wrapper only forwards ``sqlstate``,
+        not ``constraint_name``), so the constraint name falls back to
+        ``orig.__cause__`` -- otherwise every registry lookup would miss.
+
+        Either value may be ``None`` (no ``orig`` / non-PostgreSQL error /
+        trigger-raised error without a constraint name).
+        """
+        orig = e.orig
+        if orig is None:
+            return None, None
+        sqlstate = getattr(orig, 'sqlstate', None)
+        constraint = getattr(orig, 'constraint_name', None)
+        if constraint is None:
+            constraint = getattr(orig.__cause__, 'constraint_name', None)
+        return sqlstate, constraint
+
+    @staticmethod
+    def lookup_integrity_violation_message(e: IntegrityError) -> str | None:
+        """Look up the registries: return the **registered business message** on hit, ``None`` otherwise.
+
+        Division of labor with ``sanitize_integrity_error``: this method
+        answers "is this constraint a business case the developer registered
+        in advance?", ``sanitize_*`` adds a fallback message on top. Callers
+        that must branch on hit/miss (e.g. classifying user errors vs.
+        platform errors) must use this method -- ``sanitize_*`` collapses both
+        cases into a string.
+
+        Pure lookup: no side effects, no logging (log in the caller's context).
+
+        Hit rules match ``sanitize_integrity_error``: ``UniqueViolation``
+        (23505) / ``ForeignKeyViolation`` (23503) / declared
+        ``CheckConstraint`` (23514 *with* ``constraint_name``) consult their
+        registries; a trigger ``RAISE EXCEPTION`` (23514 *without*
+        ``constraint_name``) carries a developer-written user-facing message
+        and counts as a hit.
+        """
+        sqlstate, constraint = TableBaseMixin._extract_violation_identity(e)
+        if sqlstate is None:
+            return None
+
+        if sqlstate == '23505':  # UniqueViolation
+            return TableBaseMixin.lookup_unique_violation_message(constraint)
+        if sqlstate == '23503':  # ForeignKeyViolation
+            return TableBaseMixin.lookup_foreign_key_violation_message(constraint)
+        if sqlstate == '23514':  # CheckViolation
+            if constraint:
+                # Declared CheckConstraint: only return a registered friendly
+                # message; never surface the raw message (CheckConstraint
+                # expressions may contain column names).
+                return TableBaseMixin.lookup_check_violation_message(constraint)
+            # Trigger RAISE EXCEPTION: the message is already user-facing.
+            # Read it from the real driver exception (``__cause__``) when
+            # present -- ``str(adapter_error)`` is prefixed with the driver
+            # exception class name, which must not leak to users.
+            orig = e.orig
+            if orig is None:
+                return None
+            source = orig.__cause__ if orig.__cause__ is not None else orig
+            trigger_msg = TableBaseMixin.extract_trigger_message(source)
+            return trigger_msg if trigger_msg else None
+        return None
 
     @classmethod
     async def add(
@@ -358,7 +608,7 @@ class TableBaseMixin(AsyncAttrs):
             refresh: bool = True,
             commit: bool = True,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
-            optimistic_retry_count: int = 0,
+            optimistic_retry_count: int | None = None,
     ) -> T:
         """
         Save (insert or update) this instance to the database.
@@ -369,18 +619,34 @@ class TableBaseMixin(AsyncAttrs):
             client = await client.save(session)
             return client
 
+        ``updated_at`` is assigned explicitly whenever a persistent instance
+        has column changes (not only via the column-level ``onupdate``): under
+        joined-table inheritance an update that touches only subclass-table
+        columns would otherwise never UPDATE the parent table that holds
+        ``updated_at``.
+
         :param session: Async database session
         :param load: Relationship(s) to eagerly load after save
         :param refresh: Whether to refresh the object after save (default True)
         :param commit: Whether to commit (default True). Set False for batch operations.
         :param jti_subclasses: Polymorphic subclass loading option (requires load)
-        :param optimistic_retry_count: Auto-retry count for optimistic lock conflicts (default 0)
+        :param optimistic_retry_count: Auto-retry count for optimistic lock
+            conflicts. ``None`` (default) uses the model policy
+            ``__optimistic_retry_default__`` (3 for ``OptimisticLockMixin``
+            models, 0 otherwise); an explicit ``0`` demands no retry. A retry
+            re-reads the row and re-applies only the columns this instance
+            actually modified.
         :returns: The refreshed instance (if refresh=True), otherwise self
         :raises OptimisticLockError: Version mismatch after retries exhausted
         """
         cls = type(self)
         instance = self
-        retries_remaining = optimistic_retry_count
+        # None = not specified -> model policy. An explicit 0 still means "no
+        # retry", so the default cannot be written as 0.
+        retries_remaining = (
+            optimistic_retry_count if optimistic_retry_count is not None
+            else cls.__optimistic_retry_default__
+        )
         current_data: dict[str, Any] | None = None
 
         while True:
@@ -392,8 +658,8 @@ class TableBaseMixin(AsyncAttrs):
             # be expired by an earlier commit, so plain getattr could emit SQL.
             _pre_insp = cast(InstanceState[Any], inspect(instance))
             instance_id = _pre_insp.identity[0] if _pre_insp.identity else instance.__dict__.get('id')
-            instance_version = instance.__dict__.get('version')
-            if optimistic_retry_count > 0 and current_data is None:
+            instance_version = instance.__dict__.get(OPTIMISTIC_LOCK_VERSION_COLUMN)
+            if retries_remaining > 0 and current_data is None:
                 # Capture only the columns the caller actually modified (via
                 # SQLAlchemy attribute history). Re-applying a full model_dump
                 # on retry would overwrite the other transaction's committed
@@ -403,12 +669,22 @@ class TableBaseMixin(AsyncAttrs):
                 _hist_insp = cast(InstanceState[Any], inspect(instance))
                 current_data = {}
                 for _col_attr in _hist_insp.mapper.column_attrs:
-                    if _col_attr.key in ('id', 'version', 'created_at', 'updated_at'):
+                    if _col_attr.key in ('id', OPTIMISTIC_LOCK_VERSION_COLUMN, 'created_at', 'updated_at'):
                         continue
                     if _hist_insp.attrs[_col_attr.key].history.has_changes():
                         current_data[_col_attr.key] = _hist_insp.attrs[_col_attr.key].value
 
             session.add(instance)
+            # Explicit assignment instead of relying on the column-level
+            # onupdate: under JTI an update touching only subclass columns
+            # never UPDATEs the parent table, so its onupdate would not fire.
+            # Only for persistent instances (INSERT timestamps come from the
+            # field defaults) whose column attributes actually changed
+            # (include_collections=False ignores pure collection changes that
+            # would not UPDATE this row).
+            _save_state = cast(InstanceState[Any], inspect(instance))
+            if _save_state.persistent and session.is_modified(instance, include_collections=False):
+                instance.updated_at = now()
             try:
                 if commit:
                     await session.commit()
@@ -421,22 +697,22 @@ class TableBaseMixin(AsyncAttrs):
                     raise OptimisticLockError(
                         message=f"{cls.__name__} optimistic lock conflict: record modified by another transaction",
                         model_class=cls.__name__,
-                        record_id=str(instance_id),
+                        record_id=str(instance_id) if instance_id is not None else None,
                         expected_version=instance_version,
                         original_error=e,
                     ) from e
 
                 retries_remaining -= 1
-                fresh = await cls.get(session, cls.id == instance_id)
+                fresh = await cls.get(session, cls.id == instance_id) if instance_id is not None else None
                 if fresh is None:
                     raise OptimisticLockError(
                         message=f"{cls.__name__} retry failed: record has been deleted",
                         model_class=cls.__name__,
-                        record_id=str(instance_id),
+                        record_id=str(instance_id) if instance_id is not None else None,
                         original_error=e,
                     ) from e
 
-                for key, value in current_data.items():
+                for key, value in (current_data or {}).items():
                     if hasattr(fresh, key):
                         setattr(fresh, key, value)
                 instance = fresh
@@ -465,7 +741,7 @@ class TableBaseMixin(AsyncAttrs):
             refresh: bool = True,
             commit: bool = True,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
-            optimistic_retry_count: int = 0,
+            optimistic_retry_count: int | None = None,
     ) -> T:
         """
         Update this instance using data from another model instance.
@@ -473,23 +749,37 @@ class TableBaseMixin(AsyncAttrs):
         **Important**: After calling this method, all session objects expire.
         Always use the return value.
 
+        ``updated_at`` is assigned explicitly for every non-empty update (see
+        ``save()`` for the joined-table-inheritance rationale); an empty update
+        (no data and no ``extra_data``) leaves it untouched.
+
         :param session: Async database session
         :param other: Model instance whose data will be merged into self
         :param extra_data: Additional dict of fields to update
-        :param exclude_unset: If True, skip unset fields from other (default True)
+        :param exclude_unset: If True, only fields explicitly set on ``other``
+            (``model_fields_set``) are applied (default True). An explicitly
+            passed ``None`` counts as set and writes NULL -- build ``other``
+            with only the fields to change if ``None`` must not overwrite.
         :param exclude: Field names to exclude from the update
         :param load: Relationship(s) to eagerly load after update
         :param refresh: Whether to refresh after update (default True)
         :param commit: Whether to commit (default True)
         :param jti_subclasses: Polymorphic subclass loading option (requires load)
-        :param optimistic_retry_count: Auto-retry count for optimistic lock conflicts (default 0)
+        :param optimistic_retry_count: Auto-retry count for optimistic lock
+            conflicts. ``None`` (default) uses the model policy
+            ``__optimistic_retry_default__`` (3 for ``OptimisticLockMixin``
+            models, 0 otherwise); an explicit ``0`` demands no retry. A retry
+            re-reads the row and re-applies ``other``'s changes to it.
         :returns: The refreshed instance
         :raises OptimisticLockError: Version mismatch after retries exhausted
         """
         cls = type(self)
         update_data = other.model_dump(exclude_unset=exclude_unset, exclude=exclude)
         instance = self
-        retries_remaining = optimistic_retry_count
+        retries_remaining = (
+            optimistic_retry_count if optimistic_retry_count is not None
+            else cls.__optimistic_retry_default__
+        )
 
         while True:
             # Snapshot scalar state BEFORE attempting the flush: a failed
@@ -500,10 +790,14 @@ class TableBaseMixin(AsyncAttrs):
             # be expired by an earlier commit, so plain getattr could emit SQL.
             _pre_insp = cast(InstanceState[Any], inspect(instance))
             instance_id = _pre_insp.identity[0] if _pre_insp.identity else instance.__dict__.get('id')
-            instance_version = instance.__dict__.get('version')
+            instance_version = instance.__dict__.get(OPTIMISTIC_LOCK_VERSION_COLUMN)
 
             # TableBaseMixin is always used with SQLModelBase; sqlmodel_update provided by SQLModel
             _ = cast(SQLModelBase, instance).sqlmodel_update(update_data, update=extra_data)
+            if update_data or extra_data:
+                # Explicit assignment (see save()): JTI updates touching only
+                # subclass columns would not fire the parent's onupdate.
+                instance.updated_at = now()
             session.add(instance)
 
             try:
@@ -518,18 +812,18 @@ class TableBaseMixin(AsyncAttrs):
                     raise OptimisticLockError(
                         message=f"{cls.__name__} optimistic lock conflict: record modified by another transaction",
                         model_class=cls.__name__,
-                        record_id=str(instance_id),
+                        record_id=str(instance_id) if instance_id is not None else None,
                         expected_version=instance_version,
                         original_error=e,
                     ) from e
 
                 retries_remaining -= 1
-                fresh = await cls.get(session, cls.id == instance_id)
+                fresh = await cls.get(session, cls.id == instance_id) if instance_id is not None else None
                 if fresh is None:
                     raise OptimisticLockError(
                         message=f"{cls.__name__} retry failed: record has been deleted",
                         model_class=cls.__name__,
-                        record_id=str(instance_id),
+                        record_id=str(instance_id) if instance_id is not None else None,
                         original_error=e,
                     ) from e
                 instance = fresh
@@ -594,6 +888,26 @@ class TableBaseMixin(AsyncAttrs):
         :param commit: Whether to commit after delete (default True)
         :returns: Number of deleted records
         :raises ValueError: If both or neither of instances/condition are provided
+        :raises ResourceReferencedError: A target row is still referenced
+            through a foreign key (``RESTRICT`` / ``NO ACTION``) -- the row
+            **exists** and was not deleted. Raised only when both hold: the
+            ``IntegrityError`` was caught here **and** its ``statement`` is a
+            ``DELETE`` (a commit flushes every pending operation of the
+            session, so an unrelated bad ``INSERT`` surfacing here is
+            re-raised untouched). Only SQL issued *inside* this method is
+            covered: with ``commit=False`` in instance mode the real
+            ``DELETE`` is emitted by the caller's later flush/commit, outside
+            this method. PostgreSQL only (relies on SQLSTATE 23503).
+        :raises OptimisticLockError: an optimistic-lock conflict occurred
+            **within this flush** -- typically the versioned ``DELETE`` of an
+            ``OptimisticLockMixin`` model matched 0 rows. The attribution
+            reach is the whole flush, not the delete target (a co-flushed
+            versioned UPDATE of another object can be the cause), so
+            ``model_class`` is the *calling* model, ``record_id`` is always
+            ``None`` and ``expected_version`` is ``None``. Never retried (see
+            ``__optimistic_retry_default__``). Same ``commit=False`` boundary
+            as above; condition mode never raises it (bulk DELETE has no
+            per-row version check).
         """
         if instances is not None and condition is not None:
             raise ValueError("Cannot provide both instances and condition")
@@ -602,37 +916,74 @@ class TableBaseMixin(AsyncAttrs):
 
         deleted_count = 0
 
-        if condition is not None:
-            # cast to ColumnElement[bool]: at runtime condition is always a column expression
-            stmt = sql_delete(cls).where(cast(ColumnElement[bool], condition))
-            # STI auto-filter: a Core DELETE built from an STI subclass targets the
-            # shared table with no discriminator criteria, so without this filter a
-            # subclass-level conditional delete would also remove sibling-subclass
-            # rows. Mirrors the WHERE discriminator IN (...) logic used by get()/count().
-            if issubclass(cls, PolymorphicBaseMixin) and not cls._is_joined_table_inheritance():
-                mapper = cast(Mapper[Any], inspect(cls))
-                poly_on = mapper.polymorphic_on
-                if poly_on is not None:
-                    descendant_identities = [
-                        m.polymorphic_identity
-                        for m in mapper.self_and_descendants
-                        if m.polymorphic_identity is not None
-                    ]
-                    if descendant_identities:
-                        stmt = stmt.where(poly_on.in_(descendant_identities))
-            result = cast(CursorResult[Any], await session.execute(stmt))
-            deleted_count = result.rowcount
-        else:
-            if isinstance(instances, list):
-                for instance in instances:
-                    await session.delete(instance)
-                deleted_count = len(instances)
+        try:
+            if condition is not None:
+                # cast to ColumnElement[bool]: at runtime condition is always a column expression
+                stmt = sql_delete(cls).where(cast(ColumnElement[bool], condition))
+                # STI auto-filter: a Core DELETE built from an STI subclass targets the
+                # shared table with no discriminator criteria, so without this filter a
+                # subclass-level conditional delete would also remove sibling-subclass
+                # rows. Same discriminator filter as get()/count().
+                sti_condition = cls._sti_descendants_condition()
+                if sti_condition is not None:
+                    stmt = stmt.where(sti_condition)
+                result = cast(CursorResult[Any], await session.execute(stmt))
+                deleted_count = result.rowcount
             else:
-                await session.delete(instances)
-                deleted_count = 1
+                if isinstance(instances, list):
+                    for instance in instances:
+                        await session.delete(instance)
+                    deleted_count = len(instances)
+                else:
+                    await session.delete(instances)
+                    deleted_count = 1
 
-        if commit:
-            await session.commit()
+            if commit:
+                await session.commit()
+        except IntegrityError as e:
+            sqlstate, constraint = TableBaseMixin._extract_violation_identity(e)
+            # "Caught inside delete()" does not prove the direction: the flush
+            # also writes every other pending operation of the session. The
+            # statement that failed does -- ``IntegrityError.statement`` is
+            # generated by SQLAlchemy (independent of server message
+            # language). A missing statement is conservatively not translated.
+            is_delete_stmt = (
+                e.statement is not None
+                and e.statement.lstrip().upper().startswith('DELETE')
+            )
+            if sqlstate == '23503' and is_delete_stmt:  # ForeignKeyViolation caused by a DELETE
+                registered = TableBaseMixin.lookup_fk_delete_restrict_message(constraint)
+                friendly = registered if registered is not None else FK_DELETE_RESTRICT_FALLBACK_MESSAGE
+                logger.warning(
+                    f"Delete rejected by foreign key constraint: model={cls.__name__}, "
+                    f"constraint={constraint}, registered={registered is not None}"
+                )
+                raise ResourceReferencedError(friendly, constraint, e) from e
+            raise
+        except StaleDataError as e:
+            # Optimistic-lock conflict (or concurrent delete) -> OptimisticLockError.
+            # No direction check is needed (unlike IntegrityError): both
+            # possible sources -- this DELETE's version mismatch, or a
+            # co-flushed object's UPDATE matching 0 rows -- mean the same to
+            # the caller: "re-read and decide again".
+            # record_id stays None on purpose: the flush covers the whole
+            # session, so naming the delete target would misattribute a
+            # conflict that may belong to another row.
+            # No rollback: the transaction belongs to the caller.
+            logger.warning(
+                f"Optimistic lock conflict during delete: calling model={cls.__name__}, "
+                f"batch={isinstance(instances, list)} (conflicting row cannot be attributed at flush level)"
+            )
+            raise OptimisticLockError(
+                message=(
+                    f"{cls.__name__}.delete detected a concurrent modification: a record in this "
+                    f"transaction was modified or deleted by another transaction"
+                ),
+                model_class=cls.__name__,
+                record_id=None,
+                expected_version=None,
+                original_error=e,
+            ) from e
 
         return deleted_count
 
@@ -656,6 +1007,114 @@ class TableBaseMixin(AsyncAttrs):
             filters.append(col(cls.updated_at) < updated_before_datetime)
         return filters
 
+    @classmethod
+    def _sti_descendants_condition(cls: type[T]) -> ColumnElement[Any] | None:
+        """The "this class and its subclasses" discriminator filter under STI; ``None`` for non-STI models.
+
+        SQLAlchemy does not add ``WHERE discriminator IN (...)`` to STI
+        subclass queries built this way (see
+        https://github.com/sqlalchemy/sqlalchemy/issues/5018 and
+        https://github.com/fastapi/sqlmodel/issues/488). ``get()``,
+        ``count()``, ``delete(condition=...)``, the keyset anchor lookup and
+        the aggregation helpers share this condition so their visible ranges
+        agree.
+        """
+        if not issubclass(cls, PolymorphicBaseMixin) or cls._is_joined_table_inheritance():
+            return None
+        mapper = cast(Mapper[Any], inspect(cls))
+        poly_on = mapper.polymorphic_on
+        if poly_on is None:
+            return None
+        descendant_identities = [
+            m.polymorphic_identity
+            for m in mapper.self_and_descendants
+            if m.polymorphic_identity is not None
+        ]
+        if not descendant_identities:
+            return None
+        return poly_on.in_(descendant_identities)
+
+    @classmethod
+    async def _build_keyset_condition(
+            cls: type[T],
+            session: AsyncSession,
+            table_view: PaginationRequest,
+            condition: ColumnElement[bool] | bool | None,
+            filter_condition: ColumnElement[bool] | bool | None,
+    ) -> ColumnElement[bool]:
+        """Build the row-value comparison for the ``after_id`` keyset cursor (composite order ``(order column, id)``).
+
+        The anchor's sort value is looked up server-side by primary key --
+        the client only passes ``after_id``, avoiding precision loss when
+        timestamps round-trip (database microseconds vs. transport
+        milliseconds). With ``order='id'`` the id itself is the anchor value
+        and no lookup happens.
+
+        Anchor visibility = ``condition`` + ``filter`` + STI filter (the same
+        WHERE as the main query). Otherwise anyone holding the UUID of a row
+        outside their scope could probe its existence and creation time
+        through the difference between a page and an error (a UUID is an
+        identifier, not a capability). Time filters are not applied to the
+        anchor (a time window is a page boundary, not a visibility boundary).
+        Trade-off: once the anchor is deleted or leaves the filter, the
+        cursor is invalid and the client restarts from the first page.
+
+        Precondition: ``table_view.after_id`` is not None and ``order`` was
+        validated to be immutable (``created_at`` / ``id``).
+
+        :raises KeysetCursorInvalidError: the anchor does not exist **or** is
+            outside the visible range (deliberately indistinguishable).
+        :raises ValueError: the model's primary key is not a UUID (programming error).
+        """
+        after_id = table_view.after_id
+        if after_id is None:
+            raise ValueError("_build_keyset_condition requires table_view.after_id to be set")
+
+        # after_id is a UUID cursor; comparing an int primary key with a UUID
+        # is a type error -- reject explicitly instead of an obscure SQL error.
+        id_column_type = cast(Mapper[Any], inspect(cls)).columns['id'].type.python_type
+        if id_column_type is not uuid.UUID:
+            raise ValueError(
+                f"the after_id keyset cursor only supports UUID primary keys; {cls.__name__}'s "
+                f"primary key is {id_column_type.__name__} -- use offset pagination"
+            )
+
+        id_col = col(cls.id)
+        order_field = table_view.order if table_view.order is not None else 'created_at'
+        if order_field == 'id':
+            return (id_col < after_id) if table_view.desc else (id_col > after_id)
+
+        order_col = col(getattr(cls, order_field))
+        # The anchor query must use the same FROM as the main query, otherwise
+        # its visible range differs:
+        # - JTI base: the main query uses with_polymorphic('*'); a condition
+        #   may reference a subclass column, which with a bare FROM would add
+        #   an unjoined subclass table (cartesian product).
+        # - JTI leaf: the mapper selectable is parent JOIN child.
+        # - STI / plain models: a single table, select_from(cls) is a no-op.
+        anchor_from: type[T] | AliasedClass[T]
+        if issubclass(cls, PolymorphicBaseMixin) and cls._is_joined_table_inheritance():
+            anchor_from = with_polymorphic(cls, '*')
+        else:
+            anchor_from = cls
+        anchor_stmt = select(order_col).select_from(anchor_from).where(id_col == after_id)
+        if condition is not None:
+            anchor_stmt = anchor_stmt.where(condition)
+        if filter_condition is not None:
+            anchor_stmt = anchor_stmt.where(filter_condition)
+        sti_condition = cls._sti_descendants_condition()
+        if sti_condition is not None:
+            anchor_stmt = anchor_stmt.where(sti_condition)
+        anchor_value = await session.scalar(anchor_stmt)
+        if anchor_value is None:
+            raise KeysetCursorInvalidError(
+                f"the record after_id={after_id} does not exist or is outside the visible "
+                "range of this query; the keyset cursor is invalid, restart from the first page"
+            )
+        if table_view.desc:
+            return (order_col < anchor_value) | ((order_col == anchor_value) & (id_col < after_id))
+        return (order_col > anchor_value) | ((order_col == anchor_value) & (id_col > after_id))
+
     @overload
     @classmethod
     async def get(
@@ -672,9 +1131,11 @@ class TableBaseMixin(AsyncAttrs):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -697,9 +1158,11 @@ class TableBaseMixin(AsyncAttrs):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -722,9 +1185,11 @@ class TableBaseMixin(AsyncAttrs):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -746,9 +1211,11 @@ class TableBaseMixin(AsyncAttrs):
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
+            skip_locked: bool = False,
             table_view: TableViewRequest | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
+            authoritative: bool = False,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
@@ -774,22 +1241,49 @@ class TableBaseMixin(AsyncAttrs):
         :param filter: Additional filter condition
         :param with_for_update: Use FOR UPDATE row locking. Locked instances are
             tracked in ``session.info[SESSION_FOR_UPDATE_KEY]`` for
-            ``@requires_for_update`` decorator verification.
-        :param table_view: TableViewRequest for pagination + sorting + time filtering
+            ``@requires_for_update`` decorator verification. A locking read
+            also **forces** ``populate_existing``: the database returns the
+            latest row, but SQLAlchemy's identity map would otherwise hand
+            back an already-loaded object with stale attributes -- a lost
+            update in the subsequent read-modify-write. No opt-out.
+        :param skip_locked: ``FOR UPDATE SKIP LOCKED`` -- skip rows locked by
+            other transactions instead of waiting. Only meaningful with
+            ``with_for_update=True`` (ignored otherwise). Intended for work
+            queues where N workers each claim a *different* candidate row;
+            without it they queue up on the same row. Note that "0 rows"
+            then also means "all candidates are locked by others", so never
+            use it for existence checks.
+        :param table_view: TableViewRequest for pagination + sorting + time
+            filtering (explicit arguments take precedence). ``order`` is
+            always completed with ``id`` as a same-direction tie-break;
+            ``after_id`` applies the keyset cursor (mutually exclusive with an
+            explicit ``order_by`` or ``join`` -> ``KeysetCursorUnsupportedError``).
         :param jti_subclasses: Polymorphic subclass loading (requires load param)
-        :param populate_existing: Force overwrite identity map objects with DB data
+        :param populate_existing: Force overwrite identity map objects with DB
+            data (lock-free bulk refresh). Not needed with ``with_for_update``.
+        :param authoritative: The single switch for **authorization reads**
+            ("the result decides whether to allow something, it must be
+            authoritative"). At this layer it equals ``populate_existing=True``
+            (bypass possibly stale identity-map objects); cached models
+            additionally bypass Redis. Merged monotonically: the effective
+            value is ``populate_existing or authoritative``.
         :param created_before_datetime: Filter created_at < datetime
         :param created_after_datetime: Filter created_at >= datetime
         :param updated_before_datetime: Filter updated_at < datetime
         :param updated_after_datetime: Filter updated_at >= datetime
         :returns: Single instance, list, or None depending on fetch_mode
         :raises ValueError: Invalid fetch_mode or jti_subclasses without load
+        :raises KeysetCursorInvalidError: ``after_id`` anchor missing / not visible
+        :raises KeysetCursorUnsupportedError: ``after_id`` combined with ``order_by`` or ``join``
         """
         if jti_subclasses is not None and load is None:
             raise ValueError(
                 "jti_subclasses requires the load parameter -- "
                 "specify which relationship to load"
             )
+
+        # keyset cursor condition (after_id), appended after condition
+        keyset_condition: ColumnElement[bool] | None = None
 
         # Apply table_view defaults
         if table_view:
@@ -802,21 +1296,48 @@ class TableBaseMixin(AsyncAttrs):
                     updated_after_datetime = table_view.updated_after_datetime
                 if updated_before_datetime is None and table_view.updated_before_datetime is not None:
                     updated_before_datetime = table_view.updated_before_datetime
-            if isinstance(table_view, PaginationRequest):
+            if isinstance(table_view, PageWindowRequest):
                 if offset is None:
                     offset = table_view.offset
                 if limit is None:
                     limit = table_view.limit
+            if isinstance(table_view, PaginationRequest):
+                # The keyset cursor's no-gap/no-duplicate guarantee depends on
+                # the fixed (order column, id) ordering; a custom order_by or
+                # a join (the anchor lookup has no join) breaks it. The
+                # user-facing message does not reveal which one.
+                if table_view.after_id is not None and order_by is not None:
+                    logger.info(f"keyset cursor rejected: {cls.__name__} query fixes order_by")
+                    raise KeysetCursorUnsupportedError(
+                        "this query does not support the after_id keyset cursor; use offset pagination"
+                    )
+                if table_view.after_id is not None and join is not None:
+                    logger.info(f"keyset cursor rejected: {cls.__name__} query uses join")
+                    raise KeysetCursorUnsupportedError(
+                        "this query does not support the after_id keyset cursor; use offset pagination"
+                    )
                 if order_by is None:
-                    order_col = col(cls.created_at) if table_view.order == "created_at" else col(cls.updated_at)
-                    order_clause: ColumnElement[Any] = desc(order_col) if table_view.desc else asc(order_col)
-                    order_by = [order_clause]
+                    # Resolve the column by name: the order value is constrained
+                    # by the request class's Literal (subclasses may add domain
+                    # sort columns), so it is always a real column.
+                    order_field = table_view.order if table_view.order is not None else 'created_at'
+                    order_col = col(getattr(cls, order_field))
+                    direction = desc if table_view.desc else asc
+                    order_by = [direction(order_col)]
+                    # id tie-break: non-unique sort columns (e.g. rows created
+                    # in one batch share created_at) have no defined order
+                    # among ties, so offset and keyset pages would skip or
+                    # repeat rows at page boundaries. Composite-PK tables
+                    # without an id column are skipped.
+                    if order_field != 'id' and hasattr(cls, 'id'):
+                        order_by.append(direction(col(getattr(cls, 'id'))))
+                if table_view.after_id is not None:
+                    keyset_condition = await cls._build_keyset_condition(session, table_view, condition, filter)
 
         # Polymorphic base class handling
         polymorphic_cls = None
         is_polymorphic = issubclass(cls, PolymorphicBaseMixin)
         is_jti = is_polymorphic and cls._is_joined_table_inheritance()
-        is_sti = is_polymorphic and not cls._is_joined_table_inheritance()
 
         # JTI: always use with_polymorphic (avoids N+1 queries)
         # STI: don't use with_polymorphic
@@ -827,22 +1348,16 @@ class TableBaseMixin(AsyncAttrs):
             statement = select(cls)
 
         # STI auto-filter: SQLAlchemy/SQLModel does NOT auto-add WHERE discriminator
-        # filter for STI sub-class queries. We manually add WHERE _polymorphic_name IN (...)
-        # using mapper.self_and_descendants to include the class and all its children.
-        if is_sti:
-            mapper = cast(Mapper[Any], inspect(cls))
-            poly_on = mapper.polymorphic_on
-            if poly_on is not None:
-                descendant_identities = [
-                    m.polymorphic_identity
-                    for m in mapper.self_and_descendants
-                    if m.polymorphic_identity is not None
-                ]
-                if descendant_identities:
-                    statement = statement.where(poly_on.in_(descendant_identities))
+        # filter for STI sub-class queries (shared with count()/delete()/keyset).
+        sti_condition = cls._sti_descendants_condition()
+        if sti_condition is not None:
+            statement = statement.where(sti_condition)
 
         if condition is not None:
             statement = statement.where(condition)
+
+        if keyset_condition is not None:
+            statement = statement.where(keyset_condition)
 
         # Time filters
         for time_filter in cls._build_time_filters(
@@ -929,11 +1444,15 @@ class TableBaseMixin(AsyncAttrs):
             # For JTI polymorphic models, use FOR UPDATE OF <main_table> to avoid
             # PostgreSQL's restriction on FOR UPDATE with LEFT OUTER JOIN nullable side
             if issubclass(cls, PolymorphicBaseMixin):
-                statement = statement.with_for_update(of=cls)
+                statement = statement.with_for_update(of=cls, skip_locked=skip_locked)
             else:
-                statement = statement.with_for_update()
+                statement = statement.with_for_update(skip_locked=skip_locked)
 
-        if populate_existing:
+        # A locking read always refreshes the identity map (see the
+        # with_for_update parameter doc); populate_existing is the explicit
+        # lock-free refresh; authoritative implies it. Merged with ``or`` --
+        # never weakening a caller's populate_existing=True.
+        if with_for_update or populate_existing or authoritative:
             statement = statement.execution_options(populate_existing=True)
 
         result = await session.exec(statement)
@@ -1079,11 +1598,131 @@ class TableBaseMixin(AsyncAttrs):
         return [identity_map[name] for name in poly_names if name in identity_map]
 
     @classmethod
+    async def distinct_column(
+            cls: type[T],
+            session: AsyncSession,
+            column: Mapped[V] | ColumnElement[V],
+            condition: ColumnElement[bool] | None = None,
+            *,
+            limit: int | None = None,
+    ) -> list[V]:
+        """
+        Return the DISTINCT values of one column (optional condition + limit).
+
+        ``get()`` returns whole rows and ``count()`` counts them; this fills
+        the "distinct values of a column" gap (e.g. scanning distinct foreign
+        keys) with a database-level ``SELECT DISTINCT <column>`` instead of
+        loading rows and de-duplicating in Python. The STI subclass filter
+        matches ``get()`` / ``count()``.
+
+        :param session: Async database session
+        :param column: Column to take distinct values of, e.g. ``col(Model.owner_id)``
+        :param condition: Optional WHERE condition
+        :param limit: Optional maximum number of values
+        :returns: The distinct values
+        """
+        statement = select(distinct(column)).select_from(cls)
+
+        sti_condition = cls._sti_descendants_condition()
+        if sti_condition is not None:
+            statement = statement.where(sti_condition)
+
+        if condition is not None:
+            statement = statement.where(condition)
+        if limit is not None:
+            statement = statement.limit(limit)
+
+        result = await session.scalars(statement)
+        return list(result.all())
+
+    @classmethod
+    async def group_sum(
+            cls: type[T],
+            session: AsyncSession,
+            sum_columns: Sequence[Mapped[Any] | ColumnElement[Any]],
+            *,
+            group_by: Mapped[GK] | ColumnElement[GK] | None = None,
+            condition: ColumnElement[bool] | None = None,
+            order_by: ColumnElement[Any] | None = None,
+    ) -> list[GroupSumRow[GK]]:
+        """
+        Aggregate ``SUM`` of each of ``sum_columns`` plus the row count, optionally grouped by ``group_by``.
+
+        Grouping is just a parameter:
+
+        - ``group_by`` omitted (``None``) -> **whole-table aggregation**,
+          returns a **single-element** list (``key=None``);
+        - ``group_by`` given (a column or expression) -> one row per group
+          (e.g. per category, or per ``date_trunc`` time bucket).
+
+        One query computes ``COUNT(*)`` and every ``COALESCE(SUM(col), 0)``;
+        the STI subclass filter matches the other aggregates.
+        ``GroupSumRow.totals`` is aligned by position with ``sum_columns``.
+
+        For a *conditional* sum (``SUM ... FILTER (WHERE ...)``) call this
+        once per condition and merge by ``key`` in Python.
+
+        :param session: Async database session
+        :param sum_columns: Numeric columns to sum (each ``COALESCE(SUM(col), 0)``);
+            their order is the index order of ``GroupSumRow.totals``
+        :param group_by: Group key column / expression; ``None`` for whole-table aggregation
+        :param condition: Optional WHERE condition
+        :param order_by: Optional ordering (defaults to ``group_by`` ascending when grouping; ignored otherwise)
+        :returns: One ``GroupSumRow`` per group; exactly one (``key=None``) without ``group_by``
+        :raises ValueError: ``sum_columns`` is empty (use :meth:`count` for row counts)
+        """
+        n_sums = len(sum_columns)
+        if n_sums == 0:
+            raise ValueError("group_sum() requires at least one sum column; use count() for plain row counts")
+        sum_exprs = [func.coalesce(func.sum(c), 0) for c in sum_columns]
+
+        if group_by is None:
+            statement = select(func.count(), *sum_exprs).select_from(cls)
+        else:
+            statement = select(group_by, func.count(), *sum_exprs).select_from(cls).group_by(group_by)
+
+        sti_condition = cls._sti_descendants_condition()
+        if sti_condition is not None:
+            statement = statement.where(sti_condition)
+        if condition is not None:
+            statement = statement.where(condition)
+
+        if group_by is not None:
+            statement = statement.order_by(order_by if order_by is not None else group_by)
+
+        rows = (await session.exec(statement)).all()
+
+        def _to_decimal(value: Any) -> Decimal:
+            # PostgreSQL NUMERIC already yields Decimal; SQLite may yield int
+            # or float (str() avoids binary float artifacts).
+            return value if isinstance(value, Decimal) else Decimal(str(value))
+
+        if group_by is None:
+            # Without GROUP BY there is always exactly one row:
+            # [0] = COUNT(*), [1:] = sums.
+            row = rows[0]
+            return [GroupSumRow(
+                key=None,
+                count=row[0],
+                totals=[_to_decimal(row[1 + i]) for i in range(n_sums)],
+            )]
+        # Grouped: [0] = group key, [1] = COUNT(*), [2:] = sums (never NULL thanks to COALESCE).
+        return [
+            GroupSumRow[GK](
+                key=cast(GK, row[0]),
+                count=row[1],
+                totals=[_to_decimal(row[2 + i]) for i in range(n_sums)],
+            )
+            for row in rows
+        ]
+
+    @classmethod
     async def count(
             cls: type[T],
             session: AsyncSession,
             condition: ColumnElement[bool] | bool | None = None,
             *,
+            distinct_column: Mapped[Any] | ColumnElement[Any] | None = None,
             time_filter: TimeFilterRequest | None = None,
             created_before_datetime: datetime | None = None,
             created_after_datetime: datetime | None = None,
@@ -1091,18 +1730,29 @@ class TableBaseMixin(AsyncAttrs):
             updated_after_datetime: datetime | None = None,
     ) -> int:
         """
-        Count records matching conditions (supports time filtering).
+        Count records matching conditions (supports time filtering and distinct counting).
 
         Uses database-level COUNT() for efficiency.
 
         :param session: Async database session
         :param condition: Query condition
+        :param distinct_column: When given, count the **distinct values** of
+            this column (``COUNT(DISTINCT col)``, e.g. distinct active users);
+            otherwise a plain ``COUNT(*)``
         :param time_filter: TimeFilterRequest (takes priority over individual params)
         :param created_before_datetime: Filter created_at < datetime
         :param created_after_datetime: Filter created_at >= datetime
         :param updated_before_datetime: Filter updated_at < datetime
         :param updated_after_datetime: Filter updated_at >= datetime
         :returns: Number of matching records
+
+        Example::
+
+            count = await User.count(
+                session,
+                created_after_datetime=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                created_before_datetime=datetime(2025, 2, 1, tzinfo=timezone.utc),
+            )
         """
         if isinstance(time_filter, TimeFilterRequest):
             if time_filter.created_after_datetime is not None:
@@ -1114,22 +1764,13 @@ class TableBaseMixin(AsyncAttrs):
             if time_filter.updated_before_datetime is not None:
                 updated_before_datetime = time_filter.updated_before_datetime
 
-        statement = select(func.count()).select_from(cls)
+        count_expr = func.count(distinct(distinct_column)) if distinct_column is not None else func.count()
+        statement = select(count_expr).select_from(cls)
 
         # STI sub-class filter (consistent with get())
-        is_polymorphic = issubclass(cls, PolymorphicBaseMixin)
-        is_sti = is_polymorphic and not cls._is_joined_table_inheritance()
-        if is_sti:
-            mapper = cast(Mapper[Any], inspect(cls))
-            poly_on = mapper.polymorphic_on
-            if poly_on is not None:
-                descendant_identities = [
-                    m.polymorphic_identity
-                    for m in mapper.self_and_descendants
-                    if m.polymorphic_identity is not None
-                ]
-                if descendant_identities:
-                    statement = statement.where(poly_on.in_(descendant_identities))
+        sti_condition = cls._sti_descendants_condition()
+        if sti_condition is not None:
+            statement = statement.where(sti_condition)
 
         if condition is not None:
             statement = statement.where(condition)
@@ -1141,7 +1782,9 @@ class TableBaseMixin(AsyncAttrs):
             statement = statement.where(time_condition)
 
         result = await session.scalar(statement)
-        return result or 0
+        # COUNT without GROUP BY always returns one row (0, not NULL); this
+        # only narrows scalar()'s ``int | None`` declaration.
+        return result if result is not None else 0
 
     @classmethod
     async def get_with_count(
@@ -1159,6 +1802,9 @@ class TableBaseMixin(AsyncAttrs):
     ) -> 'ListResponse[T]':
         """
         Get paginated list with total count, returns ListResponse.
+
+        ``count`` is the size of the whole filtered set; the keyset cursor
+        (``after_id``) does not affect it.
 
         :param session: Async database session
         :param condition: Query condition
@@ -1180,8 +1826,9 @@ class TableBaseMixin(AsyncAttrs):
                 updated_before_datetime=table_view.updated_before_datetime,
             )
 
-        total_count = await cls.count(session, condition, time_filter=time_filter)
-
+        # Items first, then count: get() performs the keyset cursor checks
+        # (after_id + order_by/join, anchor validity); counting first would
+        # waste an aggregate query on a request that is bound to fail.
         items = await cls.get(
             session,
             condition,
@@ -1195,6 +1842,8 @@ class TableBaseMixin(AsyncAttrs):
             jti_subclasses=jti_subclasses,
         )
 
+        total_count = await cls.count(session, condition, time_filter=time_filter)
+
         return ListResponse(count=total_count, items=items)
 
     @overload
@@ -1206,6 +1855,7 @@ class TableBaseMixin(AsyncAttrs):
             *,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             with_for_update: bool = False,
+            authoritative: bool = False,
     ) -> T: ...
 
     @overload
@@ -1217,6 +1867,7 @@ class TableBaseMixin(AsyncAttrs):
             *,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             with_for_update: bool = False,
+            authoritative: bool = False,
     ) -> T: ...
 
     @classmethod
@@ -1227,6 +1878,7 @@ class TableBaseMixin(AsyncAttrs):
             *,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             with_for_update: bool = False,
+            authoritative: bool = False,
     ) -> T:
         """
         Get a single record by primary key ID (guaranteed to exist).
@@ -1237,6 +1889,10 @@ class TableBaseMixin(AsyncAttrs):
         :param id: Primary key ID (int or UUID depending on subclass)
         :param load: Relationship(s) to eagerly load
         :param with_for_update: Whether to acquire a row lock
+        :param authoritative: The single switch for authorization reads (see
+            :meth:`get`); without it "fetch one by id, authoritatively" would
+            need the longer ``get(..., fetch_mode='one')`` form, and this more
+            natural entry point would silently return a possibly stale object.
         :returns: The model instance
         :raises NoResultFound: Record does not exist
         :raises MultipleResultsFound: Multiple records found
@@ -1244,18 +1900,19 @@ class TableBaseMixin(AsyncAttrs):
         return await cls.get(
             session, col(cls.id) == id,
             fetch_mode='one', load=load, with_for_update=with_for_update,
+            authoritative=authoritative,
         )
 
     @overload
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: int, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T: ...
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: int, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found", with_for_update: bool = False) -> T: ...
 
     @overload
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T: ...
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found", with_for_update: bool = False) -> T: ...
 
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: int | uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T:
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: int | uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found", with_for_update: bool = False) -> T:
         """
         Get a record by primary key ID, raising 404 if not found.
 
@@ -1269,11 +1926,17 @@ class TableBaseMixin(AsyncAttrs):
             Callers may supply a localized / context-specific message
             (e.g. ``"Bundle not found"``) without falling back to manual
             ``get(...) + null check + raise`` boilerplate.
+        :param with_for_update: Forwarded to :meth:`get` -- read the row with
+            ``SELECT ... FOR UPDATE`` (which by itself bypasses the Redis
+            cache and the identity map). Typical use: close the TOCTOU window
+            between "exists" and "delete" -- a concurrent second request
+            blocks, then finds no row after the first commits and gets the
+            same 404 as a serial second delete.
         :returns: The found instance
         :raises HTTPException: (FastAPI) If not found
         :raises RecordNotFoundError: (no FastAPI) If not found
         """
-        instance = await cls.get(session, col(cls.id) == id, load=load)
+        instance = await cls.get(session, col(cls.id) == id, load=load, with_for_update=with_for_update)
         if instance is None:
             if _HAS_FASTAPI:
                 raise _FastAPIHTTPException(status_code=404, detail=detail)
@@ -1286,13 +1949,33 @@ class UUIDTableBaseMixin(TableBaseMixin):
     UUID-based async CRUD mixin.
 
     Inherits all CRUD methods from TableBaseMixin, with the ``id`` field
-    overridden to use UUID with auto-generation.
+    overridden to a **UUIDv7** primary key generated on creation.
+
+    UUIDv7 (RFC 9562) starts with a 48-bit Unix millisecond timestamp, so the
+    byte order is the creation-time order: ``ORDER BY id`` approximates
+    creation order and B-tree inserts concentrate on the right edge (far fewer
+    page splits and random I/O than UUIDv4). Generated by
+    :func:`sqlmodel_ext.mixins.uuid7` (``uuid.uuid7`` on Python 3.14+).
+
+    Known limitations:
+
+    - The id reveals its creation time (millisecond precision). IDs are
+      identifiers, not capabilities; do not rely on them being unguessable.
+    - Do not treat id order as authoritative time order: the timestamp comes
+      from the application clock, with no global monotonicity across
+      processes. Use a database-clock column for authoritative ordering.
+    - Existing rows keep whatever UUID version they were created with; mixed
+      v4/v7 values still have a well-defined byte order, so ``ORDER BY id``
+      remains a consistent total order (e.g. for lock ordering).
+    - If a primary key must be *derived* deterministically (e.g. ``uuid5``
+      from an idempotency key), assign it explicitly -- the default factory
+      only applies when no id is given.
 
     Attributes:
-        id: UUID primary key, auto-generated.
+        id: UUIDv7 primary key, auto-generated.
     """
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    """UUID primary key, auto-generated."""
+    id: uuid.UUID = Field(default_factory=uuid7, primary_key=True)
+    """UUIDv7 primary key (time-ordered), auto-generated."""
 
     @override
     @classmethod
@@ -1303,6 +1986,7 @@ class UUIDTableBaseMixin(TableBaseMixin):
             *,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             with_for_update: bool = False,
+            authoritative: bool = False,
     ) -> T:
         """
         Get a single record by UUID primary key (guaranteed to exist).
@@ -1311,13 +1995,16 @@ class UUIDTableBaseMixin(TableBaseMixin):
         :param id: UUID primary key
         :param load: Relationship(s) to eagerly load
         :param with_for_update: Whether to acquire a row lock
+        :param authoritative: The single switch for authorization reads (see :meth:`TableBaseMixin.get_one`)
         :returns: The model instance
         """
-        return await super().get_one(session, id, load=load, with_for_update=with_for_update)
+        return await super().get_one(
+            session, id, load=load, with_for_update=with_for_update, authoritative=authoritative,
+        )
 
     @override
     @classmethod
-    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found") -> T:
+    async def get_exist_one(cls: type[T], session: AsyncSession, id: uuid.UUID, load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None, *, detail: str = "Not found", with_for_update: bool = False) -> T:
         """
         Get a record by UUID primary key, raising 404 if not found.
 
@@ -1325,8 +2012,9 @@ class UUIDTableBaseMixin(TableBaseMixin):
         :param id: UUID primary key
         :param load: Relationship(s) to eagerly load
         :param detail: 404 response detail text (default ``"Not found"``)
+        :param with_for_update: Read with a row lock (see :meth:`TableBaseMixin.get_exist_one`)
         :returns: The found instance
         :raises HTTPException: (FastAPI) If not found
         :raises RecordNotFoundError: (no FastAPI) If not found
         """
-        return await super().get_exist_one(session, id, load, detail=detail)
+        return await super().get_exist_one(session, id, load, detail=detail, with_for_update=with_for_update)

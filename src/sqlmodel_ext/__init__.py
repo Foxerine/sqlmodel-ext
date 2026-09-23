@@ -23,7 +23,16 @@ Quick start::
 __version__ = "0.4.2"
 
 # Base
-from sqlmodel_ext.base import SQLModelBase, ExtraIgnoreModelBase, CustomTableArg
+from sqlmodel_ext.base import SQLModelBase, ExtraIgnoreModelBase, CustomTableArg, SQLModelExtConfig
+
+# Tri-state semantics ("not provided" vs null) and the optional wire value
+from sqlmodel_ext.unset import Unset, OMITTED_SENTINEL
+
+# Field metadata markers
+from sqlmodel_ext.constants import EXCLUDE_IF_NONE
+
+# ``sqlmodel.select`` with overloads for 5-9 column projections (same object at runtime)
+from sqlmodel_ext.select import select
 
 # Enhanced session (cache-aware commit/reset/refresh/execute)
 from sqlmodel_ext.session import AsyncSession
@@ -77,6 +86,8 @@ from sqlmodel_ext.field_types import (
     DirectoryPathType,
     FilePathType,
     # String constraints
+    max_length_of,
+    Str1,
     Str16,
     Str24,
     Str32,
@@ -95,6 +106,8 @@ from sqlmodel_ext.field_types import (
     Text2K,
     Text2500,
     Text3K,
+    Text3072,
+    Text4K,
     Text5K,
     Text8K,
     Text10K,
@@ -109,12 +122,17 @@ from sqlmodel_ext.field_types import (
     NonEmptyStr64,
     NonEmptyStr128,
     NonEmptyStr256,
+    NonEmptyStrippedStr32,
     NonEmptyStrippedStr64,
     NonEmptyStrippedStr128,
     NonEmptyStrippedStr256,
     Sha256Hex,
     BCP47LanguageCode,
+    SingleLineStr64,
+    SearchQueryStr64,
+    HttpHeaderName,
     # Numeric constraints
+    INT32_MIN,
     INT32_MAX,
     INT64_MAX,
     JS_MAX_SAFE_INTEGER,
@@ -124,6 +142,7 @@ from sqlmodel_ext.field_types import (
     NonNegativeInt,
     PositiveBigInt,
     NonNegativeBigInt,
+    SignedBigInt,
     PositiveFloat,
     NonNegativeFloat,
     # Decimal constraints (NUMERIC(p, s) + sign + JSON-string serialization)
@@ -131,9 +150,20 @@ from sqlmodel_ext.field_types import (
     NonNegativeDecimal38_18,
     PositiveDecimal38_18,
     OptionalNonNegativeDecimal38_18,
+    OptionalSignedDecimal38_18,
+    SignedWriteDecimal38_18,
+    NonNegativeWriteDecimal38_18,
+    PositiveWriteDecimal38_18,
+    OptionalNonNegativeWriteDecimal38_18,
+    OptionalSignedWriteDecimal38_18,
+    SignedSumDecimal38_18,
+    DECIMAL_38_18_COLUMN_DIGITS,
+    DECIMAL_38_18_WRITE_DIGITS,
+    DECIMAL_38_18_PLACES,
     SignedDecimal20_10,
     NonNegativeDecimal20_10,
     OptionalNonNegativeDecimal20_10,
+    NullableNonNegativeDecimal20_10,
     # Bounded-length list aliases
     List,
     List1,
@@ -154,6 +184,7 @@ from sqlmodel_ext.field_types import (
     List1024,
     # Custom types
     IPAddress,
+    ClientIPAddress,
     Url,
     HttpUrl,
     WebSocketUrl,

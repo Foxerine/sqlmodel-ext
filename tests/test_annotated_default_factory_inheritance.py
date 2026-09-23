@@ -31,10 +31,11 @@ from typing import Annotated, Any, final
 import pytest
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
-from sqlalchemy import String
+from sqlalchemy import BigInteger, String
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlmodel import Field
+from sqlmodel import Field, SQLModel
 
+from sqlmodel_ext import NonNegativeBigInt, NonNegativeInt
 from sqlmodel_ext.base import SQLModelBase
 
 
@@ -192,3 +193,115 @@ class TestMultiFieldInfoInAnnotated:
         assert fi.default == 'anonymous'
         instance = Leaf()
         assert instance.name == 'anonymous'
+
+
+# ---------------------------------------------------------------------------
+# Explicit ``default=None`` must survive metaclass normalization
+# ---------------------------------------------------------------------------
+#
+# A constrained alias (``NonNegativeBigInt`` = ``Annotated[int, Field(ge=0, ...,
+# sa_type=BigInteger)]``) combined with ``| None`` and a right-hand
+# ``= Field(default=None, ...)`` used to lose the explicit ``default=None``: the
+# right-hand FieldInfo was discarded while the annotation's FieldInfo was
+# recovered, and a ``None`` default was treated as "unset" when FieldInfos were
+# merged -- the field silently became required. The three declaration shapes
+# below must agree on the *real* table-model path.
+
+
+def _admits_none(annotation: object) -> bool:
+    import types
+    import typing
+
+    while typing.get_origin(annotation) is typing.Annotated:
+        annotation = typing.get_args(annotation)[0]
+    if isinstance(annotation, types.UnionType) or typing.get_origin(annotation) is typing.Union:
+        return type(None) in typing.get_args(annotation)
+    return annotation is type(None)
+
+
+class ExplicitNoneRhsField(SQLModelBase, table=True):
+    """Right-hand ``Field(...)`` coexisting with the alias FieldInfo."""
+    id: NonNegativeInt = Field(primary_key=True)
+    value: NonNegativeBigInt | None = Field(default=None, sa_type=BigInteger)
+
+
+class ExplicitNonePlainDefault(SQLModelBase, table=True):
+    """Alias with a plain ``= None`` default."""
+    id: NonNegativeInt = Field(primary_key=True)
+    value: NonNegativeBigInt | None = None
+
+
+class ExplicitNoneBareType(SQLModelBase, table=True):
+    """Control: bare type, no alias FieldInfo involved."""
+    id: NonNegativeInt = Field(primary_key=True)
+    value: bool | None = None
+
+
+_EXPLICIT_NONE_MODELS = (ExplicitNoneRhsField, ExplicitNonePlainDefault, ExplicitNoneBareType)
+# Reflection only -- keep them out of the shared metadata used by create_all().
+for _model in _EXPLICIT_NONE_MODELS:
+    SQLModel.metadata.remove(_model.__table__)  # type: ignore[attr-defined]
+
+
+class TestExplicitNoneDefaultSurvives:
+    def test_rhs_field_shape_is_not_required(self) -> None:
+        field = _EXPLICIT_NONE_MODELS[0].model_fields['value']
+        assert field.is_required() is False
+        assert field.default is None
+
+    def test_all_shapes_agree(self) -> None:
+        for model in _EXPLICIT_NONE_MODELS:
+            field = model.model_fields['value']
+            assert field.is_required() is False, model.__name__
+            assert field.default is None, model.__name__
+            assert _admits_none(field.annotation), model.__name__
+
+    def test_constrained_shapes_keep_column_type_and_constraints(self) -> None:
+        for model in _EXPLICIT_NONE_MODELS[:2]:
+            column = model.__table__.columns['value']  # type: ignore[attr-defined]
+            assert isinstance(column.type, BigInteger), model.__name__
+            assert column.nullable is True
+            model.model_validate({'id': 1, 'value': 0})
+            model.model_validate({'id': 1, 'value': None})
+            with pytest.raises(ValueError):
+                model.model_validate({'id': 1, 'value': -1})
+
+    def test_merge_keeps_explicit_none_default(self) -> None:
+        from pydantic_core import PydanticUndefined
+
+        from sqlmodel_ext.base import _merge_field_info_attrs
+
+        target = Field(sa_type=BigInteger)
+        _merge_field_info_attrs(target, Field(default=None))
+        assert target.default is None
+
+        # ...while an unset default stays unset.
+        target = Field(sa_type=BigInteger)
+        _merge_field_info_attrs(target, Field(alias='x'))
+        assert target.default is PydanticUndefined
+        assert target.alias == 'x'
+
+
+class RhsPrimaryKeyOnAlias(SQLModelBase, table=True):
+    """``= Field(primary_key=True)`` on a constrained alias that carries its own SQLModel FieldInfo."""
+    id: NonNegativeInt = Field(primary_key=True)
+    label: str = 'x'
+
+
+SQLModel.metadata.remove(RhsPrimaryKeyOnAlias.__table__)  # type: ignore[attr-defined]
+
+
+class TestRhsFieldAttributesReachColumn:
+    def test_primary_key_from_rhs_field(self) -> None:
+        # sqlmodel >= 0.0.32 reads only the first FieldInfoMetadata carrier;
+        # the rhs values must be folded into it, not appended after it.
+        assert RhsPrimaryKeyOnAlias.__table__.c.id.primary_key is True  # type: ignore[attr-defined]
+
+    def test_alias_singleton_not_mutated(self) -> None:
+        import typing
+
+        from sqlmodel.main import FieldInfoMetadata
+
+        alias_fi = typing.get_args(NonNegativeInt)[1]
+        carriers = [m for m in alias_fi.metadata if isinstance(m, FieldInfoMetadata)]
+        assert carriers and all(c.primary_key is not True for c in carriers)
