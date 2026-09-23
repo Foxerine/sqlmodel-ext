@@ -133,8 +133,8 @@ class TestWriteInto:
 
 class TestBaseline:
     def test_introduced_ignores_line_numbers_and_keeps_extra_occurrences(self) -> None:
-        old = Diagnostic('a.py', 'rule', 'msg', 3)
-        found = [Diagnostic('a.py', 'rule', 'msg', 10), Diagnostic('a.py', 'rule', 'msg', 20)]
+        old = Diagnostic('a.py', 'rule', 'msg', 3, 'x.y()')
+        found = [Diagnostic('a.py', 'rule', 'msg', 10, 'x.y()'), Diagnostic('a.py', 'rule', 'msg', 20, 'x.y()')]
         introduced = check_derived.introduced_by(found, [old])
         assert [item.identity for item in introduced] == [old.identity]  # one extra occurrence, not zero or two
         assert check_derived.introduced_by(found[:1], [old]) == []  # moved line is not "new"
@@ -144,10 +144,10 @@ class TestBaseline:
             Span('m.py', 10, 12, 'U <- check', True),
             Span('m.py', 20, 22, 'U <- method', False),
         ]
-        consumer = Diagnostic('h.py', 'reportAttributeAccessIssue', 'x', 5)
-        in_validator = Diagnostic('m.py', 'reportAttributeAccessIssue', 'x', 11)
-        in_method = Diagnostic('m.py', 'reportAttributeAccessIssue', 'x', 21)
-        artifact = Diagnostic('m.py', 'reportIncompatibleVariableOverride', 'x', 11)
+        consumer = Diagnostic('h.py', 'reportAttributeAccessIssue', 'x', 5, 'a')
+        in_validator = Diagnostic('m.py', 'reportAttributeAccessIssue', 'x', 11, 'b')
+        in_method = Diagnostic('m.py', 'reportAttributeAccessIssue', 'x', 21, 'c')
+        artifact = Diagnostic('m.py', 'reportIncompatibleVariableOverride', 'x', 11, 'b')
         blocking, latent = check_derived.classify([consumer, in_validator, in_method, artifact], spans)
         assert blocking == [(consumer, 'consumer'), (in_validator, 'U <- check')]
         assert latent == [(in_method, 'U <- method')]

@@ -50,18 +50,29 @@ calls that method -- and is printed without failing.
 
 **Invariants**:
 
-1. **The project is never modified.** The copies live in the system temporary
-   directory and are deleted afterwards (unless ``--keep``); bytecode writing
-   is disabled while the project's modules are imported, so not even
-   ``__pycache__`` appears. Enforced by :func:`main` (temporary directory must
-   lie outside the project) and :func:`sqlmodel_ext.derived_decls.write_into`
-   (refuses a destination inside the project).
+1. **The tool itself never writes into the project.** The copies live in the
+   system temporary directory and are deleted afterwards (unless ``--keep``);
+   bytecode writing is disabled while the project's modules are imported, so
+   not even ``__pycache__`` appears. Enforced by :func:`main` (temporary
+   directory must lie outside the project) and
+   :func:`sqlmodel_ext.derived_decls.write_into` (refuses a destination inside
+   the project). **This does not cover your own code**: to read runtime facts
+   the target modules are *imported* from the project, exactly as a test run
+   would import them, so their module-level side effects (writing files,
+   opening connections, ...) do run. Only point the tool at import-safe modules.
 2. **Only new errors are reported, not the total.** Pre-existing errors in the
    project must not make every run fail -- a gate that always fails gets
    bypassed. Enforced by the baseline run in :func:`main`.
-3. **The baseline is compared by ``(file, rule, message)`` counts, without
-   line numbers.** The expansion inserts lines, so every line number below it
-   shifts; a key including the line would report every existing error as new.
+3. **The baseline is compared by ``(file, rule, message, source line text)``
+   counts, without line numbers.** The expansion inserts lines, so every line
+   number below it shifts; a key including the line would report every
+   existing error as new. The stripped text of the flagged line moves with the
+   code, so it keeps an existing error matched while telling apart a new error
+   with the same rule and message on a different line -- without it, an old
+   error disappearing and a new one appearing in the same file would cancel
+   out and the new one would be hidden. Residual limit: two errors with the
+   same rule and message on *textually identical* lines of one file are
+   interchangeable to the baseline (counts still keep their multiplicity).
 4. **The checked code is the project's code.** Every imported target module
    must resolve to a file under ``--root``; otherwise the run aborts. An
    installed copy of the package shadowing the project would make every
@@ -292,10 +303,13 @@ class Diagnostic(typing.NamedTuple):
     line: int
     """0-based, as in pyright's JSON ``range.start.line``."""
 
+    source: str
+    """Stripped text of the flagged line in the analyzed copy (part of the baseline key)."""
+
     @property
-    def identity(self) -> tuple[str, str, str]:
-        """Baseline key -- deliberately without the line number."""
-        return self.path, self.rule, self.message
+    def identity(self) -> tuple[str, str, str, str]:
+        """Baseline key -- deliberately without the line number, but with the line's text (invariant 3)."""
+        return self.path, self.rule, self.message, self.source
 
 
 def diagnose(copy: pathlib.Path, executable: pathlib.Path, python: str | None) -> list[Diagnostic]:
@@ -326,16 +340,26 @@ def diagnose(copy: pathlib.Path, executable: pathlib.Path, python: str | None) -
             "[ABORT] basedpyright analyzed 0 files -- check 'include' / 'exclude' in the configuration"
         )
     diagnostics: list[dict[str, typing.Any]] = payload['generalDiagnostics']
-    return [
-        Diagnostic(
-            path=pathlib.Path(item['file']).resolve().relative_to(copy.resolve()).as_posix(),
+    source_lines: dict[pathlib.Path, list[str]] = {}
+    out: list[Diagnostic] = []
+    for item in diagnostics:
+        if item.get('severity') != 'error':
+            continue
+        file = pathlib.Path(item['file']).resolve()
+        if file not in source_lines:
+            source_lines[file] = file.read_text(encoding='utf-8').splitlines()
+        line: int = item['range']['start']['line']
+        lines = source_lines[file]
+        out.append(Diagnostic(
+            path=file.relative_to(copy.resolve()).as_posix(),
             rule=item.get('rule', '-'),
             message=str(item['message']).splitlines()[0],
-            line=item['range']['start']['line'],
-        )
-        for item in diagnostics
-        if item.get('severity') == 'error'
-    ]
+            line=line,
+            # A diagnostic can sit on the empty position after the last line
+            # (e.g. end-of-file errors); that position has no text.
+            source=lines[line].strip() if line < len(lines) else '',
+        ))
+    return out
 
 
 def introduced_by(found: list[Diagnostic], baseline: list[Diagnostic]) -> list[Diagnostic]:

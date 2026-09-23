@@ -26,9 +26,12 @@ base, the checker sees the tri-state directly, and this module together with
 :mod:`sqlmodel_ext.check_derived` will be deprecated and then removed. Nothing
 it produces is ever committed, so removal leaves nothing behind.
 
-**This module never touches the working tree**: everything it writes goes into
-a disposable copy that the caller creates and deletes. There are no generated
-files in the repository, nothing to review and nothing to clean up.
+**This module never writes into the working tree**: everything it writes goes
+into a disposable copy that the caller creates and deletes. There are no
+generated files in the repository, nothing to review and nothing to clean up.
+(Reading runtime facts means the caller has imported the project's modules,
+so their own import-time side effects are outside this guarantee -- see
+:mod:`sqlmodel_ext.check_derived`, invariant 1.)
 
 **Two things are expanded, and both are required**:
 

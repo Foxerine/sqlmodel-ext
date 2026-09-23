@@ -85,10 +85,14 @@ In CI, run the same command directly.
    - **field declarations**: for every field the metaclass really made tri-state (decided by the runtime `model_fields`, not by re-deriving the metaclass rules), it writes `name: Unset | <annotation copied verbatim from the base source>` into an `if TYPE_CHECKING:` block of the derived class — keeping aliases such as `Str64` instead of expanding them to `Annotated[...]`;
    - **methods expanded along the MRO**: members the derived class does not define, an ancestor does, and that read a tri-state field (`self.<field>`) — methods, properties, `model_validator`, `model_post_init` — are copied into the derived class. Their `self` then has the derived type, and an insufficient guard is reported by basedpyright natively.
 4. **Runs basedpyright** on the copy (with the project's own configuration: `pyrightconfig.json`, else `[tool.basedpyright]` / `[tool.pyright]` in `pyproject.toml`).
-5. If there are errors, runs it again on an **unexpanded** copy as the baseline and reports only the errors the expansion **introduced**. The comparison key is the count of `(file, rule, message)`, **without line numbers** — the expansion inserts lines, and a key with line numbers would count every existing error as new.
+5. If there are errors, runs it again on an **unexpanded** copy as the baseline and reports only the errors the expansion **introduced**. The comparison key is the count of `(file, rule, message, text of the flagged line)`, **without line numbers** — the expansion inserts lines, and a key with line numbers would count every existing error as new. The line's text moves with the code, so an existing error stays matched, while a new error with the same rule and message on a different line is still reported (without the text, an old error disappearing and a new one appearing in the same file would cancel out). Residual limit: two identical errors on textually identical lines of one file are interchangeable.
 6. Deletes the temporary directory (kept with `--keep`).
 
-**It never modifies your working tree**: every write goes to the temporary copy; bytecode writing is disabled while your modules are imported, so not even `__pycache__` appears; the writer refuses a destination inside the project. Nothing generated ever lands in the repository.
+**The tool itself never writes into your project**: every write goes to the temporary copy; bytecode writing is disabled while your modules are imported, so not even `__pycache__` appears; the writer refuses a destination inside the project. Nothing generated ever lands in the repository.
+
+::: warning Your modules are imported
+To read runtime facts, the target modules are **imported from your project**, exactly as a test run would import them, so their module-level side effects run: a module that writes a file, opens a connection or starts a server at import time will do so. Point `check_derived` only at import-safe modules (model definitions usually are).
+:::
 
 **Severity**:
 

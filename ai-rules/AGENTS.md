@@ -32,8 +32,10 @@ the existing declaration and derive from it.
    `python -m sqlmodel_ext.check_derived <package>` (experimental) after every
    change and fix what it reports as blocking. It expands the derived DTOs in a
    throwaway copy and runs basedpyright there, catching `is not None` checks
-   and inherited validators that plain basedpyright cannot see. It never
-   modifies the working tree; do not try to "apply" its expansion to the source.
+   and inherited validators that plain basedpyright cannot see. The tool itself
+   never writes into the working tree; do not try to "apply" its expansion to
+   the source. It does import the target modules, so run it only on
+   import-safe modules (no side effects at import time).
 4. Never write `# type: ignore`. `# pyright: ignore[ruleName]  # <reason>` is
    allowed only for a genuine defect in a third-party stub, with the rule name
    and the reason on the same line.
