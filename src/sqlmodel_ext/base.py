@@ -399,6 +399,34 @@ def _union_member_annotation(original_ann: typing.Any) -> typing.Any:
     return typing.Annotated[inner, *reduced]
 
 
+def _json_schema_property_key(field_name: str, field: FieldInfo, mode: str, by_alias: bool) -> str:
+    """
+    The key under which Pydantic lists ``field`` in a JSON schema's ``properties``.
+
+    Mirrors Pydantic's own rule, using the public ``FieldInfo`` attributes: with
+    ``by_alias`` the key is the mode's alias -- ``validation_alias`` in
+    validation mode, ``serialization_alias`` in serialization mode (``alias``
+    fills both) -- and for ``AliasChoices`` the first choice that is a string
+    or a single-element string ``AliasPath``; otherwise, and without
+    ``by_alias``, the field name. A bare ``AliasPath`` (not inside
+    ``AliasChoices``) keeps the field name: Pydantic's rule only picks paths
+    out of a list of choices. Checked against Pydantic's output for every
+    alias form in both modes.
+    """
+    if not by_alias:
+        return field_name
+    alias = field.validation_alias if mode == 'validation' else field.serialization_alias
+    if isinstance(alias, str):
+        return alias
+    if isinstance(alias, AliasChoices):
+        for choice in alias.choices:
+            if isinstance(choice, str):
+                return choice
+            if len(choice.path) == 1 and isinstance(choice.path[0], str):
+                return choice.path[0]
+    return field_name
+
+
 _ALIAS_FIELD_ATTRS: typing.Final = frozenset({'alias', 'validation_alias', 'serialization_alias'})
 """The members of ``_UNION_INCOMPATIBLE_FIELD_ATTRS`` an ``alias_generator`` can fill in."""
 
@@ -1776,7 +1804,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
         if not config.get('omitted_sentinel', False):
             return super().model_json_schema(*args, **kwargs)
 
-        def _inject(props: object, model: type[BaseModel]) -> None:
+        def _inject(props: object, model: type[BaseModel], mode: str, by_alias: bool) -> None:
             """Inject the sentinel branch into the omissible fields of ``model`` found in ``props``."""
             if not isinstance(props, dict):
                 return
@@ -1784,8 +1812,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
             for field_name, field in model.model_fields.items():
                 if not cls.annotation_is_omissible(field.annotation):
                     continue
-                # With validate_by_name the schema key may be the alias.
-                key = field.alias if field.alias in typed_props else field_name
+                key = _json_schema_property_key(field_name, field, mode, by_alias)
                 field_schema = typed_props.get(key)
                 if not isinstance(field_schema, dict):
                     continue
@@ -1819,7 +1846,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
                 json_schema = super().model_schema(schema)
                 model: type[Any] = schema['cls']
                 if issubclass(model, BaseModel):
-                    _inject(json_schema.get('properties'), model)
+                    _inject(json_schema.get('properties'), model, self.mode, self.by_alias)
                 return json_schema
 
         bound.arguments['schema_generator'] = _SentinelGenerator
