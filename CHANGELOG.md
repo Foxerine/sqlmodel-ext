@@ -23,7 +23,10 @@ Upgrade guide: [Migrate from 0.4.x to 0.5.0](docs/en/how-to/migrate-to-0-5.md)
   `is not Unset`. `partial=True` cannot be combined with `table=True`.
 - **Optimistic-lock column renamed `version` → `oplock_version`**, now `BIGINT`
   (bounded by `JS_MAX_SAFE_INTEGER`) with `server_default 0`, and excluded from
-  `model_dump()`. Requires a database migration (see the upgrade guide).
+  `model_dump()`. Requires a database migration (see the upgrade guide). The
+  rename is **not rolling-compatible**: 0.4.x and 0.5.0 instances cannot run
+  against the same table at once, so stop the old instances before migrating
+  (or plan your own expand/contract sequence).
 - **`oplock_version` is a reserved name**: declaring it in the class body of any
   `SQLModelBase` subclass raises `TypeError`.
 - **`OptimisticLockMixin` retries conflicts 3 times by default**

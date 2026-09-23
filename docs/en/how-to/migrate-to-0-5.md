@@ -99,7 +99,7 @@ Checklist:
 
 - the rename: `version` is a very common domain field name, and having it taken by the lock forced awkward names on business fields;
 - `BIGINT`: removes any realistic risk of `INTEGER` overflow on frequently updated rows;
-- `server_default`: during a rolling deployment, old instances that do not know the column omit it on INSERT; a database default keeps those INSERTs valid;
+- `server_default`: writers that do not know the column (raw SQL, other services, fixtures) omit it on INSERT; a database default keeps those INSERTs valid. It does **not** make the 0.4 → 0.5 rename rolling-compatible — see the warning below the SQL;
 - `exclude=True`: it is ORM-internal state and must not leak into `model_dump()` (e.g. into response DTOs with `extra='forbid'`).
 
 **How to migrate**:
@@ -129,6 +129,17 @@ ALTER TABLE "order" ALTER COLUMN version TYPE BIGINT;
 ALTER TABLE "order" ALTER COLUMN version SET DEFAULT 0;
 ALTER TABLE "order" RENAME version TO oplock_version;
 ```
+
+Only the **root** table of a JTI hierarchy carries the column (child tables share it through mapper inheritance); STI has a single table anyway. Run the migration once per root table of every model that mixes in `OptimisticLockMixin`.
+
+::: warning This rename is not rolling-compatible
+Once the column is renamed, any application instance still running sqlmodel-ext 0.4.x reads and writes a `version` column that no longer exists, and every load or save of those models fails. Conversely, 0.5.0 instances cannot run against the old column name. So for models that use `OptimisticLockMixin`:
+
+- **simplest**: stop all 0.4.x instances, run the migration, start the 0.5.0 instances (a short maintenance window);
+- **zero downtime**: plan your own expand/contract sequence (for example, keep both columns in sync with a database trigger during the rollout, then drop `version` afterwards). The library does not ship such a bridge.
+
+Models without `OptimisticLockMixin` are unaffected. A shared Redis cache is safe during a mixed 0.4/0.5 window: an entry written by the other version fails validation, is deleted and the read falls back to the database — correctness is kept, only the hit rate drops until the rollout completes.
+:::
 
 The equivalent Alembic operation (the SQL above is what it generates for the PostgreSQL dialect):
 
