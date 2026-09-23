@@ -9,7 +9,9 @@ Import this module for side effects before using SQLModelBase.
 import sys
 
 if sys.version_info >= (3, 14):
-    import annotationlib  # noqa: F401
+    # The checker analyzes at pythonVersion 3.12 (the lowest supported version), where this
+    # version-gated block is statically unreachable; it does run on 3.14+.
+    import annotationlib  # noqa: F401  # pyright: ignore[reportUnreachable]
     import types
     from enum import StrEnum
     from typing import Literal, Union, get_args, get_origin
@@ -101,7 +103,7 @@ if sys.version_info >= (3, 14):
                 if non_none_args:
                     first_arg = non_none_args[0]
                     # Check for Annotated SA type metadata first (e.g. Array[T] | None).
-                    # Array[T] desugars to Annotated[list[T], _ArrayTypeHandler(T)];
+                    # Array[T] desugars to Annotated[list[T], ArrayTypeHandler(T)];
                     # wrapping with | None produces Union[Annotated[...], None],
                     # so the SA type must be extracted from the inner Annotated.
                     first_arg_type_name = type(first_arg).__name__

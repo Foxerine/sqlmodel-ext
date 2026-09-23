@@ -128,13 +128,14 @@ import types
 import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Annotated, Any, ClassVar, Self, TypeVar, Union, override
+from typing import Annotated, Any, ClassVar, Self, TypeVar, override
 
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import QueryableAttribute
 from sqlmodel.ext.asyncio.session import AsyncSession as _AsyncSession
 
 from sqlmodel_ext._type_unwrap import (
+    TYPING_UNION,
     get_pydantic_generic_args,
     unwrap_generic_to_dto_class,
     unwrap_to_class,
@@ -333,7 +334,7 @@ def _is_async_session_hint(hint: Any) -> bool:
     origin = typing.get_origin(hint)
     if origin is Annotated:
         return _is_async_session_hint(typing.get_args(hint)[0])
-    if origin is Union or origin is types.UnionType:  # pyright: ignore[reportDeprecated]
+    if origin is TYPING_UNION or origin is types.UnionType:
         return any(_is_async_session_hint(arg) for arg in typing.get_args(hint))
     return isinstance(hint, type) and issubclass(hint, _AsyncSession)
 
@@ -393,7 +394,7 @@ def _extract_model_from_hint(hint: Any, model_names: set[str]) -> str | None:
         return _extract_model_from_hint(args[0], model_names) if args else None
 
     # Union / Optional -> the first matching member wins
-    if origin is Union or origin is types.UnionType:  # pyright: ignore[reportDeprecated]
+    if origin is TYPING_UNION or origin is types.UnionType:
         for a in args:
             if a is type(None):
                 continue
@@ -809,7 +810,7 @@ class RelationLoadChecker:
 
             # Union/Optional: Self | None, T | None
             # Handle both typing.Union (Optional[X], Union[X, Y]) and types.UnionType (X | Y)
-            if origin is Union or origin is types.UnionType:  # pyright: ignore[reportDeprecated]
+            if origin is TYPING_UNION or origin is types.UnionType:
                 return any(
                     _hint_returns_model(arg)
                     for arg in typing.get_args(hint)
@@ -1084,7 +1085,10 @@ class RelationLoadChecker:
         non_model_asts: dict[str, list[tuple[str, str, ast.Module]]] = {}
         seen_func_ids: set[int] = set()
 
-        for _raw_module_name, module in list(sys.modules.items()):
+        # typeshed types sys.modules values as ModuleType, but a None entry is the
+        # standard "import blocked" marker, so the snapshot is widened to admit it.
+        module_entries = typing.cast(list[tuple[str, types.ModuleType | None]], list(sys.modules.items()))
+        for _raw_module_name, module in module_entries:
             # The isolation boundary covers the whole module-identity decision, not
             # just the attribute reads: the *values* (e.g. a ``str`` subclass
             # ``__file__``) can raise from replace / startswith / ``in`` as well.
@@ -1428,7 +1432,9 @@ class RelationLoadChecker:
 
         default_skip = skip_paths or []
 
-        for _raw_module_name, module in list(sys.modules.items()):
+        # sys.modules may hold None ("import blocked"); see _discover_non_model_commit_methods.
+        module_entries = typing.cast(list[tuple[str, types.ModuleType | None]], list(sys.modules.items()))
+        for _raw_module_name, module in module_entries:
             # Module objects are external input (see _discover_non_model_commit_methods);
             # here the isolation obeys skip_third_party_attrs: True skips, False fails loud.
             try:
@@ -3533,7 +3539,7 @@ def _has_unsafe_return_path(
             for expr_node in _own_expression_nodes(stmt):
                 if not isinstance(expr_node, ast.NamedExpr):
                     continue
-                if isinstance(expr_node.target, ast.Name) and _value_is_unsafe(expr_node.value, unsafe):
+                if _value_is_unsafe(expr_node.value, unsafe):
                     unsafe.add(expr_node.target.id)
             if isinstance(stmt, ast.Return):
                 # Must go through _value_is_unsafe (single source of truth), so that
@@ -6200,12 +6206,12 @@ def run_model_checks(base_class: type) -> None:
         if 'pytest' in sys.modules or '_pytest' in sys.modules:
             logger.warning(
                 f"Test environment: relation load static analysis found {len(warnings)} "
-                f"issues (non-blocking). See error log above for details."
+                + f"issues (non-blocking). See error log above for details."
             )
         else:
             raise RuntimeError(
                 f"Relation load static analysis found {len(warnings)} model method issues. "
-                f"Fix them before restarting. See error log above for details."
+                + f"Fix them before restarting. See error log above for details."
             )
     else:
         logger.info("Model method relation load analysis passed")
@@ -6288,8 +6294,8 @@ class RelationLoadCheckMiddleware:
         if _base_class is None:
             logger.warning(
                 "RelationLoadCheckMiddleware: base_class not set. "
-                "Ensure your models package is properly imported "
-                "and run_model_checks() was called."
+                + "Ensure your models package is properly imported "
+                + "and run_model_checks() was called."
             )
             return
 
@@ -6298,7 +6304,7 @@ class RelationLoadCheckMiddleware:
         if routes_app is None:
             logger.warning(
                 "RelationLoadCheckMiddleware: "
-                "no app with routes found, skipping endpoint checks"
+                + "no app with routes found, skipping endpoint checks"
             )
             return
 
@@ -6317,7 +6323,7 @@ class RelationLoadCheckMiddleware:
                 logger.error(str(w))
             raise RuntimeError(
                 f"Relation load static analysis found {len(warnings)} issues. "
-                f"Fix them before restarting. See error log above for details."
+                + f"Fix them before restarting. See error log above for details."
             )
         logger.info("Endpoint and coroutine relation load analysis passed")
 
@@ -6353,9 +6359,9 @@ def _check_completion_warning() -> None:
             "  rlc.check_on_startup = False\n"
         )
         try:
-            sys.stderr.write(msg)
+            _ = sys.stderr.write(msg)
         except (ValueError, OSError):
             pass  # stderr already closed, silently ignore
 
 
-atexit.register(_check_completion_warning)
+_ = atexit.register(_check_completion_warning)

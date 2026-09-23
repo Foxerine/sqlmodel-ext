@@ -34,7 +34,7 @@ import logging
 import types
 from abc import ABC
 from enum import StrEnum
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import Annotated, Any, ClassVar, get_args, get_origin, override
 from uuid import UUID
 
 from pydantic.fields import FieldInfo
@@ -48,8 +48,9 @@ from sqlmodel.main import get_column_from_field
 from sqlmodel_ext.base import (
     CustomTableArg,
     SQLModelBase,
-    _classes_with_custom_table_args,
+    classes_with_custom_table_args,
 )
+from sqlmodel_ext._type_unwrap import TYPING_UNION
 from sqlmodel_ext.mixins._uuid import uuid7
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,7 @@ _sti_subclasses_to_register: list[type] = []
 #
 # ``DeferredIndex`` inherits ``base.CustomTableArg`` -- the SQLModel metaclass
 # intercepts every ``CustomTableArg`` instance out of ``table_args`` and
-# pushes it onto the module-level ``_classes_with_custom_table_args`` queue.
+# pushes it onto the module-level ``classes_with_custom_table_args`` queue.
 # This module's ``_create_sti_deferred_indexes()`` scans the queue at the end
 # of ``register_sti_columns_for_all_subclasses()``, filters by
 # ``isinstance(arg, DeferredIndex)``, and converts the stashed markers into
@@ -111,23 +112,24 @@ class DeferredIndex(CustomTableArg):
         (e.g. ``postgresql_using='gin'``)
     """
 
-    __slots__ = ('name', 'column_names', 'kwargs')
+    __slots__: ClassVar[tuple[str, ...]] = ('name', 'column_names', 'kwargs')
 
     def __init__(self, name: str, *column_names: str, **kwargs: Any) -> None:
         self.name: str = name
         self.column_names: tuple[str, ...] = column_names
         self.kwargs: dict[str, Any] = kwargs
 
+    @override
     def __repr__(self) -> str:
         return (
             f"DeferredIndex({self.name!r}, "
-            f"{', '.join(repr(c) for c in self.column_names)}, **{self.kwargs!r})"
+            + f"{', '.join(repr(c) for c in self.column_names)}, **{self.kwargs!r})"
         )
 
 
 def _create_sti_deferred_indexes() -> None:
     """
-    Scan the ``_classes_with_custom_table_args`` queue and convert
+    Scan the ``classes_with_custom_table_args`` queue and convert
     ``DeferredIndex`` markers into real SQLAlchemy ``Index`` objects.
 
     Called at the end of ``register_sti_columns_for_all_subclasses()`` --
@@ -138,7 +140,7 @@ def _create_sti_deferred_indexes() -> None:
     (``isinstance`` filter) and consumed by their own handlers -- the queue is
     shared but dispatch is per-semantics.
     """
-    for cls, custom_args in _classes_with_custom_table_args:
+    for cls, custom_args in classes_with_custom_table_args:
         for arg in custom_args:
             if not isinstance(arg, DeferredIndex):
                 continue  # other CustomTableArg subtypes are consumed by their own handlers
@@ -158,8 +160,8 @@ def _create_sti_deferred_indexes() -> None:
             except KeyError as e:
                 raise RuntimeError(
                     f"DeferredIndex {arg.name} references column {e} which is not on "
-                    f"table {table.name} -- confirm an STI subclass declares the field "
-                    f"and _register_sti_columns() has run"
+                    + f"table {table.name} -- confirm an STI subclass declares the field "
+                    + f"and _register_sti_columns() has run"
                 ) from e
             # Constructing the Index automatically attaches it to the columns' Table.
             _ = Index(arg.name, *cols, **arg.kwargs)
@@ -240,7 +242,7 @@ def _extract_strenum_type(annotation: Any) -> type[StrEnum] | None:
 
     # Unwrap T | None or Optional[T]
     origin = get_origin(annotation)
-    if origin is Union or origin is types.UnionType:
+    if origin is TYPING_UNION or origin is types.UnionType:
         args = [a for a in get_args(annotation) if a is not type(None)]
         if len(args) == 1:
             annotation = args[0]
@@ -311,11 +313,13 @@ def _register_strenum_coercion_for_subclass(cls: type) -> None:
                 d[field_name] = enum_type(str(raw))
 
     @event.listens_for(cls, 'load')
-    def _on_load(target, context):
+    def _on_load(target: Any, context: Any) -> None:
+        del context  # signature fixed by SQLAlchemy's InstanceEvents.load(target, context)
         _coerce(target)
 
     @event.listens_for(cls, 'refresh')
-    def _on_refresh(target, context, attrs):
+    def _on_refresh(target: Any, context: Any, attrs: Any) -> None:
+        del context, attrs  # signature fixed by SQLAlchemy's InstanceEvents.refresh(target, context, attrs)
         _coerce(target)
 
     # Wrap __init__: SQLModel table=True generates an __init__ that bypasses Pydantic
@@ -428,7 +432,8 @@ def create_subclass_id_mixin(parent_table_name: str) -> type['SQLModelBase']:
         )
 
         @classmethod
-        def __pydantic_init_subclass__(cls, **kwargs):
+        @override
+        def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
             super().__pydantic_init_subclass__(**kwargs)
             _fix_polluted_model_fields(cls)
 
@@ -474,7 +479,10 @@ class AutoPolymorphicIdentityMixin:
             upload_deadline: datetime | None = None  # auto-added to userfile table
     """
 
-    def __init_subclass__(cls, polymorphic_identity: str | None = None, **kwargs):
+    __mapper_args__: ClassVar[dict[str, Any]]
+    """Declared only (no value): ``__init_subclass__`` creates it per subclass."""
+
+    def __init_subclass__(cls, polymorphic_identity: str | None = None, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
         if polymorphic_identity is not None:
@@ -561,10 +569,10 @@ class AutoPolymorphicIdentityMixin:
                 if isinstance(existing_col.type, Integer) != isinstance(new_type, Integer):
                     raise TypeError(
                         f"STI column type conflict: {cls.__name__}.{field_name} type "
-                        f"({type(new_type).__name__}) is incompatible with existing "
-                        f"{parent_table.name}.{field_name} type "
-                        f"({type(existing_col.type).__name__}). "
-                        f"Use a different field name."
+                        + f"({type(new_type).__name__}) is incompatible with existing "
+                        + f"{parent_table.name}.{field_name} type "
+                        + f"({type(existing_col.type).__name__}). "
+                        + f"Use a different field name."
                     )
                 continue
 
@@ -707,7 +715,7 @@ class AutoPolymorphicIdentityMixin:
                     except Exception as e:
                         logger.warning(
                             f"Failed to add column property {field_name} from {cls.__name__} "
-                            f"to ancestor {ancestor.__name__}: {e}"
+                            + f"to ancestor {ancestor.__name__}: {e}"
                         )
 
 
@@ -738,12 +746,15 @@ class PolymorphicBaseMixin:
     - Prevents direct external modification
     """
 
+    __mapper_args__: ClassVar[dict[str, Any]]
+    """Declared only (no value): ``__init_subclass__`` creates it per subclass."""
+
     def __init_subclass__(
         cls,
         polymorphic_on: str | None = None,
         polymorphic_abstract: bool | None = None,
-        **kwargs
-    ):
+        **kwargs: Any,
+    ) -> None:
         super().__init_subclass__(**kwargs)
 
         if '__mapper_args__' not in cls.__dict__:
@@ -761,11 +772,13 @@ class PolymorphicBaseMixin:
             cls.__mapper_args__['polymorphic_abstract'] = polymorphic_abstract
 
     @classmethod
-    def _is_joined_table_inheritance(cls) -> bool:
+    def is_joined_table_inheritance(cls) -> bool:
         """
         Detect whether this class uses Joined Table Inheritance.
 
         Checks if any direct subclass has a distinct ``local_table``.
+        Called by ``TableBaseMixin`` (``mixins.table``) to pick the
+        polymorphic loading strategy.
 
         :returns: True for JTI, False for STI or no subclasses
         """
@@ -814,7 +827,7 @@ class PolymorphicBaseMixin:
         if polymorphic_on is None:
             raise ValueError(
                 f"{cls.__name__} does not have polymorphic_on configured. "
-                f"Ensure it correctly inherits PolymorphicBaseMixin."
+                + f"Ensure it correctly inherits PolymorphicBaseMixin."
             )
         return polymorphic_on.key
 

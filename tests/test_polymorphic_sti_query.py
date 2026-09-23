@@ -147,7 +147,7 @@ class TestPolymorphicIdentityNaming:
 
 class TestStiSchema:
     def test_sti_not_detected_as_jti(self) -> None:
-        assert PolyStiAnimal._is_joined_table_inheritance() is False
+        assert PolyStiAnimal.is_joined_table_inheritance() is False
 
     def test_all_subclasses_share_the_root_table(self) -> None:
         root_table = PolyStiAnimal.__table__  # pyright: ignore[reportAttributeAccessIssue]

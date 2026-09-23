@@ -358,7 +358,7 @@ from sqlmodel_ext.field_types.dialects.postgresql import JSON100K, JSONList100K,
 
 Contract: **object in, object out**.
 
-- **Inbound**: accepts a JSON object / array (preferred) or a JSON **string** (compatibility form). Both forms must be encodable (nesting within the limits of both serializers, orjson and Pydantic — Pydantic's is about 98 levels) with a canonical encoding of at most 100K **characters** (counted in characters, not UTF-8 bytes, so CJK text is not rejected 3x too early).
+- **Inbound**: accepts a JSON object / array (preferred) or a JSON **string** (compatibility form). Both forms must be encodable (nesting within the limits of both serializers, orjson and Pydantic — Pydantic's is platform-dependent, about 98 levels on Windows builds and higher on Linux) with a canonical encoding of at most 100K **characters** (counted in characters, not UTF-8 bytes, so CJK text is not rejected 3x too early).
 - **Outbound**: `model_dump()`, `model_dump(mode='json')` and `model_dump_json()` all output the object / array itself (since 0.5.0; it used to be a JSON string). The serialization schema declares a pure object / array; the validation schema honestly declares `anyOf[object, string]`.
 - **Table models are checked too**: `table=True` models skip Pydantic validation, so `SQLModelBase.model_post_init` calls `ensure_json_within_limits` on these fields (call `super()` when overriding `model_post_init`). Code paths that bypass models can call `ensure_json_within_limits(value)` directly.
 - The 100K limit does not appear in the JSON Schema (JSON Schema cannot express an encoded length for objects); document it in the field docstring.

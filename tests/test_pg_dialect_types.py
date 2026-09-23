@@ -86,7 +86,7 @@ class FtVectorModel(SQLModelBase):
 
 
 def _array_handler(alias: typing.Any):
-    """Extract the _ArrayTypeHandler from an Array[...] Annotated alias."""
+    """Extract the ArrayTypeHandler from an Array[...] Annotated alias."""
     return typing.get_args(alias)[1]
 
 

@@ -104,7 +104,7 @@ class TestJtiSchema:
         assert fks[0].target_fullname == 'polyjtivehicle.id'
 
     def test_root_detects_joined_table_inheritance(self) -> None:
-        assert PolyJtiVehicle._is_joined_table_inheritance() is True
+        assert PolyJtiVehicle.is_joined_table_inheritance() is True
 
     def test_auto_polymorphic_identity_is_lowercased_classname(self) -> None:
         """Root has no identity -> subclass identity = classname.lower()."""

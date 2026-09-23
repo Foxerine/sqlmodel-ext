@@ -13,7 +13,7 @@ Class hierarchy::
 """
 import uuid
 from datetime import datetime
-from typing import TypeVar, Literal, Generic
+from typing import ClassVar, TypeVar, Literal, Generic
 
 # Generic container choice:
 # - A generic container used as a FastAPI **response_model** (ListResponse)
@@ -90,7 +90,7 @@ class ListResponse(BaseModel, Generic[ItemT]):
         a broken JSON schema for the parametrized field. See the module-level
         comment.
     """
-    model_config = ConfigDict(use_attribute_docstrings=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(use_attribute_docstrings=True)
 
     count: int
     """Total number of records matching the query conditions."""
@@ -156,7 +156,7 @@ class TimeFilterRequest(SQLModelBase):
         if created_after is not None and created_after >= before:
             raise ValueError(
                 "created_after_datetime cannot be >= updated_before_datetime "
-                "(a record's update time cannot be earlier than its creation time)"
+                + "(a record's update time cannot be earlier than its creation time)"
             )
         return before
 
@@ -238,8 +238,8 @@ class PaginationRequest(PageWindowRequest):
         if order not in ('created_at', 'id', None):
             raise ValueError(
                 f"after_id keyset cursor does not support order={order}: a mutable sort "
-                "column moves rows after updates and breaks the no-gap/no-duplicate "
-                "guarantee; use an immutable sort column (e.g. order=created_at)"
+                + "column moves rows after updates and breaks the no-gap/no-duplicate "
+                + "guarantee; use an immutable sort column (e.g. order=created_at)"
             )
         return after_id
 
@@ -262,9 +262,9 @@ class PaginationRequest(PageWindowRequest):
         if offset:
             raise ValueError(
                 "after_id and offset cannot be combined: the keyset cursor already means "
-                f"'continue after the anchor'; adding offset={offset} would additionally "
-                f"skip {offset} records after the anchor (they would become unreachable). "
-                "Pass only after_id and omit offset when paging."
+                + f"'continue after the anchor'; adding offset={offset} would additionally "
+                + f"skip {offset} records after the anchor (they would become unreachable). "
+                + "Pass only after_id and omit offset when paging."
             )
         return after_id
 

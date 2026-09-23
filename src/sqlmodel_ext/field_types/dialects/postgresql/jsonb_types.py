@@ -91,17 +91,16 @@ def ensure_json_within_limits(value: dict[str, typing.Any] | list[typing.Any]) -
     except PydanticSerializationError as e:
         raise ValueError(
             f"JSON is nested too deeply; outbound serialization would fail "
-            f"(Pydantic's limit is about 98 levels): {e}"
+            + f"(beyond Pydantic's serializer depth limit on this platform): {e}"
         ) from e
 
 
-def _parse_json_string(value: str, expected_type: type, type_name: str) -> dict[str, typing.Any] | list[typing.Any]:
+def _parse_json_string(value: str, expected_type: type) -> dict[str, typing.Any] | list[typing.Any]:
     """
     Parse a JSON string.
 
     :param value: JSON string
     :param expected_type: Expected Python type (dict or list)
-    :param type_name: Type name for error messages
     :returns: Parsed dict or list
     :raises ValueError: If length exceeds limit or format is invalid
     """
@@ -162,7 +161,7 @@ class JSON100K(dict[str, typing.Any]):
                 ensure_json_within_limits(value)
                 return typing.cast(dict[str, typing.Any], value)
             if isinstance(value, str):
-                result = typing.cast(dict[str, typing.Any], _parse_json_string(value, dict, "JSON100K"))
+                result = typing.cast(dict[str, typing.Any], _parse_json_string(value, dict))
                 # The raw string length was already checked before parsing (so a
                 # huge input is never loaded); re-check the canonical encoding,
                 # which is what gets stored, and the nesting depth.
@@ -236,7 +235,7 @@ class JSONList100K(list[dict[str, typing.Any]]):
                 ensure_json_within_limits(value)
                 return typing.cast(list[dict[str, typing.Any]], value)
             if isinstance(value, str):
-                result = typing.cast(list[dict[str, typing.Any]], _parse_json_string(value, list, "JSONList100K"))
+                result = typing.cast(list[dict[str, typing.Any]], _parse_json_string(value, list))
                 # See JSON100K: re-check the canonical encoding and depth.
                 ensure_json_within_limits(result)
                 return result

@@ -20,7 +20,8 @@ import sys
 import inspect
 import typing
 from collections.abc import Mapping
-from typing import Any, Self, Sequence, get_args, get_origin
+from collections.abc import Sequence
+from typing import Any, Self, get_args, get_origin
 
 from pydantic import AliasChoices, BaseModel, model_validator
 from pydantic import Field as PydanticField
@@ -28,14 +29,16 @@ from pydantic.fields import FieldInfo
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import core_schema as pydantic_core_schema
 from pydantic_core import PydanticUndefined as Undefined
-from sqlalchemy import Column, inspect as sa_inspect
+from sqlalchemy import Column, Table, inspect as sa_inspect
 from sqlalchemy.orm import Mapped, declared_attr, relationship as sa_relationship
 from sqlmodel import Field, SQLModel
-from sqlmodel.main import (
+from sqlmodel._compat import (  # Internal API: where sqlmodel.main imports these from
     SQLModelConfig,
-    SQLModelMetaclass,
     is_table_model_class,
     get_relationship_to,
+)
+from sqlmodel.main import (
+    SQLModelMetaclass,
     FieldInfo as SQLModelFieldInfo,  # Internal API: stable since sqlmodel 0.0.22
     FieldInfoMetadata,  # Internal API: pydantic-rebuild-safe sa_type carrier
     get_column_from_field,  # Internal API: stable since sqlmodel 0.0.22
@@ -55,12 +58,13 @@ if getattr(FieldInfoMetadata, '__hash__') is None:
 _FIM_UNSET_SA_TYPE = FieldInfoMetadata().sa_type
 
 # Import _compat for side effects (Python 3.14 monkey-patches)
-import sqlmodel_ext._compat  # noqa: F401
+from sqlmodel_ext import _compat as _compat  # noqa: F401  # redundant alias marks the import as intentional
 
+from sqlmodel_ext._type_unwrap import TYPING_UNION
 from sqlmodel_ext._sa_type import (
-    _extract_sa_type_from_annotation,
-    _resolve_annotations,
-    _evaluate_annotation_from_string,
+    extract_sa_type_from_annotation,
+    resolve_annotations,
+    evaluate_annotation_from_string,
 )
 from sqlmodel_ext.constants import OPTIMISTIC_LOCK_VERSION_COLUMN
 from sqlmodel_ext.unset import (
@@ -91,7 +95,8 @@ else:
 
 # Python 3.14+ support
 if sys.version_info >= (3, 14):
-    import annotationlib  # noqa: F401
+    # Statically unreachable at the checker's pythonVersion 3.12 (lowest supported); runs on 3.14+.
+    import annotationlib  # noqa: F401  # pyright: ignore[reportUnreachable]
 else:
     annotationlib = None
 
@@ -592,8 +597,8 @@ def _apply_partial(
             if _contains_forward_ref(original_ann):
                 raise TypeError(
                     f"partial=True: field {field_name!r} still has an unresolved forward reference "
-                    f"({original_ann!r}); define the referenced class and call "
-                    f"model_rebuild() on the base class before deriving the partial class"
+                    + f"({original_ann!r}); define the referenced class and call "
+                    + f"model_rebuild() on the base class before deriving the partial class"
                 )
 
         # When a field is declared as ``field: T = Field(gt=..., le=...)`` (non-Annotated form),
@@ -690,7 +695,7 @@ def _recover_annotated_sqlmodel_fields(
         union_origin = get_origin(field_type)
         # ``X | None`` (PEP 604) has origin ``types.UnionType``; ``Union[X, None]`` is ``typing.Union``.
         # Match both without depending on ``types`` import inside any version block.
-        is_union = union_origin is typing.Union or (
+        is_union = union_origin is TYPING_UNION or (
             union_origin is not None and getattr(union_origin, '__name__', '') == 'UnionType'
         )
         if is_union:
@@ -917,7 +922,7 @@ def _make_sti_fk_resolver(
                     if col_name not in table.c:
                         raise RuntimeError(
                             f"STI FK resolution failed: column '{col_name}' "
-                            f"not in table '{table.name}' (class {cls_name})"
+                            + f"not in table '{table.name}' (class {cls_name})"
                         )
                     columns.append(table.c[col_name])
                     break
@@ -941,7 +946,7 @@ def _make_sti_fk_resolver(
 # metaclass (``__DeclarativeMeta.__new__``) **intercepts** these markers,
 # removes them from ``table_args`` (never handing them to SQLAlchemy), and
 # pushes (target class, markers) onto the module-level queue
-# ``_classes_with_custom_table_args`` for downstream infrastructure (e.g. the
+# ``classes_with_custom_table_args`` for downstream infrastructure (e.g. the
 # STI deferred index in ``mixins.polymorphic``) to scan and consume at the
 # right moment.
 #
@@ -958,7 +963,7 @@ class CustomTableArg:
     Objects inheriting this class, when placed in ``table_args``, are
     **intercepted** by the SQLModel metaclass -- never passed to SQLAlchemy
     ``Table.__init__`` (avoiding immediate-evaluation failures) and instead
-    stashed on the ``_classes_with_custom_table_args`` queue for downstream
+    stashed on the ``classes_with_custom_table_args`` queue for downstream
     infrastructure to consume.
 
     Concrete subclass example: ``mixins.polymorphic.DeferredIndex``
@@ -966,13 +971,16 @@ class CustomTableArg:
     """
 
 
-_classes_with_custom_table_args: list[tuple[type, list[CustomTableArg]]] = []
+classes_with_custom_table_args: list[tuple[type, list[CustomTableArg]]] = []
 """
 Queue of classes carrying custom ``table_args`` elements: ``(class, [CustomTableArg, ...])``.
 
 Appended by ``__DeclarativeMeta.__new__`` after class creation completes.
 Downstream infrastructure (e.g. ``mixins.polymorphic._create_sti_deferred_indexes()``)
 scans this queue and consumes entries as needed (dispatching on ``isinstance``).
+
+Internal protocol, not part of the public API: public name only because
+:mod:`sqlmodel_ext.mixins.polymorphic` consumes it across module boundaries.
 """
 
 
@@ -986,7 +994,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
     4.  **Smart merge**: When both dict and kwargs are provided, merges them (kwargs take priority).
     """
 
-    _KNOWN_MAPPER_KEYS = {
+    _KNOWN_MAPPER_KEYS: typing.ClassVar[set[str]] = {
         "polymorphic_on",
         "polymorphic_identity",
         "polymorphic_abstract",
@@ -1068,7 +1076,10 @@ class __DeclarativeMeta(SQLModelMetaclass):
             if not _is_inheriting_table and 'version_id_col' not in attrs.get('__mapper_args__', {}):
                 _static_mapper_args = dict(attrs.get('__mapper_args__', {}))
 
-                def _mapper_args_with_version_col(target_cls, _static=_static_mapper_args):
+                def _mapper_args_with_version_col(
+                        target_cls: Any,
+                        _static: dict[str, Any] = _static_mapper_args,
+                ) -> dict[str, Any]:
                     merged = dict(_static)
                     merged['version_id_col'] = target_cls.__table__.c[OPTIMISTIC_LOCK_VERSION_COLUMN]
                     return merged
@@ -1084,7 +1095,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
             # Split out CustomTableArg markers -- never handed to SQLAlchemy
             # (avoiding immediate evaluation against not-yet-existing
             # columns); stashed on the module-level
-            # ``_classes_with_custom_table_args`` queue for downstream
+            # ``classes_with_custom_table_args`` queue for downstream
             # infrastructure (e.g. STI deferred indexes) to consume.
             real_table_args: list[Any] = []
             custom_table_args: list[CustomTableArg] = []
@@ -1105,7 +1116,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
             attrs['__abstract__'] = kwargs.pop('abstract')
 
         # 4. Extract sa_type from Annotated metadata and inject into Field
-        annotations, annotation_strings, eval_globals, eval_locals = _resolve_annotations(attrs)
+        annotations, annotation_strings, eval_globals, eval_locals = resolve_annotations(attrs)
 
         # Snapshot the names this class body declares itself. Must be taken
         # before _recover_annotated_sqlmodel_fields, which injects inherited
@@ -1130,8 +1141,8 @@ class __DeclarativeMeta(SQLModelMetaclass):
         if OPTIMISTIC_LOCK_VERSION_COLUMN in _own_annotation_names:
             raise TypeError(
                 f"{name}: '{OPTIMISTIC_LOCK_VERSION_COLUMN}' is reserved for "
-                f"OptimisticLockMixin's version_id_col and cannot be declared by a model. "
-                f"Use another name (e.g. 'version' or 'revision') for a domain version field."
+                + f"OptimisticLockMixin's version_id_col and cannot be declared by a model. "
+                + f"Use another name (e.g. 'version' or 'revision') for a domain version field."
             )
 
         # 4.6. partial: turn inherited fields into omissible fields (Unset | T = Unset).
@@ -1139,12 +1150,12 @@ class __DeclarativeMeta(SQLModelMetaclass):
         if 'all_fields_optional' in kwargs:
             raise TypeError(
                 f"{name}: the 'all_fields_optional' class keyword was removed in "
-                f"sqlmodel-ext 0.5.0. Use 'partial=True' instead. The semantics changed: "
-                f"omitted fields are now 'Unset' (pydantic's MISSING sentinel), not None, "
-                f"and explicit null is only accepted where the base field allows None. "
-                f"Replace 'x is not None' / 'x is None' checks on such fields with "
-                f"'x is not Unset' / 'x is Unset' (from sqlmodel_ext import Unset); "
-                f"Unset fields are already excluded from model_dump()."
+                + f"sqlmodel-ext 0.5.0. Use 'partial=True' instead. The semantics changed: "
+                + f"omitted fields are now 'Unset' (pydantic's MISSING sentinel), not None, "
+                + f"and explicit null is only accepted where the base field allows None. "
+                + f"Replace 'x is not None' / 'x is None' checks on such fields with "
+                + f"'x is not Unset' / 'x is Unset' (from sqlmodel_ext import Unset); "
+                + f"Unset fields are already excluded from model_dump()."
             )
         is_partial = kwargs.pop('partial', False)
         if is_partial:
@@ -1153,8 +1164,8 @@ class __DeclarativeMeta(SQLModelMetaclass):
             if will_be_table:
                 raise TypeError(
                     f"{name}: 'partial=True' cannot be combined with 'table=True' -- the "
-                    f"partial default is 'Unset', which cannot be stored. Use a separate "
-                    f"non-table DTO class for PATCH payloads."
+                    + f"partial default is 'Unset', which cannot be stored. Use a separate "
+                    + f"non-table DTO class for PATCH payloads."
                 )
             _apply_partial(annotations, attrs, bases, _own_annotation_names)
 
@@ -1164,7 +1175,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
                 attrs['__annotate__'] = None
 
         for field_name, field_type in annotations.items():
-            field_type = _evaluate_annotation_from_string(
+            field_type = evaluate_annotation_from_string(
                 field_name, annotation_strings, field_type, eval_globals, eval_locals,
             )
 
@@ -1179,7 +1190,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
             if origin is Mapped:
                 continue
 
-            sa_type = _extract_sa_type_from_annotation(field_type)
+            sa_type = extract_sa_type_from_annotation(field_type)
 
             if sa_type is not None:
                 field_value = attrs.get(field_name, Undefined)
@@ -1230,7 +1241,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
         # constructed at this point, so consumers can access __table__ etc.
         _custom_args = attrs.get('__custom_table_args__')
         if _custom_args:
-            _classes_with_custom_table_args.append((result, _custom_args))
+            classes_with_custom_table_args.append((result, _custom_args))
 
         # 7. Restore SQLModel FieldInfo attributes discarded by Pydantic and rebuild Columns.
         # Pydantic FieldInfo uses __slots__, so setattr for SQLModel extensions is silently
@@ -1268,8 +1279,8 @@ class __DeclarativeMeta(SQLModelMetaclass):
                 if rel_name in attrs:
                     raise TypeError(
                         f"Class {name} cannot redefine parent {base.__name__}'s "
-                        f"Relationship field '{rel_name}'. "
-                        f"Modify the relationship in the parent class instead."
+                        + f"Relationship field '{rel_name}'. "
+                        + f"Modify the relationship in the parent class instead."
                     )
 
         # 10. Inherit parent field descriptions (use_attribute_docstrings fix)
@@ -1329,7 +1340,9 @@ class __DeclarativeMeta(SQLModelMetaclass):
         is a table model. This fix detects JTI scenarios and forces the call
         to create the child table.
         """
-        from sqlmodel.main import is_table_model_class, DeclarativeMeta, ModelMetaclass
+        from pydantic._internal._model_construction import ModelMetaclass
+        from sqlalchemy.orm import DeclarativeMeta
+        from sqlmodel._compat import is_table_model_class
 
         if not is_table_model_class(cls):
             ModelMetaclass.__init__(cls, name, bases, attrs, **kwargs)
@@ -1404,16 +1417,15 @@ class __DeclarativeMeta(SQLModelMetaclass):
 
         if is_joined_inheritance:
             # JTI: create child table
-            from sqlalchemy import Column, ForeignKey
+            from sqlalchemy import ForeignKey
             from sqlalchemy import Uuid as SA_UUID
             from sqlalchemy.exc import NoInspectionAvailable
             from sqlalchemy.orm.attributes import InstrumentedAttribute
 
             # Collect all ancestor table column names
             ancestor_column_names: set[str] = set()
-            for ancestor in cls.__mro__:
-                if ancestor is cls:
-                    continue
+            # ``__mro__[0]`` is ``cls`` itself; only its ancestors are collected.
+            for ancestor in cls.__mro__[1:]:
                 if is_table_model_class(ancestor):
                     try:
                         mapper = sa_inspect(ancestor)
@@ -1586,9 +1598,14 @@ class __DeclarativeMeta(SQLModelMetaclass):
                                         if _fk_field in _model_fields:
                                             _tbl = parent_cls.__table__
                                             _fn = _fk_field
-                                            rel_kwargs['foreign_keys'] = (
-                                                lambda _t=_tbl, _f=_fn: [_t.c[_f]]
-                                            )
+                                            # Defaults bind the current loop values (late-binding closure guard).
+                                            def _resolve_fk_columns(
+                                                _t: Table = _tbl,
+                                                _f: str = _fn,
+                                            ) -> list[Column[Any]]:
+                                                return [_t.c[_f]]
+
+                                            rel_kwargs['foreign_keys'] = _resolve_fk_columns
 
                                     properties[rel_name] = sa_relationship(relationship_to, *rel_args, **rel_kwargs)
 
@@ -1710,7 +1727,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
     Must be used together with TableBaseMixin or UUIDTableBaseMixin for table models.
     """
 
-    model_config = SQLModelExtConfig(
+    model_config: typing.ClassVar[SQLModelExtConfig] = SQLModelExtConfig(
         use_attribute_docstrings=True, validate_by_name=True, extra='forbid',
     )
 
@@ -1807,6 +1824,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
         return _normalise(data)
 
     @classmethod
+    @typing.override
     def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """
         Add the sentinel branch to omissible fields (only when ``omitted_sentinel`` is on).
@@ -1880,6 +1898,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
         return super().model_json_schema(*bound.args, **bound.kwargs)
 
     @classmethod
+    @typing.override
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         """Discover, at class creation, the fields that need the construction-time JSON check (see ``__orjson_checked_fields__``)."""
         super().__pydantic_init_subclass__(**kwargs)
@@ -1888,6 +1907,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
             if _annotation_contains_orjson_checked_type(field_info.annotation)
         )
 
+    @typing.override
     def model_post_init(self, context: Any, /) -> None:
         """
         Construction-time invariant: ``JSON100K`` / ``JSONList100K`` values must be encodable and within the size limit.
@@ -1911,6 +1931,7 @@ class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
                 _ensure_json_within_limits(value)
 
     @classmethod
+    @typing.override
     def __get_pydantic_json_schema__(
         cls,
         core_schema: Any,
@@ -1990,7 +2011,7 @@ class ExtraIgnoreModelBase(SQLModelBase):
     (those should keep 'forbid' to catch mistakes).
     """
 
-    model_config = SQLModelExtConfig(
+    model_config: typing.ClassVar[SQLModelExtConfig] = SQLModelExtConfig(
         use_attribute_docstrings=True, validate_by_name=True, extra='ignore',
     )
 
@@ -2024,7 +2045,7 @@ class ExtraIgnoreModelBase(SQLModelBase):
             sample = [name[:64] for name in sorted(unknown)[:5]]
             logger.warning(
                 "External input contains unknown fields | model=%s "
-                "unknown_count=%d sample_fields=%s",
+                + "unknown_count=%d sample_fields=%s",
                 cls.__name__, total, sample,
             )
         return data

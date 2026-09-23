@@ -3,8 +3,8 @@
   // Run `basedpyright` from the repository root (it picks this file up automatically).
   // basedpyright reads this file as JSONC, so comments are allowed.
   //
-  // Everything not listed below keeps basedpyright's defaults. The gate is 0 errors;
-  // warnings are reported but do not fail CI.
+  // Everything not listed below keeps basedpyright's defaults. The gate is 0 errors
+  // and 0 warnings: any warning fails CI (see "failOnWarnings" below).
   //
   // Scope: `src` only. The test suite deliberately exercises dynamic / invalid usage
   // (runtime-attached attributes, fake dialects, wrong-typed arguments to assert the
@@ -15,9 +15,9 @@
   "pythonVersion": "3.12",
   "include": ["src"],
 
-  // basedpyright's default ("recommended") mode exits non-zero on warnings too; the
-  // gate here is errors only, warnings stay visible in the output.
-  "failOnWarnings": false,
+  // Exit non-zero on warnings too (basedpyright's "recommended" default, stated
+  // explicitly so the gate does not depend on the default).
+  "failOnWarnings": true,
 
   // Every `import sqlmodel_ext.<submodule>` inside the package implicitly imports the
   // re-exporting `sqlmodel_ext/__init__.py`, which the checker reports as a cycle

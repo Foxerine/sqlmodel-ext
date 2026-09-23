@@ -132,8 +132,8 @@ def import_targets(targets: list[str], import_paths: list[pathlib.Path], root: p
         if not module.__file__ or not _is_under(loaded, root):
             raise SystemExit(
                 f"[ABORT] '{target}' was imported from {loaded or '<no file>'}, "
-                f"which is outside the project root {root}. The results would describe "
-                f"other code; aborting."
+                + f"which is outside the project root {root}. The results would describe "
+                + f"other code; aborting."
             )
         package_path: list[str] | None = getattr(module, '__path__', None)
         if package_path is None:
@@ -280,7 +280,7 @@ def find_basedpyright(explicit: str | None) -> pathlib.Path:
     if found is None:
         raise SystemExit(
             "[ABORT] basedpyright not found (install it: pip install 'basedpyright>=1.40.1', "
-            "or pass --basedpyright PATH)"
+            + "or pass --basedpyright PATH)"
         )
     return pathlib.Path(found)
 
@@ -511,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
     if _is_under(temp_parent, root):
         raise SystemExit(
             f"[ABORT] the system temporary directory {temp_parent} is inside the project {root}; "
-            f"point TMPDIR / TEMP / TMP outside the project"
+            + f"point TMPDIR / TEMP / TMP outside the project"
         )
     holder = pathlib.Path(tempfile.mkdtemp(prefix='check-derived-', dir=temp_parent))
     if _is_under(holder, root):
@@ -525,8 +525,8 @@ def main(argv: list[str] | None = None) -> int:
         spans = derived_decls.write_into(expanded, root, expansions)
         print(
             f"[..] expanded {len(expansions)} class(es) / "
-            f"{sum(len(expansion.methods) for expansion in expansions)} inherited member(s) "
-            f"({time.monotonic() - started:.1f}s)"
+            + f"{sum(len(expansion.methods) for expansion in expansions)} inherited member(s) "
+            + f"({time.monotonic() - started:.1f}s)"
         )
 
         found = diagnose(expanded, executable, python)
@@ -542,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
         if not introduced:
             print(
                 f"[OK] all {len(found)} error(s) already exist without expansion; none introduced "
-                f"({time.monotonic() - started:.1f}s)"
+                + f"({time.monotonic() - started:.1f}s)"
             )
             return 0
 
@@ -551,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         report(blocking, BLOCKING_BANNER, BLOCKING_ADVICE)
         print(
             f"\n[{'FAIL' if blocking else 'OK'}] blocking {len(blocking)} / latent {len(latent)} "
-            f"({time.monotonic() - started:.1f}s)"
+            + f"({time.monotonic() - started:.1f}s)"
         )
         return 1 if blocking else 0
     finally:

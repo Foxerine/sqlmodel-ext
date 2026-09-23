@@ -154,14 +154,14 @@ async def get(
     offset: int | None = None,
     limit: int | None = None,
     fetch_mode: Literal["one", "first", "all"] = "first",
-    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
     options: list[ExecutableOption] | None = None,
     load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
     order_by: list[ColumnElement[Any]] | None = None,
     filter: ColumnElement[bool] | bool | None = None,
     with_for_update: bool = False,
     skip_locked: bool = False,
-    table_view: TableViewRequest | None = None,
+    table_view: TableViewArgument | None = None,  # TimeFilterRequest | PageWindowRequest
     jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
     populate_existing: bool = False,
     authoritative: bool = False,
@@ -195,7 +195,7 @@ async def get(
 | `filter` | `ColumnElement[bool]` | 额外 WHERE 条件 |
 | `with_for_update` | `bool` | `SELECT ... FOR UPDATE` 行锁。实例 `id()` 写入 `session.info[SESSION_FOR_UPDATE_KEY]`；**强制** `populate_existing`（无法关闭），保证拿到的是数据库最新值而不是 identity map 里的旧对象 |
 | `skip_locked` | `bool` | `FOR UPDATE SKIP LOCKED`：跳过被别的事务锁住的行而不是等待。只在 `with_for_update=True` 时生效。"0 行"也可能意味着"候选都被别人锁了"，**不要**用于存在性判断 |
-| `table_view` | `TableViewRequest` | 分页 + 排序 + 时间过滤 + keyset 游标参数包。`order` 总会追加同方向的 `id` 作为决胜列；`after_id` 应用 keyset 游标 |
+| `table_view` | `TableViewRequest`（或任意 `TimeFilterRequest` / `PageWindowRequest`，具备哪部分就应用哪部分） | 分页 + 排序 + 时间过滤 + keyset 游标参数包。`order` 总会追加同方向的 `id` 作为决胜列；`after_id` 应用 keyset 游标 |
 | `jti_subclasses` | `list[type] \| 'all'` | JTI 多态关系子类加载（需要 `load`） |
 | `populate_existing` | `bool` | 无锁地强制用数据库数据覆盖 identity map 中的对象 |
 | `authoritative` | `bool` | **授权读取**的唯一开关（结果决定是否允许某件事，必须权威）：本层等价于 `populate_existing=True`；缓存模型额外绕过 Redis。与 `populate_existing` 单调合并（取 `or`） |
@@ -346,7 +346,7 @@ async def get_with_count(
     session: AsyncSession,
     condition: ColumnElement[bool] | bool | None = None,
     *,
-    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
     options: list[ExecutableOption] | None = None,
     load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
     order_by: list[ColumnElement[Any]] | None = None,

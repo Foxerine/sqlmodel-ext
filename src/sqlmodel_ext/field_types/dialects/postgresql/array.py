@@ -14,7 +14,7 @@ Usage::
 """
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Generic, TypeVar, final, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Generic, TypeVar, final, get_origin, override
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -23,6 +23,7 @@ from pydantic_core import CoreSchema, core_schema
 from sqlalchemy import Integer, String
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.engine.interfaces import Dialect
+from sqlalchemy.types import TypeEngine
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,12 @@ _UNKNOWN_ENUM_ELEM = object()
 value; filtered out at the array level by ``_TolerantEnumArray``. A dedicated
 sentinel (rather than None) is used so it stays distinct from a genuine NULL
 element inside the array."""
+
+
+def _enum_member_values(enum_class: type[Enum]) -> list[Any]:
+    """``values_callable`` for ``sa.Enum``: the PG ENUM labels are the members'
+    ``.value`` (e.g. ``StrEnum`` strings), not their Python names."""
+    return [member.value for member in enum_class]
 
 
 class _TolerantEnum(sa.TypeDecorator[Any]):
@@ -67,17 +74,18 @@ class _TolerantEnum(sa.TypeDecorator[Any]):
     unknown fields).
     """
 
-    impl = sa.Enum
-    cache_ok = True
+    impl: TypeEngine[Any] | type[TypeEngine[Any]] = sa.Enum
+    cache_ok: bool | None = True
 
     def __init__(self, enum_class: type[Enum], name: str):
         super().__init__(
             enum_class,
             name=name,
-            values_callable=lambda e: [m.value for m in e],
+            values_callable=_enum_member_values,
         )
-        self._enum_name = name
+        self._enum_name: str = name
 
+    @override
     def result_processor(
             self, dialect: Dialect, coltype: object,
     ) -> 'Callable[[Any], Any]':
@@ -91,8 +99,8 @@ class _TolerantEnum(sa.TypeDecorator[Any]):
             except LookupError:
                 logger.warning(
                     "Enum column read an unknown value %r (enum %s); ignored -- "
-                    "likely a rolling-deployment version-skew window (the DB holds "
-                    "a newer enum value that this process's code does not yet know).",
+                    + "likely a rolling-deployment version-skew window (the DB holds "
+                    + "a newer enum value that this process's code does not yet know).",
                     value, self._enum_name,
                 )
                 return _UNKNOWN_ENUM_ELEM
@@ -109,12 +117,13 @@ class _TolerantEnumArray(sa.TypeDecorator[Any]):
     (``None``) inside the array are unaffected.
     """
 
-    impl = ARRAY
-    cache_ok = True
+    impl: TypeEngine[Any] | type[TypeEngine[Any]] = ARRAY
+    cache_ok: bool | None = True
 
     def __init__(self, item_type: '_TolerantEnum'):
         super().__init__(item_type)
 
+    @override
     def process_result_value(
             self, value: 'list[Any] | None', dialect: Dialect,
     ) -> 'list[Any] | None':
@@ -125,8 +134,13 @@ class _TolerantEnumArray(sa.TypeDecorator[Any]):
 
 # --- Pydantic/SQLModel Integration Layer ---
 @final
-class _ArrayTypeHandler:
-    """(Internal) Provides Pydantic/SQLAlchemy config for Array[T]."""
+class ArrayTypeHandler:
+    """(Internal) Provides Pydantic/SQLAlchemy config for Array[T].
+
+    Internal protocol, not part of the public API: public name only because
+    :mod:`sqlmodel_ext.field_types` reads ``max_length`` off it across module
+    boundaries (``max_length_of``).
+    """
 
     def __init__(self, item_type: type[T], max_length: int | None = None):
         self.max_length = max_length
@@ -136,7 +150,7 @@ class _ArrayTypeHandler:
         if issubclass(origin_type, Enum):
             # Enum.value is always Any in Python's type system (untyped .value attribute)
             self.item_schema = core_schema.literal_schema(
-                [member.value for member in origin_type]  # pyright: ignore[reportAny]
+                [member.value for member in origin_type]
             )
             # _TolerantEnum carries values_callable so the PG ENUM is populated
             # with the member string values (StrEnum.value) rather than the
@@ -215,4 +229,4 @@ else:
                 item_type, max_length = params
             else:
                 item_type, max_length = params, None
-            return Annotated[list[item_type], _ArrayTypeHandler(item_type, max_length)]
+            return Annotated[list[item_type], ArrayTypeHandler(item_type, max_length)]

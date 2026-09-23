@@ -49,7 +49,7 @@ degrades to the upstream behavior when no cached model is involved.
 """
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, override
 from collections.abc import Awaitable, Callable, Generator, Iterable
 
 from sqlalchemy import func, text
@@ -171,7 +171,7 @@ class AsyncSession(_AsyncSessionBase):
         if self.in_nested_transaction():
             raise RuntimeError(
                 "post-commit callbacks cannot be registered inside a savepoint "
-                "(a nested rollback could not undo them precisely)"
+                + "(a nested rollback could not undo them precisely)"
             )
         self.info.setdefault(POST_COMMIT_CALLBACKS_KEY, []).append(callback)
 
@@ -218,13 +218,14 @@ class AsyncSession(_AsyncSessionBase):
         if actual_level != REPEATABLE_READ_REPORTED_LEVEL:
             raise RuntimeError(
                 "could not raise the session to REPEATABLE READ (the isolation level setting was "
-                f"silently ignored): expected {REPEATABLE_READ_REPORTED_LEVEL!r}, got {actual_level!r}. "
-                "Most likely the session already executed SQL (the connection was established, so "
-                "execution_options were ignored) -- enter_repeatable_read() must be the first "
-                "database action of a new session."
+                + f"silently ignored): expected {REPEATABLE_READ_REPORTED_LEVEL!r}, got {actual_level!r}. "
+                + "Most likely the session already executed SQL (the connection was established, so "
+                + "execution_options were ignored) -- enter_repeatable_read() must be the first "
+                + "database action of a new session."
             )
         self.info[SESSION_REPEATABLE_READ_KEY] = True
 
+    @override
     async def commit(self, *, fail_soft_when_observed: bool = False) -> None:
         """Commit + synchronously invalidate every involved ``CachedTableBaseMixin`` model + run post-commit callbacks.
 
@@ -288,7 +289,7 @@ class AsyncSession(_AsyncSessionBase):
             except BaseException:
                 logger.exception(
                     "cache invalidation after commit failed (including cancellation) -- the database "
-                    "committed; suppressed (fail-soft), continuing with post-commit callbacks"
+                    + "committed; suppressed (fail-soft), continuing with post-commit callbacks"
                 )
             for callback in callbacks:
                 try:
@@ -296,7 +297,7 @@ class AsyncSession(_AsyncSessionBase):
                 except BaseException:
                     logger.exception(
                         "post-commit callback failed (including cancellation) -- the database "
-                        "committed; suppressed (fail-soft), continuing with the next callback"
+                        + "committed; suppressed (fail-soft), continuing with the next callback"
                     )
             return
         await CachedTableBaseMixin._flush_invalidations(self, committed)  # pyright: ignore[reportPrivateUsage]
@@ -308,6 +309,7 @@ class AsyncSession(_AsyncSessionBase):
                 # do not block later callbacks.
                 logger.exception("post-commit callback failed (the database change is committed)")
 
+    @override
     async def rollback(self, *, best_effort_budget_seconds: float | None = None) -> None:
         """Roll back + discard pending post-commit callbacks (their DB change was not persisted).
 
@@ -331,7 +333,7 @@ class AsyncSession(_AsyncSessionBase):
             except Exception:
                 logger.exception(
                     f"rollback failed / timed out (budget {best_effort_budget_seconds:.1f}s) -- "
-                    "invalidating the connection on a best-effort basis"
+                    + "invalidating the connection on a best-effort basis"
                 )
                 try:
                     await self.invalidate()
@@ -343,7 +345,8 @@ class AsyncSession(_AsyncSessionBase):
         finally:
             _ = self.info.pop(POST_COMMIT_CALLBACKS_KEY, None)
 
-    def begin(self) -> '_PostCommitAwareSessionBegin':  # pyright: ignore[reportIncompatibleMethodOverride]  # returns an enhanced handle with the same protocols
+    @override
+    def begin(self) -> '_PostCommitAwareSessionBegin':
         """Enhanced transaction context for ``async with session.begin():`` and ``await session.begin()``.
 
         The native ``AsyncSessionTransaction.__aexit__`` commits the
@@ -357,6 +360,7 @@ class AsyncSession(_AsyncSessionBase):
         """
         return _PostCommitAwareSessionBegin(self)
 
+    @override
     async def reset(self) -> None:
         """Reset the session (release transaction/connection) + clear tracking state in ``session.info``.
 
@@ -373,6 +377,7 @@ class AsyncSession(_AsyncSessionBase):
         finally:
             self._clear_tracking_state()
 
+    @override
     async def close(self) -> None:
         """Close the session + clear tracking state (symmetric with ``reset()``).
 
@@ -393,6 +398,7 @@ class AsyncSession(_AsyncSessionBase):
         _ = self.info.pop(SESSION_REPEATABLE_READ_KEY, None)
         CachedTableBaseMixin._clear_session_cache_state(self)  # pyright: ignore[reportPrivateUsage]
 
+    @override
     async def refresh(
             self,
             instance: object,
@@ -587,8 +593,8 @@ class SessionFactory(async_sessionmaker[AsyncSession]):
                     await session.rollback()
                     logger.warning(
                         f"{description}: REPEATABLE READ snapshot conflict (a unique conflict proves a "
-                        f"concurrent winner committed but it is invisible to this snapshot); discarding "
-                        f"the session and retrying: attempt={attempt}/{max_attempts}"
+                        + f"concurrent winner committed but it is invisible to this snapshot); discarding "
+                        + f"the session and retrying: attempt={attempt}/{max_attempts}"
                     )
                     continue
                 except DBAPIError as e:
@@ -607,18 +613,18 @@ class SessionFactory(async_sessionmaker[AsyncSession]):
                     await session.rollback()
                     logger.warning(
                         f"{description}: serialization failure (SQLSTATE {SERIALIZATION_FAILURE_SQLSTATE}); "
-                        f"discarding the session and retrying: attempt={attempt}/{max_attempts}"
+                        + f"discarding the session and retrying: attempt={attempt}/{max_attempts}"
                     )
                     continue
                 if session.commit_count == commits_before:
                     raise RuntimeError(
                         f"{description}: the operation returned without committing. "
-                        "run_in_repeatable_read requires the operation to commit itself; "
-                        "otherwise the session rolls back on exit and the writes are lost"
+                        + "run_in_repeatable_read requires the operation to commit itself; "
+                        + "otherwise the session rolls back on exit and the writes are lost"
                     )
                 return result
 
         raise SerializationRetryExhaustedError(
             f"{description}: serialization conflict on {max_attempts} consecutive attempts "
-            f"(SQLSTATE {SERIALIZATION_FAILURE_SQLSTATE} or REPEATABLE READ snapshot conflict); giving up"
+            + f"(SQLSTATE {SERIALIZATION_FAILURE_SQLSTATE} or REPEATABLE READ snapshot conflict); giving up"
         ) from last_error

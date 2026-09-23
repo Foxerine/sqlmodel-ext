@@ -119,9 +119,9 @@ def _bind_session(
     if not isinstance(session, AsyncSession):
         raise RuntimeError(
             f"{context}: cannot locate an AsyncSession in the call arguments "
-            f"(got {type(session).__name__}); the isolation-level guard cannot verify. "
-            "Make sure the method has a `session` parameter and that every inner "
-            "decorator uses @wraps (inspect.signature follows __wrapped__)."
+            + f"(got {type(session).__name__}); the isolation-level guard cannot verify. "
+            + "Make sure the method has a `session` parameter and that every inner "
+            + "decorator uses @wraps (inspect.signature follows __wrapped__)."
         )
     return session
 
@@ -261,14 +261,14 @@ def requires_for_update(
         if session is None:
             raise RuntimeError(
                 f"{cls_name}.{func.__name__}() cannot extract an AsyncSession from its arguments; "
-                "the row-lock guard cannot verify. Make sure the method has a `session` parameter "
-                "and that every inner decorator uses @wraps (inspect.signature follows __wrapped__)."
+                + "the row-lock guard cannot verify. Make sure the method has a `session` parameter "
+                + "and that every inner decorator uses @wraps (inspect.signature follows __wrapped__)."
             )
         locked: set[int] = session.info.get(SESSION_FOR_UPDATE_KEY, set())
         if id(self) not in locked:
             raise RuntimeError(
                 f"{cls_name}.{func.__name__}() requires a FOR UPDATE locked instance. "
-                f"Call {cls_name}.get(session, ..., with_for_update=True) first."
+                + f"Call {cls_name}.get(session, ..., with_for_update=True) first."
             )
         return await func(*args, **kwargs)
 
@@ -302,8 +302,8 @@ def validate_locked_instances(
             cls_name = type(inst).__name__
             raise RuntimeError(
                 f"{context}: {cls_name} instance is not FOR UPDATE locked -- call "
-                f"{cls_name}.get(session, ..., with_for_update=True) first and hold the "
-                "lock until the transaction commits"
+                + f"{cls_name}.get(session, ..., with_for_update=True) first and hold the "
+                + "lock until the transaction commits"
             )
 
 
@@ -339,7 +339,7 @@ def requires_locked_param(
             if 'session' not in bound.arguments:
                 raise RuntimeError(
                     f"{context}: the decorated callable has no `session` parameter, "
-                    "the row-lock guard cannot verify (fail-closed)"
+                    + "the row-lock guard cannot verify (fail-closed)"
                 )
             target = bound.arguments.get(param_name)
             if target is None:
@@ -412,8 +412,8 @@ def requires_repeatable_read(
         if not session.info.get(SESSION_REPEATABLE_READ_KEY, False):
             raise RuntimeError(
                 f"{context} requires a REPEATABLE READ transaction (reads across statements "
-                "must see one snapshot). Orchestrate this call from the outermost entry point "
-                "via session_factory.run_in_repeatable_read(...)."
+                + "must see one snapshot). Orchestrate this call from the outermost entry point "
+                + "via session_factory.run_in_repeatable_read(...)."
             )
         return await func(*args, **kwargs)
 
@@ -464,9 +464,9 @@ def requires_read_committed(
         if isolation != 'read committed':
             raise RuntimeError(
                 f"{context} requires a READ COMMITTED transaction (a per-statement snapshot is "
-                f"needed to see concurrent commits); actual isolation level = {isolation!r}. "
-                "Do not call it inside run_in_repeatable_read or any transaction whose isolation "
-                "level was changed (session / connection / engine)."
+                + f"needed to see concurrent commits); actual isolation level = {isolation!r}. "
+                + "Do not call it inside run_in_repeatable_read or any transaction whose isolation "
+                + "level was changed (session / connection / engine)."
             )
         return await func(*args, **kwargs)
 
@@ -530,7 +530,7 @@ class RelationPreloadMixin:
                     if spec not in all_available_names and not hasattr(cls, spec):
                         raise AttributeError(
                             f"{cls.__name__}.{method_name} declares relation '{spec}', "
-                            f"but {cls.__name__} has no such attribute"
+                            + f"but {cls.__name__} has no such attribute"
                         )
 
     def _is_relation_loaded(self, rel_name: str) -> bool:
@@ -583,7 +583,7 @@ class RelationPreloadMixin:
                 if parent_attr is None:
                     logger.warning(
                         f"Cannot find relationship path from {self.__class__.__name__} "
-                        f"to {parent_class.__name__}, cannot check if {rel.key} is loaded"
+                        + f"to {parent_class.__name__}, cannot check if {rel.key} is loaded"
                     )
                     to_load.append(rel)
                     continue

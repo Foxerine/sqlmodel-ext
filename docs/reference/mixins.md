@@ -171,7 +171,7 @@ from sqlmodel_ext import PolymorphicBaseMixin
 
 ```python
 @classmethod
-def _is_joined_table_inheritance(cls) -> bool
+def is_joined_table_inheritance(cls) -> bool
 
 @classmethod
 def get_concrete_subclasses(cls) -> list[type[PolymorphicBaseMixin]]

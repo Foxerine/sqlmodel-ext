@@ -42,6 +42,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   field the rule constrains (`after_id`, `created_before_datetime`,
   `updated_before_datetime`) instead of the model root, and independent violations are
   reported together. `TimeFilterRequest` no longer overrides `model_post_init`.
+- `PolymorphicBaseMixin._is_joined_table_inheritance()` is renamed
+  `is_joined_table_inheritance()` (it was documented and called across modules; the
+  underscore was not a real boundary). Update direct callers.
+- `get(table_view=...)` is annotated `TableViewArgument` (`TimeFilterRequest |
+  PageWindowRequest`), matching what it already accepted at runtime (e.g. a bare
+  `PageWindowRequest`). The `join=(Model, onclause)` ON clause is annotated with the
+  new `OnClauseArgument` alias (SQLAlchemy's public `OnClauseRole`) instead of
+  SQLAlchemy's private `_OnClauseArgument`.
+- The type-check gate of the repository is now 0 errors **and 0 warnings**
+  (`failOnWarnings: true`).
 
 ## [0.5.0]
 

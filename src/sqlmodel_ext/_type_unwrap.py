@@ -17,7 +17,15 @@ from a ``response_model`` to its DTO / ORM classes).
 """
 import types
 import typing
-from typing import Annotated, Any, Union
+from typing import Annotated, Any, Final
+
+# ``typing.Union`` as a runtime value: the ``get_origin()`` of ``Optional[X]`` /
+# ``Union[X, Y]`` on Python < 3.14 (``X | Y`` has origin ``types.UnionType``).
+# reportDeprecated targets spelling *annotations* with ``Union`` (use ``X | Y``);
+# an identity-comparison target has no non-deprecated spelling, so the single
+# reference lives here and every origin check in the package compares against
+# this name (internal protocol, not part of the public API).
+TYPING_UNION: Final = typing.Union  # pyright: ignore[reportDeprecated]
 
 
 def unwrap_to_class(hint: Any) -> type | None:
@@ -41,7 +49,7 @@ def unwrap_to_class(hint: Any) -> type | None:
             return unwrap_to_class(args[0])
 
     # X | None (UnionType) or Optional[X] (Union[X, None])
-    if origin is types.UnionType or origin is Union:  # pyright: ignore[reportDeprecated]
+    if origin is types.UnionType or origin is TYPING_UNION:
         args = typing.get_args(hint)
         non_none = [a for a in args if a is not type(None)]
         if len(non_none) == 1:

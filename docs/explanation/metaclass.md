@@ -126,7 +126,7 @@ real_table_args, custom_table_args = [], []
 for arg in raw_table_args:
     (custom_table_args if isinstance(arg, CustomTableArg) else real_table_args).append(arg)
 attrs['__table_args__'] = tuple(real_table_args)
-# super().__new__ 之后追加到模块级队列 _classes_with_custom_table_args
+# super().__new__ 之后追加到模块级队列 classes_with_custom_table_args
 ```
 
 **为什么**：SQLAlchemy 的 `Table.__init__` 会立即消费 `__table_args__` 的每个元素——引用尚不存在的列的 `Index` 当场抛错。`CustomTableArg` 是通用的"延迟处理"标记：元类只负责拦截 + 入队，不知道具体语义；目前的消费者是 `mixins.polymorphic.DeferredIndex`（STI 子类列的延迟索引）。`table_name=` / `abstract=` 分别转成 `__tablename__` / `__abstract__`。
@@ -134,7 +134,7 @@ attrs['__table_args__'] = tuple(real_table_args)
 ### 第 4 步：解析注解，记录"本类自己声明了哪些字段"
 
 ```python
-annotations, annotation_strings, eval_globals, eval_locals = _resolve_annotations(attrs)
+annotations, annotation_strings, eval_globals, eval_locals = resolve_annotations(attrs)
 _own_annotation_names = frozenset(annotations)
 ```
 
@@ -178,7 +178,7 @@ if is_partial:
 
 ```python
 for field_name, field_type in annotations.items():
-    sa_type = _extract_sa_type_from_annotation(field_type)
+    sa_type = extract_sa_type_from_annotation(field_type)
     if sa_type is not None:
         field_value = attrs.get(field_name, Undefined)
         if field_value is Undefined:
@@ -195,10 +195,10 @@ for field_name, field_type in annotations.items():
 
 `_durably_set_sa_type()` 把 `sa_type` 写进 `FieldInfo.metadata` 里的 `FieldInfoMetadata` 条目——这正是 SQLModel 自己的 `Field(sa_type=...)` 使用、并且能撑过 Pydantic 重建 `model_fields` 的通道；直接 `setattr` 会在列构建之前丢失。已经显式设置的 `sa_type` 不会被覆盖。
 
-#### `_extract_sa_type_from_annotation()` 的三种提取方式
+#### `extract_sa_type_from_annotation()` 的三种提取方式
 
 ```python
-def _extract_sa_type_from_annotation(annotation):
+def extract_sa_type_from_annotation(annotation):
     # 方式 1：类型本身有 __sqlmodel_sa_type__ 属性
     # 方式 2：Annotated 的元数据项有 __sqlmodel_sa_type__，或其 __get_pydantic_core_schema__
     #         返回的 schema 的 metadata 里有 'sa_type'
@@ -206,7 +206,7 @@ def _extract_sa_type_from_annotation(annotation):
     ...
 ```
 
-以 `Array[str]` 为例：`__class_getitem__` 返回 `Annotated[list[str], _ArrayTypeHandler(str)]`，而 `_ArrayTypeHandler` 的 schema 带有 `metadata={'sa_type': ARRAY(String)}`；`JSON100K` 的 schema 带有 `metadata={'sa_type': JSONB}`。**类型自己声明它的列类型**，元类负责把它送到列构建器。
+以 `Array[str]` 为例：`__class_getitem__` 返回 `Annotated[list[str], ArrayTypeHandler(str)]`，而 `ArrayTypeHandler` 的 schema 带有 `metadata={'sa_type': ARRAY(String)}`；`JSON100K` 的 schema 带有 `metadata={'sa_type': JSONB}`。**类型自己声明它的列类型**，元类负责把它送到列构建器。
 
 ### 第 5–7 步：保存 SQLModel 的 `FieldInfo`，调用父类，再恢复
 

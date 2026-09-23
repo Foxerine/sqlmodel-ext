@@ -52,7 +52,8 @@ jobs:
   # -------------------------------------------------------------------
   # Job 1b: static type check. basedpyright reads pyrightconfig.json from
   # the repository root (src only, pythonVersion 3.12 = lowest supported).
-  # The gate is 0 errors; warnings are printed but do not fail the job.
+  # The gate is 0 errors and 0 warnings: pyrightconfig.json sets failOnWarnings,
+  # so any warning makes basedpyright exit non-zero and fails the job.
   # The alembic extra is installed so the optional-import module
   # `mixins/migration_cache_invalidation.py` resolves its imports.
   # "0 errors" is also what an empty scan prints, so the job additionally

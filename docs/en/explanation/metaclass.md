@@ -126,7 +126,7 @@ real_table_args, custom_table_args = [], []
 for arg in raw_table_args:
     (custom_table_args if isinstance(arg, CustomTableArg) else real_table_args).append(arg)
 attrs['__table_args__'] = tuple(real_table_args)
-# appended to the module-level queue _classes_with_custom_table_args after super().__new__
+# appended to the module-level queue classes_with_custom_table_args after super().__new__
 ```
 
 **Why**: SQLAlchemy's `Table.__init__` consumes every element of `__table_args__` immediately — an `Index` referencing a not-yet-existing column raises on the spot. `CustomTableArg` is a generic "defer this" marker: the metaclass only intercepts and enqueues, knowing nothing about the semantics; the current consumer is `mixins.polymorphic.DeferredIndex` (deferred indexes on STI subclass columns). `table_name=` / `abstract=` become `__tablename__` / `__abstract__`.
@@ -134,7 +134,7 @@ attrs['__table_args__'] = tuple(real_table_args)
 ### Step 4: Resolve annotations and record "which fields this class declares itself"
 
 ```python
-annotations, annotation_strings, eval_globals, eval_locals = _resolve_annotations(attrs)
+annotations, annotation_strings, eval_globals, eval_locals = resolve_annotations(attrs)
 _own_annotation_names = frozenset(annotations)
 ```
 
@@ -178,7 +178,7 @@ The generated annotations exist at runtime; static type checkers still see the b
 
 ```python
 for field_name, field_type in annotations.items():
-    sa_type = _extract_sa_type_from_annotation(field_type)
+    sa_type = extract_sa_type_from_annotation(field_type)
     if sa_type is not None:
         field_value = attrs.get(field_name, Undefined)
         if field_value is Undefined:
@@ -195,10 +195,10 @@ for field_name, field_type in annotations.items():
 
 `_durably_set_sa_type()` writes `sa_type` into a `FieldInfoMetadata` entry of `FieldInfo.metadata` — the channel SQLModel's own `Field(sa_type=...)` uses and that survives Pydantic's `model_fields` rebuild; a plain `setattr` would be lost before the column is built. An explicitly set `sa_type` is never overwritten.
 
-#### `_extract_sa_type_from_annotation()` — three extraction methods
+#### `extract_sa_type_from_annotation()` — three extraction methods
 
 ```python
-def _extract_sa_type_from_annotation(annotation):
+def extract_sa_type_from_annotation(annotation):
     # Method 1: the type itself has a __sqlmodel_sa_type__ attribute
     # Method 2: an Annotated metadata item has __sqlmodel_sa_type__, or the schema returned by
     #           its __get_pydantic_core_schema__ carries 'sa_type' in its metadata
@@ -206,7 +206,7 @@ def _extract_sa_type_from_annotation(annotation):
     ...
 ```
 
-Take `Array[str]`: `__class_getitem__` returns `Annotated[list[str], _ArrayTypeHandler(str)]`, and the `_ArrayTypeHandler` schema carries `metadata={'sa_type': ARRAY(String)}`; the `JSON100K` schema carries `metadata={'sa_type': JSONB}`. **The type declares its own column type**, and the metaclass delivers it to the column builder.
+Take `Array[str]`: `__class_getitem__` returns `Annotated[list[str], ArrayTypeHandler(str)]`, and the `ArrayTypeHandler` schema carries `metadata={'sa_type': ARRAY(String)}`; the `JSON100K` schema carries `metadata={'sa_type': JSONB}`. **The type declares its own column type**, and the metaclass delivers it to the column builder.
 
 ### Steps 5–7: Save SQLModel `FieldInfo`s, call the parent, restore
 

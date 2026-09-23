@@ -358,7 +358,7 @@ from sqlmodel_ext.field_types.dialects.postgresql import JSON100K, JSONList100K,
 
 契约：**对象进，对象出**。
 
-- **入站**：接受 JSON 对象 / 数组（推荐）或 JSON **字符串**（兼容形式）。两种形式都要满足：可编码（嵌套深度在 orjson 与 Pydantic 两个序列化器的上限内——Pydantic 约 98 层）且规范编码不超过 100K **字符**（按字符而不是 UTF-8 字节计，中文不会被提前 3 倍拒绝）。
+- **入站**：接受 JSON 对象 / 数组（推荐）或 JSON **字符串**（兼容形式）。两种形式都要满足：可编码（嵌套深度在 orjson 与 Pydantic 两个序列化器的上限内——Pydantic 的上限与平台有关，Windows 构建约 98 层，Linux 上更高）且规范编码不超过 100K **字符**（按字符而不是 UTF-8 字节计，中文不会被提前 3 倍拒绝）。
 - **出站**：`model_dump()`、`model_dump(mode='json')`、`model_dump_json()` 都输出对象 / 数组本身（0.5.0 起；此前输出 JSON 字符串）。序列化 schema 声明为纯 object / array；校验 schema 如实声明为 `anyOf[object, string]`。
 - **表模型也检查**：`table=True` 模型跳过 Pydantic 校验，`SQLModelBase.model_post_init` 会对这些字段调用 `ensure_json_within_limits`（覆写 `model_post_init` 时必须调用 `super()`）。绕过模型的代码路径可以直接调用 `ensure_json_within_limits(value)`。
 - 100K 上限不会出现在 JSON Schema 里（JSON Schema 无法对对象表达"编码长度"），请写进字段 docstring。

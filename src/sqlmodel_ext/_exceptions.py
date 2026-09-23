@@ -12,5 +12,5 @@ class RecordNotFoundError(Exception):
     status_code: int = 404
 
     def __init__(self, detail: str = "Not found"):
-        self.detail = detail
+        self.detail: str = detail
         super().__init__(detail)

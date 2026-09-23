@@ -2,15 +2,27 @@
 Internal helpers for extracting SQLAlchemy types from annotations.
 
 These are used by the metaclass to inject sa_type into Field definitions.
+
+Internal protocol, not part of the public API: the functions carry public names
+only because :mod:`sqlmodel_ext.base` (the metaclass) imports them across module
+boundaries; the module itself stays private (``_sa_type``).
 """
 import sys
 import typing
-from typing import Any, Mapping, get_args, get_origin, get_type_hints
+from collections.abc import Mapping
+from typing import Any, get_args, get_origin, get_type_hints
 
-from sqlalchemy.orm import Mapped
+
+def _null_schema_handler(_source_type: Any) -> None:
+    """
+    Stand-in for pydantic's ``GetCoreSchemaHandler`` when probing a type's
+    ``__get_pydantic_core_schema__`` for ``metadata['sa_type']``: the probe
+    only reads the metadata and never needs the delegated inner schema.
+    """
+    return None
 
 
-def _extract_sa_type_from_annotation(annotation: Any) -> Any | None:
+def extract_sa_type_from_annotation(annotation: Any) -> Any | None:
     """
     Extract SQLAlchemy type from a type annotation.
 
@@ -40,7 +52,7 @@ def _extract_sa_type_from_annotation(annotation: Any) -> Any | None:
                     try:
                         schema = item.__get_pydantic_core_schema__(
                             annotation,
-                            lambda x: None,
+                            _null_schema_handler,
                         )
                         if isinstance(schema, dict) and 'metadata' in schema:
                             sa_type = schema['metadata'].get('sa_type')
@@ -54,7 +66,7 @@ def _extract_sa_type_from_annotation(annotation: Any) -> Any | None:
         try:
             schema = annotation.__get_pydantic_core_schema__(
                 annotation,
-                lambda x: None,
+                _null_schema_handler,
             )
             if isinstance(schema, dict) and 'metadata' in schema:
                 sa_type = schema['metadata'].get('sa_type')
@@ -66,7 +78,7 @@ def _extract_sa_type_from_annotation(annotation: Any) -> Any | None:
     return None
 
 
-def _resolve_annotations(attrs: dict[str, Any]) -> tuple[
+def resolve_annotations(attrs: dict[str, Any]) -> tuple[
     dict[str, Any],
     dict[str, str],
     Mapping[str, Any],
@@ -112,7 +124,7 @@ def _resolve_annotations(attrs: dict[str, Any]) -> tuple[
     return dict(evaluated), {}, module_globals, localns
 
 
-def _evaluate_annotation_from_string(
+def evaluate_annotation_from_string(
     field_name: str,
     annotation_strings: dict[str, str],
     current_type: Any,
@@ -129,7 +141,7 @@ def _evaluate_annotation_from_string(
         return current_type
 
     expr = annotation_strings.get(field_name)
-    if not expr or not isinstance(expr, str):
+    if not expr:
         return current_type
 
     try:

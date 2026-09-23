@@ -115,7 +115,7 @@ def collect_migration_invalidation_tasks(alembic_ini: str = DEFAULT_ALEMBIC_INI)
     if _AlembicConfig is None or _AlembicScriptDirectory is None:
         raise RuntimeError(
             "collect_migration_invalidation_tasks() requires the 'alembic' package; "
-            "install it or pass the tasks to run_pending_migration_cache_invalidations(tasks=...)"
+            + "install it or pass the tasks to run_pending_migration_cache_invalidations(tasks=...)"
         )
     tasks: dict[str, list[str]] = {}
     try:
@@ -140,7 +140,7 @@ def collect_migration_invalidation_tasks(alembic_ini: str = DEFAULT_ALEMBIC_INI)
             if sentinel in tasks and tasks[sentinel] != list(model_names):
                 logger.warning(
                     f"cache invalidation sentinel {sentinel} declared twice with different content "
-                    f"(migration {script.revision} overrides the earlier declaration)"
+                    + f"(migration {script.revision} overrides the earlier declaration)"
                 )
             tasks[sentinel] = list(model_names)
     return tasks
@@ -181,7 +181,7 @@ async def run_pending_migration_cache_invalidations(
     name_to_cls: dict[str, type[CachedTableBaseMixin]] = {}
 
     def visit(cls: type) -> None:
-        if isinstance(cls, type) and issubclass(cls, CachedTableBaseMixin):
+        if issubclass(cls, CachedTableBaseMixin):
             name_to_cls[cls.__name__] = cls
         for sub in cls.__subclasses__():
             visit(sub)
@@ -207,7 +207,7 @@ async def run_pending_migration_cache_invalidations(
 
         logger.warning(
             f"running migration cache invalidation task {sentinel} for the first time "
-            f"({len(table_names)} model(s))..."
+            + f"({len(table_names)} model(s))..."
         )
         cleared = 0
         failed = 0
@@ -228,8 +228,8 @@ async def run_pending_migration_cache_invalidations(
         if failed > 0:
             logger.error(
                 f"migration cache invalidation task {sentinel}: {failed} model(s) failed; the sentinel "
-                f"is NOT written and the task will be retried on the next startup "
-                f"(cleared={cleared}/{len(table_names)})"
+                + f"is NOT written and the task will be retried on the next startup "
+                + f"(cleared={cleared}/{len(table_names)})"
             )
             continue
 

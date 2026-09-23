@@ -154,14 +154,14 @@ async def get(
     offset: int | None = None,
     limit: int | None = None,
     fetch_mode: Literal["one", "first", "all"] = "first",
-    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
     options: list[ExecutableOption] | None = None,
     load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
     order_by: list[ColumnElement[Any]] | None = None,
     filter: ColumnElement[bool] | bool | None = None,
     with_for_update: bool = False,
     skip_locked: bool = False,
-    table_view: TableViewRequest | None = None,
+    table_view: TableViewArgument | None = None,  # TimeFilterRequest | PageWindowRequest
     jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
     populate_existing: bool = False,
     authoritative: bool = False,
@@ -195,7 +195,7 @@ On `CachedTableBaseMixin` models, `get()` has one extra parameter, `no_cache: bo
 | `filter` | `ColumnElement[bool]` | Additional WHERE condition |
 | `with_for_update` | `bool` | `SELECT ... FOR UPDATE` row lock. Instance `id()`s are written to `session.info[SESSION_FOR_UPDATE_KEY]`; **forces** `populate_existing` (cannot be turned off), guaranteeing you get the latest database values rather than a stale object from the identity map |
 | `skip_locked` | `bool` | `FOR UPDATE SKIP LOCKED`: skip rows locked by other transactions instead of waiting. Only effective when `with_for_update=True`. "0 rows" may also mean "every candidate is locked by someone else", so **do not** use it for existence checks |
-| `table_view` | `TableViewRequest` | Bundle of pagination + ordering + time filtering + keyset cursor parameters. `order` always appends `id` in the same direction as a tiebreaker; `after_id` applies the keyset cursor |
+| `table_view` | `TableViewRequest` (or any `TimeFilterRequest` / `PageWindowRequest`; each part is applied when present) | Bundle of pagination + ordering + time filtering + keyset cursor parameters. `order` always appends `id` in the same direction as a tiebreaker; `after_id` applies the keyset cursor |
 | `jti_subclasses` | `list[type] \| 'all'` | Subclass loading for JTI polymorphic relationships (requires `load`) |
 | `populate_existing` | `bool` | Lock-free forced overwrite of identity-map objects with database data |
 | `authoritative` | `bool` | The single switch for **authorization reads** (the result decides whether something is allowed, so it must be authoritative): at this layer equivalent to `populate_existing=True`; cached models additionally bypass Redis. Monotonically merged with `populate_existing` (`or`) |
@@ -346,7 +346,7 @@ async def get_with_count(
     session: AsyncSession,
     condition: ColumnElement[bool] | bool | None = None,
     *,
-    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+    join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
     options: list[ExecutableOption] | None = None,
     load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
     order_by: list[ColumnElement[Any]] | None = None,

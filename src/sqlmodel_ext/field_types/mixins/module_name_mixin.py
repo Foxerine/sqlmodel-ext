@@ -1,6 +1,6 @@
 """Module name auto-injection mixin."""
 import inspect
-from typing import ClassVar
+from typing import Any, ClassVar
 
 
 class ModuleNameMixin:
@@ -15,7 +15,7 @@ class ModuleNameMixin:
     """
     _module_name_field: ClassVar[str] = "name"
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         field_to_set = self._module_name_field
 
         if field_to_set not in kwargs:

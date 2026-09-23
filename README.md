@@ -1122,7 +1122,7 @@ mapping = Tool.get_identity_to_class_map()
 # {'websearchtool': WebSearchTool, 'calculatortool': CalculatorTool}
 
 # Check inheritance type
-Tool._is_joined_table_inheritance()  # True for JTI, False for STI
+Tool.is_joined_table_inheritance()  # True for JTI, False for STI
 ```
 
 ---

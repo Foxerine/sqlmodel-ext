@@ -71,11 +71,11 @@ import inspect
 import textwrap
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, ClassVar, Literal, Self, cast, overload
+from typing import Any, ClassVar, Literal, Self, cast, overload, override
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 try:
     import orjson
@@ -96,9 +96,8 @@ logger = logging.getLogger(__name__)
 
 from uuid import UUID
 
-from pydantic import ValidationError
 from pydantic_core import to_jsonable_python
-from sqlalchemy import ColumnElement, Table, TableClause, event, inspect as sa_inspect, select as sa_select
+from sqlalchemy import ColumnElement, Table, TableClause, event, inspect as sa_inspect
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import (
@@ -117,14 +116,12 @@ from sqlalchemy.sql.dml import Delete, Insert, Update
 from sqlalchemy.sql.elements import BinaryExpression, ClauseElement, ColumnClause, TextClause
 from sqlalchemy.sql.util import find_tables
 from sqlalchemy.sql.visitors import iterate as sa_iterate
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
-
-from sqlalchemy.sql._typing import _OnClauseArgument  # pyright: ignore[reportPrivateUsage]
 
 from sqlmodel_ext.base import SQLModelBase
 from sqlmodel_ext.mixins.polymorphic import PolymorphicBaseMixin
-from sqlmodel_ext.mixins.table import TableBaseMixin
-from sqlmodel_ext.pagination import TableViewRequest
+from sqlmodel_ext.mixins.table import OnClauseArgument, TableBaseMixin, TableViewArgument
 
 
 
@@ -226,7 +223,10 @@ def _referenced_tables(clause: ClauseElement) -> set[TableClause] | None:
         if isinstance(element, ColumnClause) and element.table is None:
             return None
     tables: set[TableClause] = set()
-    for item in find_tables(clause, check_columns=True):
+    # find_tables() is annotated ``List[TableClause]`` but its visitors also
+    # append joins, aliases, subqueries and ``column.table`` (possibly None);
+    # widen to ``object`` so the dispatch below matches what it really returns.
+    for item in cast(Iterable[object], find_tables(clause, check_columns=True)):
         if isinstance(item, Table):
             tables.add(item)
         elif isinstance(item, TableClause):
@@ -363,7 +363,7 @@ class CachedTableBaseMixin(TableBaseMixin):
         if cls._redis_client is None:
             raise RuntimeError(
                 f"{cls.__name__}: Redis client not configured. "
-                f"Call CachedTableBaseMixin.configure_redis(redis_client) at startup."
+                + f"Call CachedTableBaseMixin.configure_redis(redis_client) at startup."
             )
         return cls._redis_client
 
@@ -555,11 +555,11 @@ class CachedTableBaseMixin(TableBaseMixin):
             nl = '\n'
             raise TypeError(
                 "The following subclass methods call cache-invalidation methods "
-                "directly (risking MissingGreenlet after commit):\n"
-                f"{nl.join(violations)}\n"
-                "Use _register_pending_invalidation() followed by "
-                "`await session.commit()` (the enhanced AsyncSession "
-                "synchronously invalidates the registered pendings) instead."
+                + "directly (risking MissingGreenlet after commit):\n"
+                + f"{nl.join(violations)}\n"
+                + "Use _register_pending_invalidation() followed by "
+                + "`await session.commit()` (the enhanced AsyncSession "
+                + "synchronously invalidates the registered pendings) instead."
             )
 
         # Install session event hooks (idempotent).
@@ -569,7 +569,7 @@ class CachedTableBaseMixin(TableBaseMixin):
         # {table name: [cached classes]} index. This keeps the raw-DML warning
         # hot path of the enhanced AsyncSession.execute() free of lazy
         # construction (first call already hits the index).
-        cls._build_cached_tablename_index()
+        _ = cls._build_cached_tablename_index()
 
     @classmethod
     def _register_session_commit_hook(cls) -> None:
@@ -648,7 +648,7 @@ class CachedTableBaseMixin(TableBaseMixin):
             CachedTableBaseMixin._schedule_fallback_compensation(
                 pending,
                 "this commit bypassed the enhanced AsyncSession.commit() "
-                "(e.g. a plain SQLAlchemy/SQLModel session or run_sync(lambda s: s.commit()))",
+                + "(e.g. a plain SQLAlchemy/SQLModel session or run_sync(lambda s: s.commit()))",
             )
 
         def _after_rollback_handler(session: _SyncSession) -> None:
@@ -1475,7 +1475,7 @@ class CachedTableBaseMixin(TableBaseMixin):
         column_keys = {attr.key for attr in st.mapper.column_attrs}
         unloaded_cols = column_keys & st.unloaded
         if not unloaded_cols:
-            return cast(Self, existing)
+            return existing
 
         pk_cols = set(st.mapper.primary_key)
         pk_keys = {p.key for p in st.mapper.column_attrs if set(p.columns) & pk_cols}
@@ -1507,7 +1507,7 @@ class CachedTableBaseMixin(TableBaseMixin):
             return cls._deserialize_item(cached[_WRAPPER_DATA_KEY])
         raise ValueError(
             f"unknown cached result type: {result_type!r} (expected "
-            f"{_CacheResultType.NONE!r}/{_CacheResultType.LIST!r}/{_CacheResultType.SINGLE!r})"
+            + f"{_CacheResultType.NONE!r}/{_CacheResultType.LIST!r}/{_CacheResultType.SINGLE!r})"
         )
 
     # ================================================================
@@ -1525,7 +1525,6 @@ class CachedTableBaseMixin(TableBaseMixin):
                 ancestor is not cls
                 and ancestor is not object
                 and ancestor is not CachedTableBaseMixin
-                and isinstance(ancestor, type)
                 and issubclass(ancestor, CachedTableBaseMixin)
             )
         ]
@@ -1556,7 +1555,7 @@ class CachedTableBaseMixin(TableBaseMixin):
         ancestors = cls._cached_ancestors()
         if not ancestors:
             # No ancestors: issue a single INCR to avoid pipeline overhead.
-            await cls._bump_query_version()
+            _ = await cls._bump_query_version()
             return
         client = cls._get_client()
         async with client.pipeline(transaction=False) as pipe:
@@ -1672,14 +1671,14 @@ class CachedTableBaseMixin(TableBaseMixin):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["all"],
-            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
@@ -1700,14 +1699,14 @@ class CachedTableBaseMixin(TableBaseMixin):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["one"],
-            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
@@ -1728,14 +1727,14 @@ class CachedTableBaseMixin(TableBaseMixin):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["first"] = ...,
-            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
@@ -1746,7 +1745,8 @@ class CachedTableBaseMixin(TableBaseMixin):
             updated_after_datetime: datetime | None = None,
     ) -> Self | None: ...
 
-    @classmethod  # @override -- runtime MRO override of TableBaseMixin.get(); pyright cannot see this statically
+    @classmethod
+    @override
     async def get(
             cls,
             session: AsyncSession,
@@ -1755,14 +1755,14 @@ class CachedTableBaseMixin(TableBaseMixin):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["one", "first", "all"] = "first",
-            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], _OnClauseArgument] | None = None,
+            join: type[TableBaseMixin] | tuple[type[TableBaseMixin], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             no_cache: bool = False,
@@ -1913,7 +1913,7 @@ class CachedTableBaseMixin(TableBaseMixin):
                     # (cleanup failure does not affect the normal query path).
                     logger.warning(
                         f"cache deserialization failed, dropping bad key and querying DB: "
-                        f"{cache_key} ({type(e).__name__}: {e})"
+                        + f"{cache_key} ({type(e).__name__}: {e})"
                     )
                     try:
                         await cls._cache_delete(cache_key)
@@ -2031,6 +2031,7 @@ class CachedTableBaseMixin(TableBaseMixin):
     #  save() override -- invalidate on write
     # ================================================================
 
+    @override
     async def save(
             self,
             session: AsyncSession,
@@ -2125,6 +2126,7 @@ class CachedTableBaseMixin(TableBaseMixin):
     #  update() override -- invalidate on write
     # ================================================================
 
+    @override
     async def update(
             self,
             session: AsyncSession,
@@ -2205,7 +2207,8 @@ class CachedTableBaseMixin(TableBaseMixin):
     #  delete() override -- invalidate on delete
     # ================================================================
 
-    @classmethod  # MRO override TableBaseMixin.delete()
+    @classmethod
+    @override
     async def delete(
             cls,
             session: AsyncSession,
@@ -2281,9 +2284,9 @@ class CachedTableBaseMixin(TableBaseMixin):
                     if target_mapper is None:
                         continue
                     target_pk = target_mapper.primary_key[0]
-                    stmt = sa_select(target_pk).where(remote_cols[0].in_(current_ids))
-                    rows = await session.execute(stmt)
-                    child_ids = [row[0] for row in rows]
+                    # SQLModel's single-column select: exec() yields the scalar ids directly.
+                    stmt = select(target_pk).where(remote_cols[0].in_(current_ids))
+                    child_ids = list(await session.exec(stmt))
                     if child_ids:
                         passive_targets.setdefault(target, []).extend(child_ids)
                         passive_queue.append((target, child_ids))
@@ -2328,7 +2331,8 @@ class CachedTableBaseMixin(TableBaseMixin):
     #  add() override -- invalidate on write
     # ================================================================
 
-    @classmethod  # MRO override TableBaseMixin.add()
+    @classmethod
+    @override
     async def add(
             cls,
             session: AsyncSession,
@@ -2466,8 +2470,8 @@ class CachedTableBaseMixin(TableBaseMixin):
                     continue
                 logger.warning(
                     f"fallback compensation triggered: {model_type.__name__} "
-                    f"did not go through the sync invalidation path "
-                    f"(pending_ids={len(pending_ids)}; {reason})"
+                    + f"did not go through the sync invalidation path "
+                    + f"(pending_ids={len(pending_ids)}; {reason})"
                 )
                 await model_type._do_sync_invalidation(pending_ids)
 
@@ -2728,7 +2732,7 @@ class CachedTableBaseMixin(TableBaseMixin):
             return  # registered by a CRUD path, not a bare statement
         logger.warning(
             f"raw execute({statement.__class__.__name__}) hits cached table {tablename!r} "
-            f"without registered invalidation -- this bypasses cache invalidation. "
-            f"Use {classes[0].__name__}.save()/delete() (auto-invalidates), or register "
-            f"{classes[0].__name__}.invalidate_on_commit(session, ...) before committing the raw DML."
+            + f"without registered invalidation -- this bypasses cache invalidation. "
+            + f"Use {classes[0].__name__}.save()/delete() (auto-invalidates), or register "
+            + f"{classes[0].__name__}.invalidate_on_commit(session, ...) before committing the raw DML."
         )

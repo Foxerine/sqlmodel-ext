@@ -28,13 +28,13 @@ class Url(str):
     ) -> core_schema.CoreSchema:
         def validate_url(value: typing.Any) -> str:
             if isinstance(value, str):
-                AnyUrl(value)
+                _ = AnyUrl(value)
                 return value
             elif isinstance(value, AnyUrl):
                 return str(value)
             else:
                 url_str = str(value)
-                AnyUrl(url_str)
+                _ = AnyUrl(url_str)
                 return url_str
 
         return core_schema.no_info_after_validator_function(
@@ -64,13 +64,13 @@ class HttpUrl(str):
     ) -> core_schema.CoreSchema:
         def validate_http_url(value: typing.Any) -> str:
             if isinstance(value, str):
-                PydanticHttpUrl(value)
+                _ = PydanticHttpUrl(value)
                 return value
             elif isinstance(value, PydanticHttpUrl):
                 return str(value)
             else:
                 url_str = str(value)
-                PydanticHttpUrl(url_str)
+                _ = PydanticHttpUrl(url_str)
                 return url_str
 
         return core_schema.no_info_after_validator_function(
@@ -100,13 +100,13 @@ class WebSocketUrl(str):
     ) -> core_schema.CoreSchema:
         def validate_websocket_url(value: typing.Any) -> str:
             if isinstance(value, str):
-                PydanticWebsocketUrl(value)
+                _ = PydanticWebsocketUrl(value)
                 return value
             elif isinstance(value, PydanticWebsocketUrl):
                 return str(value)
             else:
                 url_str = str(value)
-                PydanticWebsocketUrl(url_str)
+                _ = PydanticWebsocketUrl(url_str)
                 return url_str
 
         return core_schema.no_info_after_validator_function(

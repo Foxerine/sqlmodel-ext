@@ -11,10 +11,9 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
-from typing import TypeVar, Literal, override, overload, Any, ClassVar, Generic, cast
+from typing import TypeAlias, TypeVar, Literal, override, overload, Any, ClassVar, Generic, cast
 
 from sqlalchemy import DateTime, ColumnElement, desc, asc, event, func, distinct, delete as sql_delete, inspect
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
     InstanceState,
@@ -32,10 +31,10 @@ from sqlalchemy.sql.base import ExecutableOption
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Field, select, col
 from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlalchemy.sql._typing import _OnClauseArgument
+from sqlalchemy.sql.roles import OnClauseRole
 from sqlalchemy.ext.asyncio import AsyncAttrs
 
-from sqlmodel_ext._utils import now, now_date
+from sqlmodel_ext._utils import now
 from sqlmodel_ext._exceptions import RecordNotFoundError
 from sqlmodel_ext.field_types import NonNegativeBigInt
 from sqlmodel_ext.mixins._uuid import uuid7
@@ -70,6 +69,23 @@ GK = TypeVar("GK")
 """Group key type of ``group_sum`` (str / datetime / ... depending on ``group_by``)."""
 V = TypeVar("V")
 """Column value type of ``distinct_column`` (UUID / str / ... depending on ``column``)."""
+
+OnClauseArgument: TypeAlias = OnClauseRole
+"""ON clause accepted by the ``join=(Model, onclause)`` form of ``get()`` / ``count()`` / ...
+
+Column expressions (``col(A.x) == col(B.y)``, ``and_(...)``) and ORM
+attributes all implement SQLAlchemy's public ``OnClauseRole``; the join call
+hands the value to ``Select.join()`` unchanged.
+"""
+
+TableViewArgument: TypeAlias = TimeFilterRequest | PageWindowRequest
+"""What ``get(table_view=...)`` accepts.
+
+Each capability is applied when the object provides it: time filtering
+(``TimeFilterRequest``), the offset/limit window (``PageWindowRequest``),
+ordering and the keyset cursor (``PaginationRequest``). ``TableViewRequest``
+provides all of them; a bare ``PageWindowRequest`` only applies the window.
+"""
 
 # FOR UPDATE tracking: get(with_for_update=True) records id(instance) to session.info,
 # for runtime checking by the @requires_for_update decorator.
@@ -113,7 +129,7 @@ def _on_lock_tracking_commit(session: _SyncSession) -> None:
         # move to the parent transaction) -- only pop the snapshot stack.
         stack: list[set[int]] = session.info.get(_SESSION_LOCK_SNAPSHOT_STACK, [])
         if stack:
-            stack.pop()
+            _ = stack.pop()
         session.info[_SESSION_NESTED_LOCK_HANDLED] = True
         return
     session.info.pop(SESSION_FOR_UPDATE_KEY, None)
@@ -193,7 +209,7 @@ def rel(relationship: object) -> QueryableAttribute[Any]:
     if not isinstance(relationship, QueryableAttribute):
         raise AttributeError(
             f"Expected a Relationship field, got {type(relationship).__name__}. "
-            f"Pass a class attribute (e.g. Character.llm), not an instance attribute."
+            + f"Pass a class attribute (e.g. Character.llm), not an instance attribute."
         )
     return relationship
 
@@ -281,9 +297,9 @@ class TableBaseMixin(AsyncAttrs):
 
     id: int | None = Field(default=None, primary_key=True)
 
-    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))  # pyright: ignore[reportArgumentType]  # older sqlmodel (e.g. 0.0.38) annotates sa_type as type[Any]; a TypeEngine instance is accepted at runtime
+    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))
     updated_at: datetime = Field(
-        sa_type=DateTime(timezone=True),  # pyright: ignore[reportArgumentType]  # older sqlmodel (e.g. 0.0.38) annotates sa_type as type[Any]; a TypeEngine instance is accepted at runtime
+        sa_type=DateTime(timezone=True),
         sa_column_kwargs={'default': now, 'onupdate': now},
         default_factory=now
     )
@@ -927,7 +943,7 @@ class TableBaseMixin(AsyncAttrs):
                 sti_condition = cls._sti_descendants_condition()
                 if sti_condition is not None:
                     stmt = stmt.where(sti_condition)
-                result = cast(CursorResult[Any], await session.execute(stmt))
+                result = await session.exec(stmt)
                 deleted_count = result.rowcount
             else:
                 if isinstance(instances, list):
@@ -956,7 +972,7 @@ class TableBaseMixin(AsyncAttrs):
                 friendly = registered if registered is not None else FK_DELETE_RESTRICT_FALLBACK_MESSAGE
                 logger.warning(
                     f"Delete rejected by foreign key constraint: model={cls.__name__}, "
-                    f"constraint={constraint}, registered={registered is not None}"
+                    + f"constraint={constraint}, registered={registered is not None}"
                 )
                 raise ResourceReferencedError(friendly, constraint, e) from e
             raise
@@ -972,7 +988,7 @@ class TableBaseMixin(AsyncAttrs):
             # No rollback: the transaction belongs to the caller.
             logger.warning(
                 f"Optimistic lock conflict during delete: calling model={cls.__name__}, "
-                f"batch={isinstance(instances, list)} (conflicting row cannot be attributed at flush level)"
+                + f"batch={isinstance(instances, list)} (conflicting row cannot be attributed at flush level)"
             )
             raise OptimisticLockError(
                 message=(
@@ -1019,7 +1035,7 @@ class TableBaseMixin(AsyncAttrs):
         the aggregation helpers share this condition so their visible ranges
         agree.
         """
-        if not issubclass(cls, PolymorphicBaseMixin) or cls._is_joined_table_inheritance():
+        if not issubclass(cls, PolymorphicBaseMixin) or cls.is_joined_table_inheritance():
             return None
         mapper = cast(Mapper[Any], inspect(cls))
         poly_on = mapper.polymorphic_on
@@ -1076,7 +1092,7 @@ class TableBaseMixin(AsyncAttrs):
         if id_column_type is not uuid.UUID:
             raise ValueError(
                 f"the after_id keyset cursor only supports UUID primary keys; {cls.__name__}'s "
-                f"primary key is {id_column_type.__name__} -- use offset pagination"
+                + f"primary key is {id_column_type.__name__} -- use offset pagination"
             )
 
         id_col = col(cls.id)
@@ -1093,7 +1109,7 @@ class TableBaseMixin(AsyncAttrs):
         # - JTI leaf: the mapper selectable is parent JOIN child.
         # - STI / plain models: a single table, select_from(cls) is a no-op.
         anchor_from: type[T] | AliasedClass[T]
-        if issubclass(cls, PolymorphicBaseMixin) and cls._is_joined_table_inheritance():
+        if issubclass(cls, PolymorphicBaseMixin) and cls.is_joined_table_inheritance():
             anchor_from = with_polymorphic(cls, '*')
         else:
             anchor_from = cls
@@ -1109,7 +1125,7 @@ class TableBaseMixin(AsyncAttrs):
         if anchor_value is None:
             raise KeysetCursorInvalidError(
                 f"the record after_id={after_id} does not exist or is outside the visible "
-                "range of this query; the keyset cursor is invalid, restart from the first page"
+                + "range of this query; the keyset cursor is invalid, restart from the first page"
             )
         if table_view.desc:
             return (order_col < anchor_value) | ((order_col == anchor_value) & (id_col < after_id))
@@ -1125,14 +1141,14 @@ class TableBaseMixin(AsyncAttrs):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["all"],
-            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], _OnClauseArgument] | None = None,
+            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             authoritative: bool = False,
@@ -1152,14 +1168,14 @@ class TableBaseMixin(AsyncAttrs):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["one"],
-            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], _OnClauseArgument] | None = None,
+            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             authoritative: bool = False,
@@ -1179,14 +1195,14 @@ class TableBaseMixin(AsyncAttrs):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["first"] = ...,
-            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], _OnClauseArgument] | None = None,
+            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             authoritative: bool = False,
@@ -1205,14 +1221,14 @@ class TableBaseMixin(AsyncAttrs):
             offset: int | None = None,
             limit: int | None = None,
             fetch_mode: Literal["one", "first", "all"] = "first",
-            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], _OnClauseArgument] | None = None,
+            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,
             filter: ColumnElement[bool] | bool | None = None,
             with_for_update: bool = False,
             skip_locked: bool = False,
-            table_view: TableViewRequest | None = None,
+            table_view: TableViewArgument | None = None,
             jti_subclasses: list[type[PolymorphicBaseMixin]] | Literal['all'] | None = None,
             populate_existing: bool = False,
             authoritative: bool = False,
@@ -1253,7 +1269,7 @@ class TableBaseMixin(AsyncAttrs):
             without it they queue up on the same row. Note that "0 rows"
             then also means "all candidates are locked by others", so never
             use it for existence checks.
-        :param table_view: TableViewRequest for pagination + sorting + time
+        :param table_view: pagination / sorting / time filters (see ``TableViewArgument``)
             filtering (explicit arguments take precedence). ``order`` is
             always completed with ``id`` as a same-direction tie-break;
             ``after_id`` applies the keyset cursor (mutually exclusive with an
@@ -1279,7 +1295,7 @@ class TableBaseMixin(AsyncAttrs):
         if jti_subclasses is not None and load is None:
             raise ValueError(
                 "jti_subclasses requires the load parameter -- "
-                "specify which relationship to load"
+                + "specify which relationship to load"
             )
 
         # keyset cursor condition (after_id), appended after condition
@@ -1337,7 +1353,7 @@ class TableBaseMixin(AsyncAttrs):
         # Polymorphic base class handling
         polymorphic_cls = None
         is_polymorphic = issubclass(cls, PolymorphicBaseMixin)
-        is_jti = is_polymorphic and cls._is_joined_table_inheritance()
+        is_jti = is_polymorphic and cls.is_joined_table_inheritance()
 
         # JTI: always use with_polymorphic (avoids N+1 queries)
         # STI: don't use with_polymorphic
@@ -1391,7 +1407,7 @@ class TableBaseMixin(AsyncAttrs):
                 if not issubclass(target_class, PolymorphicBaseMixin):
                     raise ValueError(
                         f"Target class {target_class.__name__} is not polymorphic. "
-                        f"Ensure it inherits PolymorphicBaseMixin."
+                        + f"Ensure it inherits PolymorphicBaseMixin."
                     )
 
                 if jti_subclasses == 'all':
@@ -1792,7 +1808,7 @@ class TableBaseMixin(AsyncAttrs):
             session: AsyncSession,
             condition: ColumnElement[bool] | bool | None = None,
             *,
-            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], _OnClauseArgument] | None = None,
+            join: type['TableBaseMixin'] | tuple[type['TableBaseMixin'], OnClauseArgument] | None = None,
             options: list[ExecutableOption] | None = None,
             load: QueryableAttribute[Any] | list[QueryableAttribute[Any]] | None = None,
             order_by: list[ColumnElement[Any]] | None = None,

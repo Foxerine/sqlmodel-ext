@@ -45,7 +45,7 @@ def __init_subclass__(cls, polymorphic_on=None, polymorphic_abstract=None, **kwa
 
 ```python
 @classmethod
-def _is_joined_table_inheritance(cls) -> bool:
+def is_joined_table_inheritance(cls) -> bool:
     """Subclass table name differs from parent → JTI"""
 
 @classmethod

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 from types import NoneType, UnionType
-from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union, get_args, get_origin
+from typing import Annotated, Any, Generic, TypeAlias, TypeVar, get_args, get_origin, override
 
 from annotated_types import Ge, GroupedMetadata, Gt, MaxLen
 from pydantic import AllowInfNan, BeforeValidator, PlainSerializer, StringConstraints, WithJsonSchema
@@ -16,8 +16,9 @@ from pydantic.fields import FieldInfo
 from sqlalchemy import BigInteger, Numeric
 from sqlmodel import Field
 
-from ._internal.path import _DirectoryPathHandler, _FilePathHandler
-from .dialects.postgresql.array import _ArrayTypeHandler
+from .._type_unwrap import TYPING_UNION
+from ._internal.path import DirectoryPathHandler, FilePathHandler
+from .dialects.postgresql.array import ArrayTypeHandler
 # Re-exports use the redundant ``X as X`` form: the package ships ``py.typed``, and
 # type checkers treat a plain ``from .m import X`` in a typed package as private
 # (consumers would get ``reportPrivateImportUsage``).
@@ -37,7 +38,7 @@ from ._ssrf import UnsafeURLError as UnsafeURLError, validate_not_private_host a
 #  Public, Database-Agnostic Types
 # ---------------------------------------------------------------------------
 
-DirectoryPathType = Annotated[Path, _DirectoryPathHandler]
+DirectoryPathType = Annotated[Path, DirectoryPathHandler]
 """
 A directory path type compatible with Pydantic and SQLModel.
 
@@ -45,7 +46,7 @@ Validates that the path should not contain a file extension,
 while behaving as a ``pathlib.Path`` in Python code.
 """
 
-FilePathType = Annotated[Path, _FilePathHandler]
+FilePathType = Annotated[Path, FilePathHandler]
 """
 A file path type compatible with Pydantic and SQLModel.
 
@@ -394,12 +395,12 @@ def max_length_of(alias: Any) -> int:
         unbounded ``Array[T]``), or a union has other than exactly one
         non-``None`` member -- failing loudly instead of inventing a bound.
     """
-    if get_origin(alias) in (Union, UnionType):
+    if get_origin(alias) in (TYPING_UNION, UnionType):
         members = [member for member in get_args(alias) if member is not NoneType]
         if len(members) != 1:
             raise TypeError(
                 f"{alias!r} has {len(members)} non-None members; expected the 'X | None' "
-                "form, so there is no single bound to reflect"
+                + "form, so there is no single bound to reflect"
             )
         alias = members[0]
     effective: int | None = None
@@ -414,7 +415,7 @@ def max_length_of(alias: Any) -> int:
                     effective = item.max_length
                 elif isinstance(item, StringConstraints) and item.max_length is not None:
                     effective = item.max_length
-                elif isinstance(item, _ArrayTypeHandler) and item.max_length is not None:
+                elif isinstance(item, ArrayTypeHandler) and item.max_length is not None:
                     effective = item.max_length
     if effective is None:
         raise TypeError(f"type alias {alias!r} declares no max_length; cannot reflect a bound")
@@ -582,13 +583,13 @@ def _reject_float_decimal_input(v: Any) -> Any:
     if isinstance(v, bool):
         raise ValueError(
             'Boolean input rejected for Decimal field; '
-            'use Decimal/int/str instead'
+            + 'use Decimal/int/str instead'
         )
     if isinstance(v, float):
         raise ValueError(
             f"Float input rejected for Decimal field (got {v!r}); "
-            "use string ('0.5') or Decimal(Decimal('0.5')) instead. "
-            "Float values have already lost precision via IEEE 754 representation."
+            + "use string ('0.5') or Decimal(Decimal('0.5')) instead. "
+            + "Float values have already lost precision via IEEE 754 representation."
         )
     return v
 
@@ -725,7 +726,7 @@ _OPTIONAL_DECIMAL_20_10_STR_SCHEMA = _optional_str_schema(_DECIMAL_20_10_STR_PAT
 
 SignedDecimal38_18: TypeAlias = Annotated[
     Decimal,
-    Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_38_18_STR_SCHEMA,
@@ -735,11 +736,7 @@ SignedDecimal38_18: TypeAlias = Annotated[
 NonNegativeDecimal38_18: TypeAlias = Annotated[
     Decimal,
     Ge(Decimal(0)),
-    # pyright ignore targets ``sa_type`` only (the SQLModel stub annotates it
-    # ``type[Any]`` but the runtime accepts SA type instances like
-    # ``Numeric(38, 18)``); ``ge`` is expressed as ``Ge(Decimal(0))`` via
-    # annotated_types so the ignore scope stays minimal.
-    Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_38_18_STR_SCHEMA,
@@ -749,8 +746,7 @@ NonNegativeDecimal38_18: TypeAlias = Annotated[
 PositiveDecimal38_18: TypeAlias = Annotated[
     Decimal,
     Gt(Decimal(0)),
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
-    Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    Field(max_digits=38, decimal_places=18, sa_type=Numeric(38, 18)),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_38_18_STR_SCHEMA,
@@ -765,8 +761,7 @@ OptionalNonNegativeDecimal38_18: TypeAlias = Annotated[
     # See https://docs.pydantic.dev/latest/concepts/types/ "Constraints on optional fields"
     Annotated[Decimal, Ge(Decimal(0)), Field(max_digits=38, decimal_places=18)] | None,
     _REJECT_FLOAT,
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
-    Field(default=None, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    Field(default=None, sa_type=Numeric(38, 18)),
     _DECIMAL_TO_JSON_STR,
     _OPTIONAL_DECIMAL_38_18_STR_SCHEMA,
 ]
@@ -777,8 +772,7 @@ OptionalSignedDecimal38_18: TypeAlias = Annotated[
     # difference is the missing ``Ge(Decimal(0))`` -- negatives are allowed.
     Annotated[Decimal, Field(max_digits=38, decimal_places=18)] | None,
     _REJECT_FLOAT,
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
-    Field(default=None, sa_type=Numeric(38, 18)),  # pyright: ignore[reportArgumentType]
+    Field(default=None, sa_type=Numeric(38, 18)),
     _DECIMAL_TO_JSON_STR,
     _OPTIONAL_DECIMAL_38_18_STR_SCHEMA,
 ]
@@ -805,7 +799,7 @@ SignedWriteDecimal38_18: TypeAlias = Annotated[
     Field(
         max_digits=DECIMAL_38_18_WRITE_DIGITS,
         decimal_places=DECIMAL_38_18_PLACES,
-        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),
     ),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
@@ -818,11 +812,10 @@ sums through ``SignedSumDecimal38_18``."""
 NonNegativeWriteDecimal38_18: TypeAlias = Annotated[
     Decimal,
     Ge(Decimal(0)),
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(
         max_digits=DECIMAL_38_18_WRITE_DIGITS,
         decimal_places=DECIMAL_38_18_PLACES,
-        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),
     ),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
@@ -834,11 +827,10 @@ see ``SignedWriteDecimal38_18``)"""
 PositiveWriteDecimal38_18: TypeAlias = Annotated[
     Decimal,
     Gt(Decimal(0)),
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(
         max_digits=DECIMAL_38_18_WRITE_DIGITS,
         decimal_places=DECIMAL_38_18_PLACES,
-        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),
     ),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
@@ -855,10 +847,9 @@ OptionalNonNegativeWriteDecimal38_18: TypeAlias = Annotated[
         Field(max_digits=DECIMAL_38_18_WRITE_DIGITS, decimal_places=DECIMAL_38_18_PLACES),
     ] | None,
     _REJECT_FLOAT,
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(
         default=None,
-        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),
     ),
     _DECIMAL_TO_JSON_STR,
     _OPTIONAL_DECIMAL_WRITE_38_18_STR_SCHEMA,
@@ -873,10 +864,9 @@ OptionalSignedWriteDecimal38_18: TypeAlias = Annotated[
         Field(max_digits=DECIMAL_38_18_WRITE_DIGITS, decimal_places=DECIMAL_38_18_PLACES),
     ] | None,
     _REJECT_FLOAT,
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
     Field(
         default=None,
-        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),  # pyright: ignore[reportArgumentType]
+        sa_type=Numeric(DECIMAL_38_18_COLUMN_DIGITS, DECIMAL_38_18_PLACES),
     ),
     _DECIMAL_TO_JSON_STR,
     _OPTIONAL_DECIMAL_WRITE_38_18_STR_SCHEMA,
@@ -907,7 +897,7 @@ needs its own width decision.
 
 SignedDecimal20_10: TypeAlias = Annotated[
     Decimal,
-    Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_20_10_STR_SCHEMA,
@@ -917,8 +907,7 @@ SignedDecimal20_10: TypeAlias = Annotated[
 NonNegativeDecimal20_10: TypeAlias = Annotated[
     Decimal,
     Ge(Decimal(0)),
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
-    Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    Field(max_digits=20, decimal_places=10, sa_type=Numeric(20, 10)),
     _REJECT_FLOAT,
     _DECIMAL_TO_JSON_STR,
     _DECIMAL_20_10_STR_SCHEMA,
@@ -929,8 +918,7 @@ OptionalNonNegativeDecimal20_10: TypeAlias = Annotated[
     # Nested Annotated (see OptionalNonNegativeDecimal38_18)
     Annotated[Decimal, Ge(Decimal(0)), Field(max_digits=20, decimal_places=10)] | None,
     _REJECT_FLOAT,
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
-    Field(default=None, sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    Field(default=None, sa_type=Numeric(20, 10)),
     _DECIMAL_TO_JSON_STR,
     _OPTIONAL_DECIMAL_20_10_STR_SCHEMA,
 ]
@@ -945,8 +933,7 @@ NullableNonNegativeDecimal20_10: TypeAlias = Annotated[
     # nullable settings where a default would hide a caller forgetting the field.
     Annotated[Decimal, Ge(Decimal(0)), Field(max_digits=20, decimal_places=10)] | None,
     _REJECT_FLOAT,
-    # pyright ignore targets ``sa_type`` only (see NonNegativeDecimal38_18)
-    Field(sa_type=Numeric(20, 10)),  # pyright: ignore[reportArgumentType]
+    Field(sa_type=Numeric(20, 10)),
     _DECIMAL_TO_JSON_STR,
     _OPTIONAL_DECIMAL_20_10_STR_SCHEMA,
 ]
@@ -987,6 +974,7 @@ class List(list[_ListT], Generic[_ListT]):
     """
 
     @classmethod
+    @override
     def __class_getitem__(cls, item: Any) -> Any:
         return list[item]
 

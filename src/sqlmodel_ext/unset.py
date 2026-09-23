@@ -163,9 +163,7 @@ def _reduce_unset(sentinel: object) -> str:
     raise TypeError(f"Cannot pickle {type(sentinel).__name__!r} object")
 
 
-# The copyreg stub declares reducers as returning ``tuple``; ``copy`` and
-# ``pickle`` both accept ``str`` at runtime (the idiomatic singleton return).
-copyreg.pickle(Sentinel, _reduce_unset)  # pyright: ignore[reportArgumentType]
+copyreg.pickle(Sentinel, _reduce_unset)
 
 OMITTED_SENTINEL: typing.Final = '__omitted__'
 """

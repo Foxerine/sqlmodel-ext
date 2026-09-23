@@ -119,7 +119,7 @@ class TrgmSearchableMixin:
         except KeyError as e:
             raise RuntimeError(
                 f"{cls.__name__}: trgm search column {column_name!r} is not on the mapper; "
-                "check __trgm_name_column__ / __trgm_text_columns__"
+                + "check __trgm_name_column__ / __trgm_text_columns__"
             ) from e
 
     @classmethod

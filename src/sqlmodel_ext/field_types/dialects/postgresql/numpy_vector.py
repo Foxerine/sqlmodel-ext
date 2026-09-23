@@ -14,13 +14,16 @@ Implementation overview:
 import ast
 import base64
 import warnings
-from typing import Any
+from typing import Any, ClassVar, override
 
 import numpy as np
 import numpy.typing as npt
 from pgvector.sqlalchemy import Vector
-from pydantic_core import core_schema
+from pydantic import GetCoreSchemaHandler
+from pydantic_core import CoreSchema, core_schema
 from sqlalchemy import TypeDecorator
+from sqlalchemy.engine import Dialect
+from sqlalchemy.types import TypeEngine
 
 from .exceptions import VectorDTypeError, VectorDecodeError, VectorDimensionError
 
@@ -36,11 +39,13 @@ class _NumpyVectorMeta(type):
     Caches type instances for identical parameters to avoid redundant creation.
     """
 
-    def __getitem__(cls, params: tuple[int, type] | int):
+    def __getitem__(cls, params: object) -> type:
         """
         Support ``NumpyVector[1024, np.float32]`` or ``NumpyVector[1024]`` syntax.
 
-        :param params: ``(dimensions, dtype)`` or a single ``dimensions`` integer
+        :param params: ``(dimensions, dtype)`` or a single ``dimensions`` integer;
+            anything else is rejected with ``TypeError`` at runtime (subscripts are
+            not type-checked at the call site, hence ``object``)
         :returns: Dynamically-created type class with SQLAlchemy type info
         """
         # Normalize parameters
@@ -52,7 +57,7 @@ class _NumpyVectorMeta(type):
         else:
             raise TypeError(
                 f"NumpyVector requires (dimensions, dtype) or dimensions, "
-                f"got {params}"
+                + f"got {params}"
             )
 
         # Validate dtype is a numpy dtype
@@ -91,14 +96,16 @@ class _NumpyVectorMeta(type):
             for validation and conversion. SQLModel identifies the SQLAlchemy
             type via the ``__sqlmodel_sa_type__`` class attribute.
             """
-            __sqlmodel_sa_type__ = sa_type
+            __sqlmodel_sa_type__: ClassVar[_NumpyVectorSQLAlchemyType] = sa_type
 
             @classmethod
-            def __get_pydantic_core_schema__(cls, source_type, schema_handler):
+            def __get_pydantic_core_schema__(
+                    cls, source_type: Any, schema_handler: GetCoreSchemaHandler,
+            ) -> CoreSchema:
                 """Delegate to the handler's schema definition."""
                 return handler.__get_pydantic_core_schema__(source_type, schema_handler)
 
-            def __class_getitem__(cls, item):
+            def __class_getitem__(cls, item: Any) -> type:
                 """Support generic syntax in type hints if needed."""
                 return cls
 
@@ -131,9 +138,9 @@ class _NumpyVectorTypeHandler:
         :param dtype: numpy data type (default: float32)
         :param sa_type: SQLAlchemy type instance (optional, for reuse)
         """
-        self.dimensions = dimensions
-        self.dtype = np.dtype(dtype).type
-        self.sa_type = sa_type or _NumpyVectorSQLAlchemyType(
+        self.dimensions: int = dimensions
+        self.dtype: type[np.generic] = np.dtype(dtype).type
+        self.sa_type: _NumpyVectorSQLAlchemyType = sa_type or _NumpyVectorSQLAlchemyType(
             dimensions=dimensions,
             dtype=dtype
         )
@@ -192,7 +199,7 @@ class _NumpyVectorTypeHandler:
                 if arr.size != expected_size:
                     raise VectorDecodeError(
                         f'Shape mismatch: expected {expected_size}, '
-                        f'got {arr.size}'
+                        + f'got {arr.size}'
                     )
 
                 # Reshape to target shape
@@ -233,7 +240,7 @@ class _NumpyVectorTypeHandler:
                 except Exception as e:
                     raise VectorDTypeError(
                         f'Failed to convert dtype from {value.dtype} '
-                        f'to {self.dtype}: {e}'
+                        + f'to {self.dtype}: {e}'
                     ) from e
 
         # Validate dimensions (strict)
@@ -245,23 +252,26 @@ class _NumpyVectorTypeHandler:
         if value.size != self.dimensions:
             raise VectorDimensionError(
                 f'Vector dimension mismatch: expected {self.dimensions}, '
-                f'got {value.size}'
+                + f'got {value.size}'
             )
 
         return value
 
-    def __get_pydantic_core_schema__(self, source_type, handler):
+    def __get_pydantic_core_schema__(self, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
         """Pydantic v2 core schema definition."""
 
         def validate_from_any(value: Any) -> npt.NDArray[Any]:
             """Pydantic validation function."""
             return self._validate_and_convert(value)
 
-        def serialize_to_json(value: npt.NDArray[Any]) -> dict[str, Any]:
+        def serialize_to_json(value: object) -> dict[str, Any]:
             """
             Serialize to a JSON-safe base64 format.
 
             Format: ``{"dtype": "float32", "shape": 1024, "data_b64": "..."}``
+
+            ``value`` is not necessarily an array: an attribute assigned after
+            construction (no ``validate_assignment``) reaches the serializer as-is.
             """
             if not isinstance(value, np.ndarray):
                 value = np.array(value, dtype=self.dtype)
@@ -305,19 +315,20 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator[npt.NDArray[Any]]):
     - Vector method proxying: cosine_distance, l2_distance, max_inner_product, etc.
     """
 
-    impl = Vector
-    cache_ok = True
+    impl: TypeEngine[Any] | type[TypeEngine[Any]] = Vector
+    cache_ok: bool | None = True
 
     def __init__(self, dimensions: int, dtype: type = np.float32):
         """
         :param dimensions: Vector dimensions
         :param dtype: numpy data type
         """
-        self.dimensions = dimensions
-        self.dtype = np.dtype(dtype).type
+        self.dimensions: int = dimensions
+        self.dtype: type[np.generic] = np.dtype(dtype).type
         super().__init__()
 
-    def load_dialect_impl(self, dialect):
+    @override
+    def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
         """
         Load the Vector implementation for the PostgreSQL dialect.
 
@@ -326,9 +337,13 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator[npt.NDArray[Any]]):
         """
         return Vector(dim=self.dimensions)
 
-    def process_bind_param(self, value: npt.NDArray[Any] | None, dialect) -> list[float] | None:
+    @override
+    def process_bind_param(self, value: object, dialect: Dialect) -> list[float] | None:
         """
         Python -> Database: convert ``numpy.ndarray`` to ``list[float]``.
+
+        ``value`` is whatever the mapped attribute holds, which is not
+        necessarily an array (e.g. a plain list assigned without validation).
         """
         if value is None:
             return None
@@ -338,7 +353,8 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator[npt.NDArray[Any]]):
 
         return value.tolist()
 
-    def process_result_value(self, value: Any, dialect) -> npt.NDArray[Any] | None:
+    @override
+    def process_result_value(self, value: Any, dialect: Dialect) -> npt.NDArray[Any] | None:
         """
         Database -> Python: convert ``pgvector.Vector`` to ``numpy.ndarray``.
         """
@@ -423,5 +439,5 @@ class NumpyVector(metaclass=_NumpyVectorMeta):
     def __init__(self):
         raise TypeError(
             "NumpyVector cannot be instantiated directly. "
-            "Use NumpyVector[dimensions, dtype] syntax instead."
+            + "Use NumpyVector[dimensions, dtype] syntax instead."
         )

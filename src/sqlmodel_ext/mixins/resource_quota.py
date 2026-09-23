@@ -36,7 +36,7 @@ Usage::
         # ... related inserts ...
         await instance.save(session)  # commits -> releases the owner lock
 """
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
@@ -124,6 +124,7 @@ class ResourceQuotaMixin:
         Subclasses must override this and forward ``with_for_update`` to the
         underlying ``Model.get``.
         """
+        del session, owner_id, with_for_update  # the signature is the override contract; this base only raises
         raise NotImplementedError(
             f"{cls.__name__} must implement _lock_owner (ResourceQuotaMixin contract)"
         )
@@ -136,6 +137,7 @@ class ResourceQuotaMixin:
         Subclasses must override it, e.g. ``col(cls.owner_id) == owner_id``,
         or a subquery through a link table.
         """
+        del owner_id  # the signature is the override contract; this base only raises
         raise NotImplementedError(
             f"{cls.__name__} must implement _quota_condition (ResourceQuotaMixin contract)"
         )
@@ -147,6 +149,7 @@ class ResourceQuotaMixin:
 
         Subclasses must override it; typically ``owner.max_<resource>``.
         """
+        del owner  # the signature is the override contract; this base only raises
         raise NotImplementedError(
             f"{cls.__name__} must implement _quota_max (ResourceQuotaMixin contract)"
         )
@@ -222,7 +225,7 @@ class ResourceQuotaMixin:
             count: int = 1,
             defer_commit: bool = False,
             idempotent_check: 'Callable[[], Awaitable[_QuotaIdempotentT | None]] | None' = None,
-    ) -> AsyncIterator['_QuotaIdempotentT | None']:
+    ) -> AsyncGenerator['_QuotaIdempotentT | None', None]:
         """
         Atomically acquire ``count`` quota slots (default 1) inside the caller's transaction.
 
@@ -308,8 +311,8 @@ class ResourceQuotaMixin:
         if not committed[0]:
             raise CallerDidNotCommitError(
                 f"{cls.__name__}.acquire_quota_lock: caller did not commit before exiting"
-                " `async with` block. The owner lock is still held, defeating the purpose of"
-                " scoping the lock window. Ensure the protected work ends with a commit"
-                " (e.g., `await model.save(session)` with default commit=True), or call"
-                " `session.rollback()` if aborting."
+                + " `async with` block. The owner lock is still held, defeating the purpose of"
+                + " scoping the lock window. Ensure the protected work ends with a commit"
+                + " (e.g., `await model.save(session)` with default commit=True), or call"
+                + " `session.rollback()` if aborting."
             )
