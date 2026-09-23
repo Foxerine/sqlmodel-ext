@@ -1,1 +1,1 @@
-from .module_name_mixin import ModuleNameMixin
+from .module_name_mixin import ModuleNameMixin as ModuleNameMixin

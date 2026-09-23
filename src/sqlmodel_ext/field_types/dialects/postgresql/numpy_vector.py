@@ -138,7 +138,7 @@ class _NumpyVectorTypeHandler:
             dtype=dtype
         )
 
-    def _validate_and_convert(self, value: Any) -> npt.NDArray:
+    def _validate_and_convert(self, value: Any) -> npt.NDArray[Any]:
         """
         Validate and convert the input value to a numpy array.
 
@@ -253,11 +253,11 @@ class _NumpyVectorTypeHandler:
     def __get_pydantic_core_schema__(self, source_type, handler):
         """Pydantic v2 core schema definition."""
 
-        def validate_from_any(value: Any) -> npt.NDArray:
+        def validate_from_any(value: Any) -> npt.NDArray[Any]:
             """Pydantic validation function."""
             return self._validate_and_convert(value)
 
-        def serialize_to_json(value: npt.NDArray) -> dict[str, Any]:
+        def serialize_to_json(value: npt.NDArray[Any]) -> dict[str, Any]:
             """
             Serialize to a JSON-safe base64 format.
 
@@ -293,7 +293,7 @@ class _NumpyVectorTypeHandler:
 
 
 # --- SQLAlchemy TypeDecorator ---
-class _NumpyVectorSQLAlchemyType(TypeDecorator):
+class _NumpyVectorSQLAlchemyType(TypeDecorator[npt.NDArray[Any]]):
     """
     SQLAlchemy type decorator mapping ``numpy.ndarray`` to ``pgvector.Vector``.
 
@@ -326,7 +326,7 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator):
         """
         return Vector(dim=self.dimensions)
 
-    def process_bind_param(self, value: npt.NDArray | None, dialect) -> list[float] | None:
+    def process_bind_param(self, value: npt.NDArray[Any] | None, dialect) -> list[float] | None:
         """
         Python -> Database: convert ``numpy.ndarray`` to ``list[float]``.
         """
@@ -338,7 +338,7 @@ class _NumpyVectorSQLAlchemyType(TypeDecorator):
 
         return value.tolist()
 
-    def process_result_value(self, value: Any, dialect) -> npt.NDArray | None:
+    def process_result_value(self, value: Any, dialect) -> npt.NDArray[Any] | None:
         """
         Database -> Python: convert ``pgvector.Vector`` to ``numpy.ndarray``.
         """

@@ -122,7 +122,22 @@ account = await Account.get_exist_one(session, uid)
 await account.adjust_balance(session, amount=-100)  # RuntimeError! // [!code error]
 ```
 
-The runtime check uses `session.info[SESSION_FOR_UPDATE_KEY]`.
+The runtime check uses `session.info[SESSION_FOR_UPDATE_KEY]`; if no session argument can be found it also raises `RuntimeError` (fail-closed). For other contract decorators (batches of instances, isolation levels, etc.), see [Enforce row locks and isolation levels](./enforce-locking-and-isolation).
+
+### Methods without a session in their signature
+
+When `@requires_relations` can't find a session among the arguments, it **skips** preloading (no error). Before calling such a method, have the orchestrating code load explicitly:
+
+```python
+await article.ensure_relations_loaded(session, ('author',))
+article.render_byline_sync()      # the method itself takes no session
+```
+
+When a batch of instances needs the same relations preloaded, first use `ensure_relations_loaded_bulk()` to cut the queries down to "one per target table", then call `ensure_relations_loaded()` on each (a no-op when already loaded):
+
+```python
+await Article.ensure_relations_loaded_bulk(session, articles, {Article: ('author',)})
+```
 
 ## First defense (experimental, off by default): AST static analysis
 
@@ -146,7 +161,35 @@ from sqlmodel_ext import RelationLoadCheckMiddleware
 app.add_middleware(RelationLoadCheckMiddleware)
 ```
 
-Once enabled, the application scans every model method and FastAPI route at startup and warns about suspicious patterns. Rule codes (RLC001 / RLC007 etc.) are documented in [Static analyzer internals](/en/explanation/relation-load-checker).
+Once enabled, the application scans every model method and FastAPI route at startup; when it finds problems it logs them and blocks startup. Rule codes (RLC001–RLC014) are documented in [Static analyzer internals](/en/explanation/relation-load-checker).
+
+Tell the analyzer which methods in your project commit (module-level configuration, read at analysis time):
+
+```python
+import sqlmodel_ext.relation_load_checker as rlc
+
+# Methods that commit only on a cache miss, indistinguishable at the call site: excluded from commit discovery entirely
+rlc.conditional_commit_methods = frozenset({'get_or_create'})
+# Methods with signature commit: bool = False that commit only when commit=True is passed: judged by each call's literal
+rlc.explicit_commit_methods = frozenset({'enqueue'})
+# Methods that, when called in a FastAPI dependency, expire objects injected by sibling dependencies (RLC014)
+rlc.dependency_commit_methods = rlc.dependency_commit_methods | {'approve'}
+```
+
+When scanning pytest test code, pass `params_share_session=False`, so a test function's model parameters are judged by whether their fixture shares the test's session:
+
+```python
+from sqlmodel_ext import RelationLoadChecker, SQLModelBase
+
+checker = RelationLoadChecker(SQLModelBase)
+warnings = checker.check_project_coroutines(project_root, params_share_session=False)
+```
+
+Suppress individual locations you've confirmed are fine with `# noqa: RLC007`, written on the line the warning reports (endpoint-level rules report on the first decorator line).
+
+::: warning Known limitation
+For a response DTO that doesn't inherit any table class, the analyzer has no anchor to map fields to relations, so it can't detect its RLC001 / RLC005 requirements.
+:::
 
 ## Decision tree
 

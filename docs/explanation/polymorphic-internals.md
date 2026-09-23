@@ -66,7 +66,7 @@ JTI 子类需要指向父表的外键。动态生成 Mixin：
 def create_subclass_id_mixin(parent_table_name: str) -> type:
     class SubclassIdMixin(SQLModelBase):
         id: UUID = Field(
-            default_factory=uuid.uuid4,
+            default_factory=uuid7,
             foreign_key=f'{parent_table_name}.id',
             primary_key=True,
         )
@@ -74,7 +74,7 @@ def create_subclass_id_mixin(parent_table_name: str) -> type:
     return SubclassIdMixin
 ```
 
-动态生成而非手写：不同父表名导致外键目标不同，函数参数化解决。
+动态生成而非手写：不同父表名导致外键目标不同，函数参数化解决。`default_factory` 必须与 `UUIDTableBaseMixin.id` 保持一致（都是 UUIDv7）：这个 Mixin 通过 MRO 覆盖父类的 `id`，两边不一致会让 JTI 子类悄悄得到与其它所有表不同版本的 UUID。
 
 **MRO 顺序至关重要**：Mixin 必须在继承列表**最前面**，其 `id` 才能覆盖 `UUIDTableBaseMixin` 的 `id`：
 
@@ -145,8 +145,16 @@ def _register_sti_columns(cls):
 
         column = get_column_from_field(field_info)
         column.nullable = True            # STI 子类字段必须 nullable // [!code warning]
+        column.default = None
+        column.server_default = None
         parent_table.append_column(column) # [!code focus]
 ```
+
+剥掉 `default` / `server_default` 是因为 Pydantic 已经在 `__init__` 时把字段默认值写成实例属性，ORM flush 时直接读实例值，从不查 `Column.default`。代价是：既没有默认值也没有服务端默认值的列会进入 SQLAlchemy 的 `mapper._insert_cols_as_none`，**兄弟子类的每次 INSERT 都会往这一列写显式 NULL**——显式 NULL 会绕过数据库 DEFAULT（DEFAULT 只在 INSERT 省略该列时生效）。
+
+::: warning 迁移作者必须遵守的不变式（此处不做检查）
+**这里注册的 STI 共享列在数据库中必须可空——永远不要给它加 NOT NULL，也不要依赖数据库 DEFAULT 为兄弟子类填值。** 违规只会在迁移过的数据库上失败，`create_all` 建的测试库里这一列本来就可空、测试一直是绿的。只想对拥有该列的子类要求非空时，用容忍 NULL 的 CHECK：`discriminator <> 'owner_identity' OR col IS NOT NULL`。
+:::
 
 ### Phase 2：`_register_sti_column_properties()`
 

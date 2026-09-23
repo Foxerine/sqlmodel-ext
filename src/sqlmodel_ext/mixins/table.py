@@ -59,9 +59,8 @@ from sqlmodel_ext.pagination import (
 # Conditional FastAPI import
 try:
     from fastapi import HTTPException as _FastAPIHTTPException
-    _HAS_FASTAPI = True
 except ImportError:
-    _HAS_FASTAPI = False
+    _FastAPIHTTPException = None
 
 logger = logging.getLogger(__name__)
 
@@ -282,9 +281,9 @@ class TableBaseMixin(AsyncAttrs):
 
     id: int | None = Field(default=None, primary_key=True)
 
-    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))
+    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))  # pyright: ignore[reportArgumentType]  # older sqlmodel (e.g. 0.0.38) annotates sa_type as type[Any]; a TypeEngine instance is accepted at runtime
     updated_at: datetime = Field(
-        sa_type=DateTime(timezone=True),
+        sa_type=DateTime(timezone=True),  # pyright: ignore[reportArgumentType]  # older sqlmodel (e.g. 0.0.38) annotates sa_type as type[Any]; a TypeEngine instance is accepted at runtime
         sa_column_kwargs={'default': now, 'onupdate': now},
         default_factory=now
     )
@@ -793,7 +792,8 @@ class TableBaseMixin(AsyncAttrs):
             instance_version = instance.__dict__.get(OPTIMISTIC_LOCK_VERSION_COLUMN)
 
             # TableBaseMixin is always used with SQLModelBase; sqlmodel_update provided by SQLModel
-            _ = cast(SQLModelBase, instance).sqlmodel_update(update_data, update=extra_data)
+            # (the mixin is not a SQLModelBase subclass statically, hence the cast through object)
+            _ = cast(SQLModelBase, cast(object, instance)).sqlmodel_update(update_data, update=extra_data)
             if update_data or extra_data:
                 # Explicit assignment (see save()): JTI updates touching only
                 # subclass columns would not fire the parent's onupdate.
@@ -1938,7 +1938,7 @@ class TableBaseMixin(AsyncAttrs):
         """
         instance = await cls.get(session, col(cls.id) == id, load=load, with_for_update=with_for_update)
         if instance is None:
-            if _HAS_FASTAPI:
+            if _FastAPIHTTPException is not None:
                 raise _FastAPIHTTPException(status_code=404, detail=detail)
             raise RecordNotFoundError(detail)
         return instance

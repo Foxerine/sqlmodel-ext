@@ -7,7 +7,7 @@ from pydantic_core import core_schema
 from sqlalchemy.types import String, TypeDecorator
 
 
-class _PathAsSQLString(TypeDecorator):
+class _PathAsSQLString(TypeDecorator[Path]):
     """(Internal) Converts Path <-> str for the database."""
     impl = String
     cache_ok = True
@@ -21,7 +21,7 @@ class _BasePathHandler(ABC):
     # from the core-schema metadata and hands it straight to the column
     # builder, which expects a TypeEngine instance (a bare class silently
     # falls back to AutoString, dropping the Path<->str result_processor).
-    sa_type: TypeDecorator = _PathAsSQLString()
+    sa_type: TypeDecorator[Path] = _PathAsSQLString()
 
     @classmethod
     @abstractmethod

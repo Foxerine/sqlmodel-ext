@@ -57,7 +57,7 @@ When a migration must declare an invalidation
 | Change | Declare? | Why |
 |--------|----------|-----|
 | ``ADD COLUMN`` | no | old cache entries validate with the field default |
-| ``DROP COLUMN`` | no* | the extra key in old entries is ignored |
+| ``DROP COLUMN`` | no* | old entries carry an extra key; ``extra='forbid'`` makes their deserialization fail, and a failed cache read falls back to the DB and self-heals |
 | change column type, same meaning | no | coerced by Pydantic, or deserialization fails and self-heals |
 | change column type **and rescale / re-encode values** | **yes** | old values validate but are wrong |
 | drop a column + add a column **backfilled with non-default values** | **yes** | old entries get the default, not the backfill |
@@ -89,9 +89,9 @@ from sqlmodel_ext.mixins.cached_table import CachedTableBaseMixin
 try:
     from alembic.config import Config as _AlembicConfig
     from alembic.script import ScriptDirectory as _AlembicScriptDirectory
-    _HAS_ALEMBIC = True
 except ImportError:
-    _HAS_ALEMBIC = False
+    _AlembicConfig = None
+    _AlembicScriptDirectory = None
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ def collect_migration_invalidation_tasks(alembic_ini: str = DEFAULT_ALEMBIC_INI)
     :returns: sentinel -> list of model class names (merged over all migrations)
     :raises RuntimeError: the optional ``alembic`` package is not installed
     """
-    if not _HAS_ALEMBIC:
+    if _AlembicConfig is None or _AlembicScriptDirectory is None:
         raise RuntimeError(
             "collect_migration_invalidation_tasks() requires the 'alembic' package; "
             "install it or pass the tasks to run_pending_migration_cache_invalidations(tasks=...)"

@@ -4,7 +4,9 @@ Consumer-side integration test.
 Runs from a clean virtualenv that has ONLY the built sqlmodel-ext wheel
 installed (plus aiosqlite for the async SQLite driver). Simulates what an
 external PyPI consumer experiences: if this script passes, the wheel is
-well-formed and the STI default-isolation fix behaves end-to-end.
+well-formed, the STI default-isolation fix behaves end-to-end and
+``partial=True`` PATCH DTOs keep the tri-state (``Unset`` / null / value)
+semantics with the pydantic version the wheel resolves to.
 
 Exits with status 0 on success, non-zero on any failed assertion. Intended
 to be invoked directly by CI:
@@ -12,8 +14,6 @@ to be invoked directly by CI:
     python -m pip install dist/*.whl aiosqlite
     python examples/consumer_integration/run.py
 """
-from __future__ import annotations
-
 import asyncio
 import sys
 
@@ -29,6 +29,7 @@ from sqlmodel_ext import (
     SQLModelBase,
     Str64,
     UUIDTableBaseMixin,
+    Unset,
     register_sti_column_properties_for_all_subclasses,
     register_sti_columns_for_all_subclasses,
 )
@@ -57,6 +58,17 @@ class NoOpFunction(Tool, AutoPolymorphicIdentityMixin, table=True):
     pass
 
 
+# ---------- partial=True PATCH DTO (tri-state Unset) ----------
+
+class WidgetBase(SQLModelBase):
+    name: Str64
+    note: str | None
+
+
+class WidgetUpdate(WidgetBase, partial=True):
+    pass
+
+
 # ---------- Integration scenario ----------
 
 FIVE_GIB = 5 * 1024 * 1024 * 1024
@@ -74,7 +86,8 @@ async def main() -> None:
     register_sti_column_properties_for_all_subclasses()
 
     # --- Layer 1: metadata assertions ---
-    shared = Tool.__table__.columns
+    tool_table = SQLModel.metadata.tables['tool']
+    shared = tool_table.columns
     if shared["max_size"].default is not None:
         fail(
             f"tool.max_size.default should be None (fix cleared the shared SA "
@@ -95,6 +108,12 @@ async def main() -> None:
             f"{ExportFunction.model_fields['max_size'].default!r}"
         )
 
+    # --- Layer 1b: tri-state PATCH DTO from the installed wheel ---
+    if WidgetUpdate().name is not Unset or WidgetUpdate().model_dump() != {}:
+        fail("partial=True: omitted fields must be Unset and absent from model_dump()")
+    if WidgetUpdate(note=None).model_dump() != {'note': None}:
+        fail("partial=True: explicit null on a nullable field must be kept")
+
     # --- Layer 2: behavioural assertions via real async SQLite ---
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
@@ -105,10 +124,9 @@ async def main() -> None:
             # NoOpFunction does not declare max_size; the shared column must be NULL.
             noop = NoOpFunction(name="noop")
             noop = await noop.save(session)
-            result = await session.execute(
-                select(Tool.__table__.c.max_size).where(Tool.__table__.c.id == noop.id)
+            stored = await session.scalar(
+                select(tool_table.c.max_size).where(tool_table.c.id == noop.id)
             )
-            stored = result.scalar_one()
             if stored is not None:
                 fail(
                     f"NoOpFunction.max_size should be NULL (bug: sibling default "
@@ -118,10 +136,9 @@ async def main() -> None:
             # UploadFunction also does not declare max_size.
             upload = UploadFunction(name="upload")
             upload = await upload.save(session)
-            result = await session.execute(
-                select(Tool.__table__.c.max_size).where(Tool.__table__.c.id == upload.id)
+            stored = await session.scalar(
+                select(tool_table.c.max_size).where(tool_table.c.id == upload.id)
             )
-            stored = result.scalar_one()
             if stored is not None:
                 fail(
                     f"UploadFunction.max_size should be NULL. Got: {stored!r}"
@@ -130,10 +147,9 @@ async def main() -> None:
             # Happy path: declaring subclass still persists its own Pydantic default.
             export = ExportFunction(name="export")
             export = await export.save(session)
-            result = await session.execute(
-                select(Tool.__table__.c.max_size).where(Tool.__table__.c.id == export.id)
+            stored = await session.scalar(
+                select(tool_table.c.max_size).where(tool_table.c.id == export.id)
             )
-            stored = result.scalar_one()
             if stored != FIVE_GIB:
                 fail(
                     f"ExportFunction.max_size should be {FIVE_GIB}. Got: {stored!r} "

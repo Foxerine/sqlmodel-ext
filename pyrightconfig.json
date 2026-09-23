@@ -1,0 +1,48 @@
+{
+  // Type-checking configuration for developing sqlmodel-ext itself.
+  // Run `basedpyright` from the repository root (it picks this file up automatically).
+  // basedpyright reads this file as JSONC, so comments are allowed.
+  //
+  // Everything not listed below keeps basedpyright's defaults. The gate is 0 errors;
+  // warnings are reported but do not fail CI.
+  //
+  // Scope: `src` only. The test suite deliberately exercises dynamic / invalid usage
+  // (runtime-attached attributes, fake dialects, wrong-typed arguments to assert the
+  // runtime rejection), so it is not held to the same gate.
+
+  // Lowest supported interpreter (pyproject `requires-python = ">=3.12"`), so code that
+  // only type-checks on newer Pythons is caught.
+  "pythonVersion": "3.12",
+  "include": ["src"],
+
+  // basedpyright's default ("recommended") mode exits non-zero on warnings too; the
+  // gate here is errors only, warnings stay visible in the output.
+  "failOnWarnings": false,
+
+  // Every `import sqlmodel_ext.<submodule>` inside the package implicitly imports the
+  // re-exporting `sqlmodel_ext/__init__.py`, which the checker reports as a cycle
+  // (__init__ -> base -> __init__). These are not real initialization-order cycles.
+  "reportImportCycles": false,
+
+  // The mixins intentionally specialize members of their bases in ways that are not
+  // Liskov-substitutable: `UUIDTableBaseMixin` narrows `id: int | None` to `UUID` and
+  // `get_one(id: int)` to `get_one(id: UUID)`; `CachedTableBaseMixin` re-declares
+  // `add` / `delete` with its own self type; SQLAlchemy `TypeDecorator` hooks rename
+  // or narrow parameters. These overrides are the designed API, not defects.
+  "reportIncompatibleMethodOverride": false,
+  "reportIncompatibleVariableOverride": false,
+
+  // The library wraps SQLAlchemy / Pydantic internals whose annotations expose `Any`
+  // pervasively (row values, column defaults, `model_dump` output, metaclass kwargs).
+  // These rules only produce warnings (~1400 of them) that would bury real diagnostics.
+  "reportAny": false,
+  "reportExplicitAny": false,
+
+  // Same root cause: partially-unknown types originate in third-party annotations
+  // (SQLAlchemy `Row` / `inspect()` / `TypeDecorator` generics, redis, alembic, numpy).
+  // Warnings only (~400).
+  "reportUnknownVariableType": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false
+}

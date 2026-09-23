@@ -87,7 +87,7 @@ from sqlmodel import SQLModel
 from sqlmodel_ext import AsyncSession, CachedTableBaseMixin  # ← new (note: the enhanced AsyncSession)
 
 engine = create_async_engine("sqlite+aiosqlite:///blog.db")
-SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 ```
 
 ::: warning Must use sqlmodel_ext.AsyncSession
@@ -121,10 +121,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 ```
 
 ::: danger `decode_responses=False`
-Cached values are `bytes` (from `model_dump_json().encode()`). Setting it to `True` makes redis-py decode bytes into str, breaking deserialization.
+Cached values are JSON `bytes` (the row's columns encoded with orjson). Setting it to `True` makes redis-py decode bytes into str, breaking deserialization.
 :::
 
-`check_cache_config()` validates that every subclass of `CachedTableBaseMixin` has a valid positive integer `__cache_ttl__`, and registers SQLAlchemy `after_commit` event hooks (used by the `commit=False` invalidation compensation path).
+`check_cache_config()` validates that a Redis client is configured and that every subclass of `CachedTableBaseMixin` has a valid positive integer `__cache_ttl__` and does not call invalidation internals directly, and registers the SQLAlchemy session event hooks (uncommitted-write tracking and the `after_commit` compensation path used when a commit bypasses the enhanced session).
 
 ## 4. Verify cache hits
 
@@ -152,12 +152,12 @@ docker exec -it blog-redis redis-cli
 > KEYS id:Article:*
 1) "id:Article:550e8400-..."
 > GET id:Article:550e8400-...
-"{\"_t\":\"single\",\"_data\":{...},\"_c\":\"Article\"}"
+"{\"_t\":\"single\",\"_data\":{\"title\":\"...\",...,\"_c\":\"Article\"}}"
 > TTL id:Article:550e8400-...
 (integer) 597
 ```
 
-`_t` is the result type (single / list / none), `_c` is the actual class name (polymorphic safety), `_data` is the result of `model_dump_json()`.
+`_t` is the result type (single / list / none), `_data` holds the row's columns, and `_c` inside it is the actual class name (so polymorphic rows come back as the right subclass).
 :::
 
 ## 5. Verify automatic invalidation
@@ -170,7 +170,9 @@ curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
 curl http://127.0.0.1:8000/articles/<article_id>
 ```
 
-The second `curl` hits the database again — why? Because `update()` internally called `_invalidate_for_model()`, which deletes `id:Article:<id>` and bumps the query cache version. The next read is a cache miss → DB query → new entry written.
+The second `curl` hits the database again — why? Because `update()` registered the changed row, and the enhanced `AsyncSession.commit()` deleted `id:Article:<id>` and bumped the query-cache version right after the commit landed. The next read is a cache miss → DB query → new entry written.
+
+The same happens for writes that never call a CRUD method: a bare `session.add()`, an attribute change followed by `commit()`, or `session.delete()` are all picked up at commit. And while a transaction has uncommitted writes on a table, queries that depend on that table skip the cache entirely — uncommitted data is never published to other requests.
 
 Business code is completely unaware.
 
@@ -235,17 +237,24 @@ If you want the author **and** something related to the author, write `load=[rel
 Some scenarios you don't want to use the cache — for example, immediately after a PATCH you want the freshest read. `get()` accepts `no_cache=True`:
 
 ```python
-fresh = await Article.get_one(session, article_id, no_cache=True)
+fresh = await Article.get(session, Article.id == article_id, no_cache=True)
 ```
 
-Usually you don't need it though — `save()` / `update()` already invalidated the cache, so the next normal read picks up the new data.
+For reads that decide whether to *allow* something (permission checks), use `authoritative=True` instead — it bypasses both Redis and SQLAlchemy's identity map, and `get_one()` accepts it too:
+
+```python
+article = await Article.get_one(session, article_id, authoritative=True)
+```
+
+Usually you don't need either — the commit already invalidated the cache, so the next normal read picks up the new data.
 
 **Auto-bypass scenarios** (you don't have to specify these):
 
 - `with_for_update=True` (row lock requires fresh data)
 - `populate_existing=True`
-- non-empty `options=` / `join=` (cannot be hashed stably)
-- pending invalidation in the current transaction
+- non-empty `options=` / `join=` (join targets are not tracked for invalidation)
+- `load=` containing a relationship the ID cache cannot serve
+- uncommitted writes in the current transaction on any table the query depends on
 
 ## 8. What you just learned
 
@@ -256,7 +265,9 @@ Usually you don't need it though — `save()` / `update()` already invalidated t
 | `configure_redis()` is called once at startup | inside lifespan |
 | `check_cache_config()` validates every subclass | inside lifespan |
 | `decode_responses=False` is non-negotiable | redis client config |
-| Cache invalidation is fully automatic | CRUD registers pendings; the enhanced `AsyncSession.commit()` sync-invalidates them |
+| Cache invalidation is fully automatic | every write in the session (CRUD or bare ORM) is registered; the enhanced `AsyncSession.commit()` invalidates after the commit lands |
+| The cache is transaction-transparent | uncommitted writes make dependent queries skip the cache |
+| Bypass on purpose | `no_cache=True` on `get()`; `authoritative=True` for permission checks |
 | `lazy='raise_on_sql'` is the MissingGreenlet safety net | no setup needed; on by default |
 | `load=` preloads relations | `Article.get_exist_one(..., load=rel(Article.author))` |
 

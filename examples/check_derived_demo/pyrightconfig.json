@@ -1,0 +1,4 @@
+{
+  // Stand-alone project root for the check_derived demo (see examples/README.md).
+  "pythonVersion": "3.12"
+}

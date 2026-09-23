@@ -1,96 +1,92 @@
 # Metaclass & SQLModelBase
 
 ::: tip Source location
-`src/sqlmodel_ext/base.py` — `SQLModelBase` and `__DeclarativeMeta` metaclass
+`src/sqlmodel_ext/base.py` — `SQLModelBase`, `SQLModelExtConfig` and the `__DeclarativeMeta` metaclass
 
-`src/sqlmodel_ext/_sa_type.py` — Extract SQLAlchemy column types from Annotated metadata
+`src/sqlmodel_ext/_sa_type.py` — extracts SQLAlchemy column types from Annotated metadata
 
-`src/sqlmodel_ext/_compat.py` — Python 3.14 compatibility patch
+`src/sqlmodel_ext/_compat.py` — Python 3.14 compatibility patches
 :::
 
-This is the **foundation** of the entire project. All model classes inherit from `SQLModelBase`, and `SQLModelBase`'s metaclass `__DeclarativeMeta` automatically completes a series of configurations during class creation.
+This is the **cornerstone** of the project, and the place where the "[single source of truth](./single-source-of-truth)" actually holds: you declare a fact once, and the metaclass derives everything SQLAlchemy needs from it **at the moment the class is created**. Every model inherits from `SQLModelBase`, and its metaclass `__DeclarativeMeta` does this work.
+
+::: info About the snippets on this page
+The snippets below are **simplified excerpts** of `base.py` meant to show the intent of each step; step numbers match the numbered comments in the source. The source is authoritative.
+:::
 
 ## What the user writes vs what the metaclass does
 
 ```python
 class UserBase(SQLModelBase):
     name: NonEmptyStrippedStr64
-    email: EmailStr
+    email: Str255
 
-class User(UserBase, UUIDTableBaseMixin, table=True):
+class User(UserBase, UUIDTableBaseMixin):   # no table=True
+    pass
+
+class UserUpdate(UserBase, partial=True):   # no field re-declared
     pass
 ```
 
-| Class | Creates DB table? | Role |
-|-------|-------------------|------|
-| `UserBase` | No | Pure data model, only defines fields |
-| `User` | Yes | Inherits fields + CRUD capabilities, maps to a database table |
-
-SQLModel uses the `table=True` keyword to decide whether to create a table. **The metaclass is where this parameter is processed.**
+| Class | Creates a DB table? | Role |
+|---|---|---|
+| `UserBase` | No | Pure data model — only defines fields |
+| `User` | Yes | Inherits fields + CRUD, maps to a DB table |
+| `UserUpdate` | No | PATCH body; every field becomes `Unset \| T` |
 
 ## `__DeclarativeMeta.__new__` step by step
-
-`__new__` executes at the **very moment** a class object is created.
 
 ### Step 1: Auto `table=True`
 
 ```python
-# base.py:113-116
 is_intended_as_table = any(getattr(b, '_has_table_mixin', False) for b in bases)
 if is_intended_as_table and 'table' not in kwargs:
-    kwargs['table'] = True # [!code focus]
+    kwargs['table'] = True
 ```
 
-Iterates through parent classes — if `_has_table_mixin = True` is found (defined on `TableBaseMixin`), `table=True` is automatically added.
+If a parent carries `_has_table_mixin = True` (defined on `TableBaseMixin`), `table=True` is added automatically.
+
+### Step 1.5: `cache_ttl` keyword
+
+```python
+if 'cache_ttl' in kwargs:
+    ttl = kwargs.pop('cache_ttl')
+    if not isinstance(ttl, int) or ttl <= 0:
+        raise ValueError(f"{name}: cache_ttl must be a positive integer, got: {ttl!r}")
+    attrs['__cache_ttl__'] = ttl
+```
+
+Lets you write `class Foo(..., cache_ttl=1800):`; `CachedTableBaseMixin` reads `__cache_ttl__`.
 
 ### Step 2: Detect inheritance type (JTI vs STI)
 
 ```python
-# base.py:119-143
 parent_tablename = None
 for base in bases:
     if is_table_model_class(base) and hasattr(base, '__tablename__'):
         parent_tablename = base.__tablename__
         break
 
-# Check for foreign key pointing to parent table → JTI characteristic
-has_fk_to_parent = False
-if parent_tablename is not None and will_be_table:
-    for base in bases:
-        for field_name, field_info in base.model_fields.items():
-            fk = getattr(field_info, 'foreign_key', None)
-            if fk and parent_tablename in fk:
-                has_fk_to_parent = True
-
-# STI: no foreign key to parent, shares parent table
-if parent_tablename and will_be_table and not has_own_tablename and not has_fk_to_parent:
-    attrs['__tablename__'] = parent_tablename
+# a parent field with a foreign key to the parent table -> JTI characteristic
+...
+if parent_tablename is not None and will_be_table and not has_own_tablename and not has_fk_to_parent:
+    attrs['__tablename__'] = parent_tablename   # STI: share the parent table
 ```
 
-When a table subclass inherits from a table parent:
-- **Has foreign key to parent** → JTI, subclass gets its own table
-- **No foreign key** → STI, subclass shares parent's `__tablename__`
+When a table subclass inherits a table parent: **a foreign key to the parent table** → JTI, the subclass gets its own table; **no foreign key** → STI, it shares the parent table.
 
 ### Step 3: Merge `__mapper_args__`
 
 ```python
-# base.py:146-158
 collected_mapper_args = {}
-
 if 'mapper_args' in kwargs:
     collected_mapper_args.update(kwargs.pop('mapper_args'))
-
 for key in cls._KNOWN_MAPPER_KEYS:  # polymorphic_on, polymorphic_identity, ...
     if key in kwargs:
         collected_mapper_args[key] = kwargs.pop(key)
-
-if collected_mapper_args:
-    existing = attrs.get('__mapper_args__', {}).copy()
-    existing.update(collected_mapper_args)
-    attrs['__mapper_args__'] = existing
 ```
 
-Extracts keywords like `polymorphic_on`, `polymorphic_abstract` from `kwargs` and merges them into the `__mapper_args__` dict. This enables a concise syntax:
+This enables the concise syntax:
 
 ```python
 # sqlmodel-ext (concise)
@@ -105,153 +101,167 @@ class Tool(SQLModel, table=True): # [!code --]
     } # [!code --]
 ```
 
-`_KNOWN_MAPPER_KEYS` supports these shortcut keywords: `polymorphic_on`, `polymorphic_identity`, `polymorphic_abstract`, `version_id_col`, `concrete`.
+`_KNOWN_MAPPER_KEYS`: `polymorphic_on`, `polymorphic_identity`, `polymorphic_abstract`, `version_id_col`, `concrete`.
 
-### Step 3.5: Intercept `CustomTableArg` in `table_args` (new in 0.4.0)
-
-While processing `table_args`, the metaclass **splits out** marker objects
-inheriting `CustomTableArg` and never hands them to SQLAlchemy:
+### Step 3.5: Optimistic-lock wiring
 
 ```python
-if 'table_args' in kwargs:
-    raw_table_args = kwargs.pop('table_args')
-    real_table_args, custom_table_args = [], []
-    for arg in raw_table_args:
-        (custom_table_args if isinstance(arg, CustomTableArg) else real_table_args).append(arg)
-    attrs['__table_args__'] = tuple(real_table_args)
-    # appended to the module-level _classes_with_custom_table_args queue after super().__new__
+if will_be_table and any(getattr(b, '_has_optimistic_lock', False) for b in bases):
+    if not _is_inheriting_table and 'version_id_col' not in attrs.get('__mapper_args__', {}):
+        def _mapper_args_with_version_col(target_cls, _static=...):
+            merged = dict(_static)
+            merged['version_id_col'] = target_cls.__table__.c[OPTIMISTIC_LOCK_VERSION_COLUMN]
+            return merged
+        attrs['__mapper_args__'] = declared_attr.directive(_mapper_args_with_version_col)
 ```
 
-**Why**: SQLAlchemy's `Table.__init__` consumes every `__table_args__` element
-immediately — an `Index` referencing a not-yet-existing column raises
-`ConstraintColumnNotFoundError` on the spot. `CustomTableArg` is a generic
-"defer processing" marker base class: the metaclass only intercepts and
-enqueues, knowing **nothing** about concrete semantics; downstream
-infrastructure scans the queue at the right moment. The only consumer today is
-`mixins.polymorphic.DeferredIndex` (deferred indexes over STI subclass
-columns, materialized at the end of STI phase 1).
+A root table class mixing in `OptimisticLockMixin` gets its `oplock_version` column registered as SQLAlchemy's `version_id_col`, so every UPDATE carries `WHERE ... AND oplock_version = :current`. The `Column` object only exists once the table is built, hence the late-evaluated `declared_attr`. STI/JTI children share it through mapper inheritance. — **The policy lives where the capability is declared**: the user only mixes in a mixin.
 
-### Step 4: Extract `sa_type` from type annotations
+### Step 3.6: `CustomTableArg` in `table_args`, `table_name`, `abstract`
 
-This is the **most elegant part** of the metaclass.
+While processing `table_args`, the metaclass **pulls out** marker objects that inherit `CustomTableArg` and does not pass them to SQLAlchemy:
 
 ```python
-# base.py:169-202
-annotations, ..., eval_globals, eval_locals = _resolve_annotations(attrs)
+real_table_args, custom_table_args = [], []
+for arg in raw_table_args:
+    (custom_table_args if isinstance(arg, CustomTableArg) else real_table_args).append(arg)
+attrs['__table_args__'] = tuple(real_table_args)
+# appended to the module-level queue _classes_with_custom_table_args after super().__new__
+```
 
+**Why**: SQLAlchemy's `Table.__init__` consumes every element of `__table_args__` immediately — an `Index` referencing a not-yet-existing column raises on the spot. `CustomTableArg` is a generic "defer this" marker: the metaclass only intercepts and enqueues, knowing nothing about the semantics; the current consumer is `mixins.polymorphic.DeferredIndex` (deferred indexes on STI subclass columns). `table_name=` / `abstract=` become `__tablename__` / `__abstract__`.
+
+### Step 4: Resolve annotations and record "which fields this class declares itself"
+
+```python
+annotations, annotation_strings, eval_globals, eval_locals = _resolve_annotations(attrs)
+_own_annotation_names = frozenset(annotations)
+```
+
+This snapshot must be taken **before** any annotation injection: later steps inject inherited fields into `annotations`, after which "declared here" and "inherited and injected" are indistinguishable. Steps 4.5.b and 4.6 rely on it.
+
+### Step 4.5: Recover SQLModel attributes from `Annotated[T, Field(...)]`
+
+When Pydantic v2 processes `Annotated` metadata it replaces `sqlmodel.main.FieldInfo` with `pydantic.fields.FieldInfo`, which knows nothing about SQLModel attributes such as `foreign_key` or `sa_type`. For **table classes** (including `Annotated` fields inherited from parents), `_recover_annotated_sqlmodel_fields()` converts them back into the `= Field(...)` form; non-table classes are left as-is so child table classes can inherit them. When several `FieldInfo`s are merged, an explicit `default=None` is kept as a real value (not "unset") — otherwise the field would silently become required.
+
+### Step 4.5.b: `oplock_version` is a reserved name
+
+```python
+if OPTIMISTIC_LOCK_VERSION_COLUMN in _own_annotation_names:
+    raise TypeError(f"{name}: 'oplock_version' is reserved for OptimisticLockMixin's version_id_col ...")
+```
+
+Any class declaring `oplock_version` in **its own body** fails — whether or not it enables optimistic locking. Reserving it only for locked classes is not enough: a class without the lock could declare a domain field of that name, which a descendant re-enabling the lock would then silently wire up as `version_id_col`.
+
+### Step 4.6: `partial=True`
+
+```python
+if 'all_fields_optional' in kwargs:
+    raise TypeError(f"{name}: the 'all_fields_optional' class keyword was removed in sqlmodel-ext 0.5.0. ...")
+is_partial = kwargs.pop('partial', False)
+if is_partial:
+    if will_be_table:
+        raise TypeError(f"{name}: 'partial=True' cannot be combined with 'table=True' ...")
+    _apply_partial(annotations, attrs, bases, _own_annotation_names)
+```
+
+`_apply_partial()` collects field names from the bases' `model_fields`, fetches the **original annotation** along the MRO (keeping `Annotated` metadata), and then:
+
+- `T` → `Unset | T` with default `Unset` (nullable fields naturally become `Unset | T | None`);
+- for fields declared as `field: T = Field(gt=..., le=...)` (non-`Annotated` form) the constraints live on the right-hand side, so they are pulled from the base's `model_fields[name].metadata` and re-wrapped into `Annotated`;
+- **field-level** attributes — `exclude` / `alias` / `validation_alias` / `serialization_alias` / `discriminator` / `repr` / `frozen` — would be silently dropped by Pydantic on a union member, so `_hoist_field_metadata()` hoists them outside the union; constraints stay inside;
+- fields the class declares itself (`_own_annotation_names`) and `Literal` fields are skipped.
+
+The generated annotations exist at runtime; static type checkers still see the base annotations. Where static enforcement matters, declare `Unset | T = Unset` explicitly, or use the experimental `python -m sqlmodel_ext.check_derived` (see [Check partial DTOs for misuse](/en/how-to/check-partial-dtos)). See [Unset](./unset-three-state).
+
+### Step 4.7: Extract `sa_type` from type annotations
+
+```python
 for field_name, field_type in annotations.items():
-    sa_type = _extract_sa_type_from_annotation(field_type) # [!code focus]
-
+    sa_type = _extract_sa_type_from_annotation(field_type)
     if sa_type is not None:
         field_value = attrs.get(field_name, Undefined)
-
         if field_value is Undefined:
-            attrs[field_name] = Field(sa_type=sa_type) # [!code focus]
+            # no "= Field(...)": prefer recovering the user's FieldInfo from inside Annotated,
+            # keeping default_factory / max_length etc., and only add sa_type
+            annotated_fi = _find_field_info_in_annotated(field_type)
+            attrs[field_name] = annotated_fi if annotated_fi is not None else Field(sa_type=sa_type)
         elif isinstance(field_value, FieldInfo):
-            if not hasattr(field_value, 'sa_type') or field_value.sa_type is Undefined:
-                field_value.sa_type = sa_type # [!code focus]
+            _durably_set_sa_type(field_value, sa_type)
+        else:
+            # bare default (e.g. fpath: FilePathType = Path("a.txt"))
+            attrs[field_name] = Field(default=field_value, sa_type=sa_type)
 ```
 
-::: info 0.3 fix: respect explicit `sa_type`
-Starting with 0.3.0 the Python 3.14 compatibility patch fixes a subtle issue: under the PEP 649 path, an explicit `Field(sa_type=...)` written by the user could be overwritten by the inferred default. The fix checks whether `sa_type` was already explicitly set, and only injects the inferred type if it wasn't.
-:::
+`_durably_set_sa_type()` writes `sa_type` into a `FieldInfoMetadata` entry of `FieldInfo.metadata` — the channel SQLModel's own `Field(sa_type=...)` uses and that survives Pydantic's `model_fields` rebuild; a plain `setattr` would be lost before the column is built. An explicitly set `sa_type` is never overwritten.
 
 #### `_extract_sa_type_from_annotation()` — three extraction methods
 
-In `_sa_type.py`, three methods are used to find SQLAlchemy column types from type annotations:
-
 ```python
 def _extract_sa_type_from_annotation(annotation):
-    # Method 1: The type itself has a __sqlmodel_sa_type__ attribute
-    if hasattr(annotation, '__sqlmodel_sa_type__'):
-        return annotation.__sqlmodel_sa_type__
-
-    # Method 2: Found in Annotated metadata
-    if get_origin(annotation) is Annotated:
-        for item in get_args(annotation)[1:]:
-            if hasattr(item, '__sqlmodel_sa_type__'):
-                return item.__sqlmodel_sa_type__
-            schema = item.__get_pydantic_core_schema__(...)
-            if 'sa_type' in schema.get('metadata', {}):
-                return schema['metadata']['sa_type']
-
-    # Method 3: The type's own __get_pydantic_core_schema__ returns metadata
-    schema = annotation.__get_pydantic_core_schema__(...)
-    return schema.get('metadata', {}).get('sa_type')
+    # Method 1: the type itself has a __sqlmodel_sa_type__ attribute
+    # Method 2: an Annotated metadata item has __sqlmodel_sa_type__, or the schema returned by
+    #           its __get_pydantic_core_schema__ carries 'sa_type' in its metadata
+    # Method 3: the schema returned by the type's own __get_pydantic_core_schema__ carries 'sa_type'
+    ...
 ```
 
-Example with `Array[str]`: `__class_getitem__` returns `Annotated[list[str], _ArrayTypeHandler(str)]`, and `_ArrayTypeHandler.__get_pydantic_core_schema__` includes `metadata={'sa_type': ARRAY(String)}` in its schema. The metaclass finds this and automatically injects it into `Field(sa_type=ARRAY(String))`.
+Take `Array[str]`: `__class_getitem__` returns `Annotated[list[str], _ArrayTypeHandler(str)]`, and the `_ArrayTypeHandler` schema carries `metadata={'sa_type': ARRAY(String)}`; the `JSON100K` schema carries `metadata={'sa_type': JSONB}`. **The type declares its own column type**, and the metaclass delivers it to the column builder.
 
-### Step 5: Call parent to create the class
+### Steps 5–7: Save SQLModel `FieldInfo`s, call the parent, restore
 
 ```python
-result = super().__new__(cls, name, bases, attrs, **kwargs)
+_saved_sqlmodel_fis = {fn: attrs[fn] for fn in annotations if isinstance(attrs.get(fn), SQLModelFieldInfo)}  # step 5 (table classes only)
+result = super().__new__(cls, name, bases, attrs, **kwargs)                                                  # step 6
+# step 6.5: append intercepted CustomTableArg markers to the module-level queue
+# step 7: Pydantic's model_fields rebuild dropped SQLModel-only attributes (unique / index / foreign_key / sa_type ...);
+#         merge the saved SQLModelFieldInfo back and rebuild the Column
 ```
 
-After the first four preprocessing steps, the configured `attrs` and `kwargs` are passed to SQLModel's original metaclass.
+While merging, boolean flags are never overwritten with `False` (`unique=False` never switches off an inherited `unique=True`), and `FieldInfoMetadata` carriers are folded into one (SQLModel reads only the first; otherwise an all-unset carrier inside a type alias shadows `= Field(primary_key=True)` — which is exactly why `id: NonNegativeInt = Field(primary_key=True)` lost its primary key on sqlmodel ≥ 0.0.32).
 
-### Steps 6-8: Fix inherited relationship fields
+### Steps 8–9: Relationship fields under inheritance
 
 ```python
-# Step 6: JTI subclass inherits parent's Relationships
+# Step 8: JTI subclasses inherit the parent's Relationships
+# Step 9: a subclass may not redefine a parent's Relationship
 for base in bases:
-    if hasattr(base, '__sqlmodel_relationships__'):
-        for rel_name, rel_info in base.__sqlmodel_relationships__.items():
-            if rel_name not in result.__sqlmodel_relationships__:
-                result.__sqlmodel_relationships__[rel_name] = rel_info
-
-# Step 7: Prevent subclass from redefining parent's Relationships
-for base in bases:
-    parent_relationships = getattr(base, '__sqlmodel_relationships__', {})
-    for rel_name in parent_relationships:
+    for rel_name in getattr(base, '__sqlmodel_relationships__', {}):
         if rel_name in attrs:
-            raise TypeError(f"Cannot redefine parent's Relationship '{rel_name}'")
-
-# Step 8: Remove Relationship fields from model_fields
-for rel_name in relationships:
-    if rel_name in model_fields:
-        del model_fields[rel_name]
-if fields_removed:
-    result.model_rebuild(force=True)
+            raise TypeError(f"Class {name} cannot redefine parent {base.__name__}'s Relationship field '{rel_name}'. ...")
 ```
 
-Fixes bugs in SQLModel/SQLAlchemy when handling inheritance + relationships: Relationships being treated as Pydantic fields, JTI subclasses losing parent Relationships, and subclass redefinition causing ambiguity.
+### Step 10: Inherit field descriptions
 
-### PEP 604 nullable relationship annotation normalization (since 0.4.1)
+`use_attribute_docstrings` reads docstrings from the source AST. When a subclass overrides a field without a docstring, or `partial=True` generates annotations programmatically, there is no docstring in the source and the description would be lost. The metaclass restores it from the parents' `model_fields` along the MRO — **the description is written once** and derived DTOs carry it automatically.
 
-When building a Relationship, the metaclass does not call SQLModel's
-`get_relationship_to` directly — it first wraps it in `_resolve_relationship_target`,
-which normalizes a **flat-string / ForwardRef** nullable relationship annotation
-(e.g. `'Parent | None'`) into a structured `ForwardRef('Parent')` via `ast` before
-delegating to upstream.
+### Step 11: Remove Relationship fields from `model_fields`
 
-Root cause: `get_relationship_to` can only strip `None` from an **already-evaluated**
-`typing.Union`; it cannot parse a whole-string PEP 604 annotation — it would treat
-the entire `'Parent | None'` string as the class name and hand it to SQLAlchemy.
-`Optional['Parent']` works only because `Optional[...]` is evaluated at
-class-definition time into `Union[ForwardRef('Parent'), None]`, leaving just the
-inner `'Parent'` as a ForwardRef.
+Relationships are not Pydantic fields; the metaclass removes them from `model_fields` / `__pydantic_fields__` and calls `model_rebuild(force=True)` when needed.
 
-So relationship fields can now use the pyright-friendly forward-reference form:
+### Step 12: Register partial classes
+
+Classes created with `partial=True` are appended, in order, to `sqlmodel_ext.base.optional_dto_registry` for tools such as contract tests to enumerate.
+
+### PEP 604 nullable relationship annotation normalization
+
+When creating a Relationship, the metaclass does not call SQLModel's `get_relationship_to` directly — it first routes through `_resolve_relationship_target`, which uses `ast` to normalize **flat string / ForwardRef** nullable annotations (such as `'Parent | None'`) into a structured `ForwardRef('Parent')` before handing off upstream.
+
+Root cause: `get_relationship_to` can only strip `None` from an **already-evaluated** `typing.Union`; it cannot parse a PEP 604 annotation that is *one whole string* — it would pass the entire `'Parent | None'` to SQLAlchemy as a class name.
 
 ```python
 class Child(SQLModelBase, UUIDTableBaseMixin, table=True):
     parent_id: uuid.UUID | None = Field(default=None, foreign_key="parent.id")
-    parent: 'Parent | None' = Relationship(back_populates="children")   # ✅ no Optional['Parent']
+    parent: 'Parent | None' = Relationship(back_populates="children")   # no Optional['Parent'] needed
 ```
 
-Every shape is covered: `Foo` / `pkg.Foo` / `Foo | None` / `None | Foo` /
-`Optional[Foo]` / `Union[Foo, None]`, plus an inner requoted form (`Optional['Foo']`).
-When the annotation cannot be reduced to a single target (e.g. a multi-member union
-`Foo | Bar`), it is handed back to upstream unchanged, preserving its original clear
-error. Normalization only affects the temporary local value passed to
-`get_relationship_to`; `cls.__annotations__` is left intact. Already-evaluated typing
-objects (`list[...]` / concrete classes / `Optional[...]`) pass through unchanged, so
-the change is backward-compatible.
+Covered forms: `Foo` / `pkg.Foo` / `Foo | None` / `None | Foo` / `Optional[Foo]` / `Union[Foo, None]`, plus nested quotes (`Optional['Foo']`). When an annotation cannot be normalized to a single target (e.g. `Foo | Bar`), it is passed through to upstream unchanged so upstream raises its own error. Normalization only applies to the temporary value passed to `get_relationship_to` and never rewrites `cls.__annotations__`.
+
+Relationships without an explicit `lazy` default to `lazy='raise_on_sql'`: an accidental lazy load in async code raises immediately instead of turning into `MissingGreenlet`.
 
 ## `__DeclarativeMeta.__init__` — JTI table creation
 
-After `__new__` creates the class, `__init__` does post-initialization. Core task: **handle JTI sub-table creation**.
+After `__new__` creates the class, `__init__` performs follow-up initialization. Its core job: **create JTI child tables**.
 
 ```python
 def __init__(cls, classname, bases, dict_, **kw):
@@ -260,116 +270,89 @@ def __init__(cls, classname, bases, dict_, **kw):
         return
 
     base_is_table = any(is_table_model_class(base) for base in bases)
-
     if not base_is_table:
-        # First table class, normal flow
         cls._setup_relationships()
         DeclarativeMeta.__init__(...)
         return
 
-    # Parent is also a table → inheritance scenario
-    is_joined_inheritance = has_different_tablename and has_fk_to_parent
-
+    # parent is also a table -> inheritance
     if is_joined_inheritance:
-        # JTI: create sub-table
-        # 1. Collect ancestor table column names
-        # 2. Find subclass-owned fields
-        # 3. Rebuild foreign key columns
-        # 4. Remove columns inherited from ancestors that don't belong in sub-table
-        # 5. Set up subclass-owned Relationships
+        # JTI: collect ancestor column names, find the subclass's own fields, rebuild FK columns,
+        # drop inherited columns that do not belong to the child table, set up own Relationships
         DeclarativeMeta.__init__(...)
-
     else:
-        # STI: subclass shares parent table
+        # STI: subclass shares the parent table
         ModelMetaclass.__init__(...)
         registry.map_imperatively(...)
 ```
 
-::: info Why this manual handling?
-SQLModel's original logic: if the parent is already a table model, the subclass **skips** `DeclarativeMeta.__init__`. But JTI needs the subclass to have its own table! sqlmodel-ext detects JTI scenarios and manually calls it to create the sub-table.
-
-For STI, `registry.map_imperatively()` maps the subclass to the parent table while handling the subclass's Relationships and foreign key resolution.
+::: info Why manual handling?
+SQLModel's original logic: if the parent is already a table model, the subclass **skips** `DeclarativeMeta.__init__`. But JTI needs the subclass to have its own table! sqlmodel-ext detects JTI and calls it manually to create the child table. For STI it uses `registry.map_imperatively()` to map the subclass onto the parent table.
 :::
-
-### Step 1.5: `cache_ttl` keyword
-
-```python
-# base.py:121-126
-if 'cache_ttl' in kwargs:
-    ttl = kwargs.pop('cache_ttl')
-    if not isinstance(ttl, int) or ttl <= 0:
-        raise ValueError(f"{name}: cache_ttl must be a positive integer, got: {ttl!r}")
-    attrs['__cache_ttl__'] = ttl
-```
-
-`CachedTableBaseMixin` uses `__cache_ttl__` to control cache TTL. The metaclass converts the `cache_ttl` keyword argument into a class attribute, enabling the syntax `class Foo(..., table=True, cache_ttl=1800):`.
 
 ## `SQLModelBase` itself
 
 ```python
 class SQLModelBase(SQLModel, metaclass=__DeclarativeMeta):
-    model_config = ConfigDict(
-        use_attribute_docstrings=True,  # Attribute docstrings as field descriptions
-        validate_by_name=True,          # Allow validation by field name
-        extra='forbid',                 # Forbid passing undefined fields
+    model_config = SQLModelExtConfig(
+        use_attribute_docstrings=True,  # attribute docstrings become field descriptions
+        validate_by_name=True,          # allow validation by field name
+        extra='forbid',                 # reject undeclared fields
     )
-
-    @classmethod
-    def get_computed_field_names(cls) -> set[str]:
-        fields = cls.model_computed_fields
-        return set(fields.keys()) if fields else set()
 ```
+
+Besides configuration, it carries the tri-state semantics and a few construction-time invariants:
+
+| Member | Purpose |
+|---|---|
+| `annotation_is_omissible()` / `field_is_omissible()` | "May this field be left out" — decided by whether the annotation contains `Unset` |
+| `_normalise_omitted_sentinel` (a `mode='before'` validator) | With `omitted_sentinel` on, replaces `'__omitted__'` at any depth of an inbound dict with `Unset` |
+| `model_json_schema()` | With `omitted_sentinel` on, injects the sentinel branch into omissible fields (nested and self-referencing models included). It has to happen at the `model_json_schema()` exit: `__get_pydantic_json_schema__` sees an intermediate product that Pydantic re-assembles later |
+| `__pydantic_init_subclass__` + `model_post_init` | Discover `JSON100K` / `JSONList100K` fields at class creation and check encodability and the 100K limit at construction — the check applies even to `table=True` models, which skip Pydantic validation. Overrides of `model_post_init` must call `super()` |
+| `__get_pydantic_json_schema__` | Restores `description` dropped from `$ref` properties |
+| `submitted_fields_among()` | Explicitly submitted fields ∩ the given models' fields |
+| `validate_list()` / `get_computed_field_names()` | Batch conversion / list computed fields |
 
 ## `ExtraIgnoreModelBase` — external data base class
 
 ```python
 class ExtraIgnoreModelBase(SQLModelBase):
-    model_config = ConfigDict(
+    model_config = SQLModelExtConfig(
         use_attribute_docstrings=True, validate_by_name=True, extra='ignore',
     )
 
     @model_validator(mode='before')
     @classmethod
     def _warn_unknown_fields(cls, data):
-        if not isinstance(data, dict):
-            return data
-        accepted = {name for name, fi in cls.model_fields.items()}
-        # Also includes alias and validation_alias
-        unknown = set(data.keys()) - accepted
+        ...  # field names, alias and validation_alias (every string choice of AliasChoices) are known
         if unknown:
-            logger.warning("External input contains unknown fields | model=%s ...", cls.__name__)
+            logger.warning("External input contains unknown fields | model=%s ...", cls.__name__, ...)
         return data
 ```
 
-Unlike `SQLModelBase` (`extra='forbid'`), `ExtraIgnoreModelBase` uses `extra='ignore'` to silently ignore unknown fields, but **logs a WARNING** to help developers notice third-party API changes.
+Unlike `SQLModelBase` (`extra='forbid'`), it silently ignores unknown fields but **logs a WARNING** so developers notice third-party API changes. Use for third-party API responses, client WebSocket messages and external JSON input.
 
-Use cases: third-party API responses, client WebSocket messages, external JSON inputs.
+## `_compat.py` — Python 3.14 patches
 
-## `_compat.py` — Python 3.14 patch
+Python 3.14 introduced PEP 649 (deferred evaluation of annotations), which broke SQLModel internals. `_compat.py` fixes two places:
 
-Python 3.14 introduces PEP 649 (deferred annotation evaluation), which causes errors in SQLModel internal functions. `_compat.py` fixes this via monkey patching:
+- **`get_sqlalchemy_type`**: the original function calls `issubclass()` on `ForwardRef`, `ClassVar`, `Literal[StrEnum.MEMBER]` and similar types, raising `TypeError`. The patch intercepts these cases first and respects an explicit `Field(sa_type=...)`.
+- **`sqlmodel_table_construct`**: in polymorphic table subclasses, inherited Relationship defaults may be replaced by `InstrumentedAttribute` objects. The patch skips these "polluted" defaults.
 
-### Patch 1: `get_sqlalchemy_type`
-
-The original function calls `issubclass()` on `ForwardRef`, `ClassVar`, `Literal[StrEnum.MEMBER]` etc., causing `TypeError`. The patch intercepts these special cases before the call, and respects the user's explicit `Field(sa_type=...)`.
-
-### Patch 2: `sqlmodel_table_construct`
-
-In polymorphic inheritance table subclasses, inherited Relationship field defaults may be replaced by SQLAlchemy with `InstrumentedAttribute` objects. The patch skips these "polluted" defaults.
-
-::: info
 Both patches only activate on Python >= 3.14.
-:::
 
 ## Summary
 
-| Metaclass step | Problem solved |
-|----------------|---------------|
-| Auto `table=True` | Eliminates manual writing |
-| Detect JTI/STI | Automatically handles both inheritance modes |
-| Merge `__mapper_args__` | Simplifies polymorphic configuration syntax |
-| Extract `sa_type` | Custom types auto-map to database columns |
-| Fix inherited relation fields | Works around SQLModel/SQLAlchemy bugs |
-| JTI sub-table creation | Enables Joined Table Inheritance in SQLModel |
+| Metaclass step | Duplication removed / problem solved |
+|----------------|----------------|
+| Auto `table=True` | "Is it a table" is expressed only by inheriting `TableBaseMixin` |
+| JTI/STI detection | The inheritance style is expressed by "is there an FK to the parent table" |
+| Merging `__mapper_args__` | Polymorphism is configured with keywords, not dicts |
+| Optimistic-lock wiring | Mix in the mixin; no hand-written `version_id_col` |
+| Reserving `oplock_version` | Misuse fails at class creation |
+| `partial=True` | Update DTOs derive from the base; no field re-declared |
+| Extracting `sa_type` | Custom types declare their own column type |
+| Restoring SQLModel `FieldInfo` / inheriting descriptions | Constraints and descriptions are written once and survive inheritance |
+| Relationship fixes / JTI child tables | Work around SQLModel/SQLAlchemy inheritance defects |
 
-**Core design philosophy**: Users just write declarative model definitions, and the metaclass handles all SQLAlchemy configuration details behind the scenes.
+**Core design idea**: the user writes declarative model definitions only; the metaclass derives every SQLAlchemy detail behind the scenes — each fact written once.

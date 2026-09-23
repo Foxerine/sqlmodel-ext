@@ -39,13 +39,13 @@ class IPAddress(str):
         def validate_ip_address(value: typing.Any) -> str:
             """Validate IP address format and return as string."""
             if isinstance(value, str):
-                IPvAnyAddress(value)
+                IPvAnyAddress(value)  # pyright: ignore[reportCallIssue]  # pydantic declares IPvAnyAddress as a Union alias under TYPE_CHECKING; at runtime it is a callable class
                 return value
             elif isinstance(value, (IPvAnyAddress, )):
                 return str(value)
             else:
                 ip_str = str(value)
-                IPvAnyAddress(ip_str)
+                IPvAnyAddress(ip_str)  # pyright: ignore[reportCallIssue]  # pydantic declares IPvAnyAddress as a Union alias under TYPE_CHECKING; at runtime it is a callable class
                 return ip_str
 
         return core_schema.no_info_after_validator_function(
@@ -55,7 +55,7 @@ class IPAddress(str):
 
     def is_private(self) -> bool:
         """Check if this IP address is a private address."""
-        return IPvAnyAddress(self).is_private
+        return IPvAnyAddress(self).is_private  # pyright: ignore[reportCallIssue]  # pydantic declares IPvAnyAddress as a Union alias under TYPE_CHECKING; at runtime it is a callable class
 
 
 def _reject_ipv6_scope_id(

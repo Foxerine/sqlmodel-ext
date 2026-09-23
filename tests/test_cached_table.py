@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime
 
 import fakeredis.aioredis
 import pytest
@@ -406,7 +406,9 @@ async def test_cache_roundtrip_preserves_datetime_and_uuid(
     engine: AsyncEngine,
     sql_log: list[str],
 ) -> None:
-    moment = datetime(2024, 5, 17, 12, 30, 45, 123456)
+    # sqlmodel >= 0.0.46 rejects naive datetimes on write; the library's own
+    # timestamps are UTC-aware, so the round-trip is asserted on an aware value.
+    moment = datetime(2024, 5, 17, 12, 30, 45, 123456, tzinfo=UTC)
     ref = uuid.uuid4()
     event_row = await CacheEvent(title="launch", happened_at=moment, ref_id=ref).save(cache_session)
     eid = event_row.id
@@ -438,7 +440,7 @@ async def test_serialize_deserialize_wrappers_roundtrip(
     fake_redis: fakeredis.aioredis.FakeRedis,
 ) -> None:
     """Direct unit roundtrip of the None / single / list wrapper formats."""
-    moment = datetime(2030, 1, 2, 3, 4, 5, 678901)
+    moment = datetime(2030, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
     ref = uuid.uuid4()
     ev = CacheEvent(title="unit", happened_at=moment, ref_id=ref)
 

@@ -376,10 +376,14 @@ def _fix_polluted_model_fields(cls: type) -> None:
         else:
             continue
 
+        # NOTE: pydantic's FieldInfo uses __slots__ and has no ``foreign_key`` /
+        # ``primary_key``; these branches only run when ``current_field`` is a
+        # sqlmodel FieldInfo, which is never the case for the polluted fields seen
+        # so far (their FieldInfo is pydantic's). Kept as-is pending a design decision.
         if hasattr(current_field, 'foreign_key'):
-            new_field.foreign_key = current_field.foreign_key
+            new_field.foreign_key = current_field.foreign_key  # pyright: ignore[reportAttributeAccessIssue]  # see NOTE above: unreachable in practice, would raise AttributeError if reached
         if hasattr(current_field, 'primary_key'):
-            new_field.primary_key = current_field.primary_key
+            new_field.primary_key = current_field.primary_key  # pyright: ignore[reportAttributeAccessIssue]  # see NOTE above: unreachable in practice, would raise AttributeError if reached
 
         cls.model_fields[field_name] = new_field
 
@@ -500,8 +504,9 @@ class AutoPolymorphicIdentityMixin:
 
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
-        if hasattr(super(), '__pydantic_init_subclass__'):
-            super().__pydantic_init_subclass__(**kwargs)
+        parent_hook = getattr(super(), '__pydantic_init_subclass__', None)
+        if parent_hook is not None:
+            parent_hook(**kwargs)
         _fix_polluted_model_fields(cls)
 
     @classmethod
@@ -525,16 +530,20 @@ class AutoPolymorphicIdentityMixin:
             return
 
         # JTI detection
-        if hasattr(cls, '__table__') and cls.__table__ is not None:
-            if cls.__table__.name != parent_table.name:
+        # (``__table__`` / ``model_fields`` come from the concrete SQLModel class this
+        # mixin is combined with, so they are read dynamically rather than declared here)
+        own_table = getattr(cls, '__table__', None)
+        if own_table is not None:
+            if own_table.name != parent_table.name:
                 return
 
-        if not hasattr(cls, 'model_fields'):
+        own_fields = getattr(cls, 'model_fields', None)
+        if own_fields is None:
             return
 
         existing_columns = {col.name for col in parent_table.columns}
 
-        for field_name, field_info in cls.model_fields.items():
+        for field_name, field_info in own_fields.items():
             if field_name in parent_fields:
                 continue
             if field_name.startswith('_'):
@@ -649,8 +658,9 @@ class AutoPolymorphicIdentityMixin:
             return
 
         # JTI detection: skip if this class has its own distinct table
-        if hasattr(cls, '__table__') and cls.__table__ is not None:
-            if cls.__table__.name != sti_table.name:
+        own_table = getattr(cls, '__table__', None)
+        if own_table is not None:
+            if own_table.name != sti_table.name:
                 return
 
         child_mapper = class_mapper(cls)
@@ -662,12 +672,13 @@ class AutoPolymorphicIdentityMixin:
         if hasattr(root_class, 'model_fields'):
             root_fields.update(root_class.model_fields.keys())
 
-        if not hasattr(cls, 'model_fields'):
+        own_fields = getattr(cls, 'model_fields', None)
+        if own_fields is None:
             return
 
         child_existing_props = {p.key for p in child_mapper.column_attrs}
 
-        for field_name in cls.model_fields:
+        for field_name in own_fields:
             if field_name in root_fields:
                 continue
             if field_name.startswith('_'):

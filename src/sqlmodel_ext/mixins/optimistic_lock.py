@@ -13,7 +13,7 @@ Not suitable for:
 
 Usage::
 
-    class Order(OptimisticLockMixin, UUIDTableBaseMixin, table=True):
+    class Order(SQLModelBase, OptimisticLockMixin, UUIDTableBaseMixin, table=True):
         status: OrderStatusEnum
         amount: Decimal
 
@@ -79,7 +79,9 @@ class OptimisticLockMixin:
     save/update/delete and converted to ``OptimisticLockError``.
 
     Principle:
-    1. Each record has an ``oplock_version`` field, starting at 0
+    1. Each record has an ``oplock_version`` field; the Python-side default is
+       0, and SQLAlchemy's ``version_id_col`` writes 1 on INSERT, so a freshly
+       saved row reads back as 1
     2. Each UPDATE generates SQL like:
        ``UPDATE table SET ..., oplock_version = oplock_version + 1 WHERE id = ? AND oplock_version = ?``
     3. If WHERE doesn't match (version changed by another transaction),
@@ -96,7 +98,7 @@ class OptimisticLockMixin:
     Inheritance order:
         OptimisticLockMixin must come before TableBaseMixin/UUIDTableBaseMixin::
 
-            class Order(OptimisticLockMixin, UUIDTableBaseMixin, table=True):
+            class Order(SQLModelBase, OptimisticLockMixin, UUIDTableBaseMixin, table=True):
                 ...
 
     Retries:
@@ -120,21 +122,25 @@ class OptimisticLockMixin:
     _has_optimistic_lock: ClassVar[bool] = True
     """Marks the class as optimistic-lock enabled (the metaclass wires ``version_id_col`` from it).
 
-    A subclass may override it with ``False`` to keep the version column but
-    not wire ``version_id_col`` -- e.g. as the first step of a two-phase
-    rollout where the column ships before the locking behavior."""
+    An intermediate base class may override it with ``False`` to keep the
+    version column but not wire ``version_id_col`` -- e.g. as the first step of
+    a two-phase rollout where the column ships before the locking behavior.
+    The override must sit on a *base* of the table class: the metaclass reads
+    the flag from the bases being combined, so setting it in the table class's
+    own body has no effect."""
 
-    # Field shape (all three parts are required):
-    # 1. The default lives inside the Annotated ``Field``: this mixin is a
-    #    plain class (no ``model_fields``), so a default given only by ``=``
-    #    assignment would be lost when the metaclass recovers Annotated fields
-    #    on subclasses; the annotation metadata carries it reliably.
-    # 2. The ``= OPLOCK_INITIAL_VERSION`` assignment is kept as well so type
-    #    checkers see an initialized attribute.
-    # 3. ``server_default``: during a rolling deployment, old application
+    # Field shape (both parts are required):
+    # 1. The default lives inside the Annotated ``Field`` and ONLY there: this
+    #    mixin is a plain class (no ``model_fields``), so a default given by
+    #    ``=`` assignment would be lost when the metaclass recovers Annotated
+    #    fields on subclasses; the annotation metadata carries it reliably.
+    #    Do not add an ``= <value>`` assignment: it creates a plain class
+    #    attribute on the mixin, and SQLModel then warns on every subclass that
+    #    the field "shadows an attribute in parent OptimisticLockMixin".
+    # 2. ``server_default``: during a rolling deployment, old application
     #    instances do not know the column and omit it on INSERT -- a DB-side
     #    default keeps those INSERTs valid.
-    oplock_version: Annotated[
+    oplock_version: Annotated[  # pyright: ignore[reportUninitializedInstanceVariable]  # initialized by the SQLModel subclass __init__ from the Field(default=...) in the metadata, which a plain-class analysis cannot see; an `= value` here would trigger SQLModel's shadowing warning (see point 1)
         int,
         Field(
             default=OPLOCK_INITIAL_VERSION,
@@ -148,7 +154,7 @@ class OptimisticLockMixin:
             # extra='forbid').
             exclude=True,
         ),
-    ] = OPLOCK_INITIAL_VERSION
+    ]
     """Optimistic lock version number, auto-incremented on each update.
 
     BIGINT with an upper bound of ``JS_MAX_SAFE_INTEGER``: removes any

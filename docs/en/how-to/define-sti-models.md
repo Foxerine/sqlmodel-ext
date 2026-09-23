@@ -14,6 +14,8 @@ If subclasses differ a lot (5+ exclusive fields), pick [JTI](./define-jti-models
 
 ```python
 from datetime import datetime
+from uuid import UUID
+from sqlmodel import Field
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
@@ -45,7 +47,16 @@ class CompletedFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
 ```
 
 ::: warning Subclass fields must be nullable
-In STI all subclasses share one table. `PendingFile.upload_deadline` is meaningless for `CompletedFile` rows, so the column must be nullable (`| None`). sqlmodel-ext forces the column to `nullable=True`.
+In STI all subclasses share one table. `PendingFile.upload_deadline` is meaningless for `CompletedFile` rows, so the column must be nullable (`| None`). sqlmodel-ext forces the column to `nullable=True` and strips its `default` / `server_default` — so every INSERT of a sibling subclass writes an **explicit NULL** into this column.
+:::
+
+::: danger When writing migrations: never add NOT NULL to a shared column
+In the database these columns must stay nullable, and you can't rely on a database DEFAULT to fill values for sibling subclasses either (an explicit NULL bypasses the DEFAULT). In a test database built by `create_all` the column is nullable anyway, so a violation only shows up on a migrated database. If you only want to require "subclasses that own this column must have a value", use a NULL-tolerant CHECK:
+
+```sql
+ALTER TABLE userfile ADD CONSTRAINT ck_userfile_completed_size
+    CHECK (_polymorphic_name <> 'completedfile' OR file_size IS NOT NULL);
+```
 :::
 
 `AutoPolymorphicIdentityMixin` automatically sets `_polymorphic_name = 'pendingfile'` / `'completedfile'`.
@@ -83,7 +94,7 @@ pending = await PendingFile.get(session, fetch_mode='all')
 ```
 
 ::: info STI auto-filter
-SQLAlchemy/SQLModel does **not** automatically add `WHERE _polymorphic_name IN (...)` for STI subclass queries. sqlmodel-ext patches it in inside `get()`, using `mapper.self_and_descendants` to include both the class itself and all of its subclasses.
+SQLAlchemy/SQLModel does **not** automatically add `WHERE _polymorphic_name IN (...)` for STI subclass queries. sqlmodel-ext adds this condition itself (`mapper.self_and_descendants`, which includes the current class and all of its subclasses), and `get()`, `count()`, `delete(condition=...)`, keyset cursor anchors, `distinct_column()` and `group_sum()` all share the same condition — `PendingFile.delete(session, condition=...)` won't accidentally delete `CompletedFile` rows, and `PendingFile.count()` covers the same scope as the list.
 :::
 
 ## Verifying the schema
@@ -99,8 +110,8 @@ userfile (
     upload_deadline TIMESTAMP NULL,         -- PendingFile field, NULL for other subclasses
     file_size BIGINT NULL,                  -- CompletedFile field
     sha256 VARCHAR(64) NULL,                -- CompletedFile field
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
 )
 ```
 

@@ -175,6 +175,45 @@ def test_toplevel_import() -> None:
         "RelationLoadCheckMiddleware",
         "run_model_checks",
         "mark_app_check_completed",
+        # Session (REPEATABLE READ / factory)
+        "SessionFactory",
+        "RepeatableReadSnapshotConflictError",
+        "SerializationRetryExhaustedError",
+        # Pagination (page window / keyset)
+        "PageWindowRequest",
+        "DEFAULT_PAGE_SIZE",
+        "MAX_PAGE_SIZE",
+        "MAX_TABLE_VIEW_OFFSET",
+        # Table extras
+        "SESSION_REPEATABLE_READ_KEY",
+        "GroupSumRow",
+        "uuid7",
+        "FK_DELETE_RESTRICT_FALLBACK_MESSAGE",
+        "ResourceReferencedError",
+        "KeysetCursorError",
+        "KeysetCursorInvalidError",
+        "KeysetCursorUnsupportedError",
+        # Lock / isolation decorators
+        "requires_locked_param",
+        "requires_read_committed",
+        "requires_repeatable_read",
+        "validate_locked_instances",
+        # Cache
+        "CACHE_TTL_HOT",
+        "CACHE_TTL_WARM",
+        "CACHE_TTL_COLD",
+        "collect_migration_invalidation_tasks",
+        "run_pending_migration_cache_invalidations",
+        # Resource quota
+        "ResourceQuotaMixin",
+        "QuotaExceededError",
+        "QuotaOwnerNotFoundError",
+        "CallerDidNotCommitError",
+        # Mixin table scan / trigram search
+        "MixinTableScanMixin",
+        "BIGRAM_FUNCTION_SQL",
+        "TrgmSearchableMixin",
+        "TrgmSearchRequest",
     ],
 )
 def test_public_symbol_is_exported(name: str) -> None:
@@ -182,3 +221,43 @@ def test_public_symbol_is_exported(name: str) -> None:
     import sqlmodel_ext
 
     assert hasattr(sqlmodel_ext, name), f"sqlmodel_ext.{name} is not exported"
+
+
+def test_package_ships_py_typed_marker() -> None:
+    """PEP 561: without ``py.typed`` type checkers treat the package as untyped."""
+    from importlib.resources import files
+
+    assert files("sqlmodel_ext").joinpath("py.typed").is_file()
+
+
+_REEXPORTING_PACKAGES = (
+    "sqlmodel_ext",
+    "sqlmodel_ext.mixins",
+    "sqlmodel_ext.field_types.mixins",
+    "sqlmodel_ext.field_types.dialects.postgresql",
+)
+
+
+@pytest.mark.parametrize("package", _REEXPORTING_PACKAGES)
+def test_reexports_use_redundant_alias(package: str) -> None:
+    """Every ``from ... import X`` in a re-exporting ``__init__`` must be ``X as X``.
+
+    In a ``py.typed`` package, pyright/basedpyright treat a plain
+    ``from m import X`` inside ``__init__.py`` as a private import, so a consumer
+    writing ``from sqlmodel_ext import X`` gets ``reportPrivateImportUsage``.
+    """
+    import ast
+    import importlib
+    from pathlib import Path
+
+    module = importlib.import_module(package)
+    assert module.__file__ is not None
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    offenders = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.asname != alias.name
+    ]
+    assert offenders == [], f"{package}: re-exported without 'X as X': {offenders}"

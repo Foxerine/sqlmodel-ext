@@ -22,8 +22,8 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
     if needs_processing(file):
         # 30 seconds of network I/O — DB connection held the whole time
         data = await s3.download_file(file.bucket_id, file.key)
-        metadata = await extract_metadata_via_ffprobe(data)
-        file.metadata = metadata
+        media_info = await extract_metadata_via_ffprobe(data)
+        file.media_info = media_info
         await file.save(session)
     return file
 ```
@@ -46,11 +46,11 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
 
         # ↓ This block holds NO DB connection — concurrent requests can use the pool
         data = await s3.download_file(bucket_id, key)
-        metadata = await extract_metadata_via_ffprobe(data)
+        media_info = await extract_metadata_via_ffprobe(data)
 
         # ↓ Any subsequent await Model.get/save automatically checks out a new connection
         file = await UserFile.get(session, UserFile.id == file_id)  # must re-query
-        file.metadata = metadata
+        file.media_info = media_info
         await file.save(session)
     return file
 ```
@@ -59,6 +59,8 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
 - `session.reset()` releases the current transaction and connection, but the session object itself stays alive (it's not closed)
 - Any subsequent `await Model.get/save` that issues SQL transparently checks out a new connection from the pool
 - During the released window all 30 connections are idle (unless other requests use them) — concurrent requests **are not stalled**
+- The enhanced `reset()` also clears FOR UPDATE lock tracking, pending post-commit callbacks, the REPEATABLE READ marker and cache tracking state — row locks held earlier were released along with the transaction, and guards such as `@requires_for_update` will require you to lock again
+- The static analyzer (RLC) likewise models objects after `reset()` as detached: continuing to read already-loaded columns is not falsely reported as RLC007 / RLC010
 
 ## 3. Object state after `session.reset()`: detached but not expired
 
@@ -118,15 +120,15 @@ After `session.reset()` the object is detached and **cannot be saved directly**.
 await session.reset()
 
 # Long I/O...
-metadata = await fetch_external_metadata(...)
+media_info = await fetch_external_metadata(...)
 
 # ❌ file is still detached — save will fail
-file.metadata = metadata
+file.media_info = media_info
 await file.save(session)
 
 # ✓ Re-query to get a fresh attached instance
 file = await UserFile.get(session, UserFile.id == file_id)
-file.metadata = metadata
+file.media_info = media_info
 await file.save(session)
 ```
 

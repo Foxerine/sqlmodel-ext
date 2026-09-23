@@ -146,6 +146,35 @@ class User(SQLModel, table=True):
     title: Str64   # Reuses the same constraints
 ```
 
+That is the basic building block of sqlmodel-ext's "declare once" approach: the constraint lives in the type, and validation, the column type and the OpenAPI schema all come from it. See [a single source of truth](./single-source-of-truth).
+
+## Sentinel values: when `None` is a real value
+
+A **sentinel** is a unique object whose only job is to mean "a special situation", compared with `is`. Python has used them for a long time (`dataclasses.MISSING`, private `_NOTSET = object()` constants), and [PEP 661](https://peps.python.org/pep-0661/) standardizes the pattern. Pydantic 2.12 ships one as `pydantic.experimental.missing_sentinel.MISSING`, which sqlmodel-ext exports as `Unset`.
+
+Why it matters: in a PATCH body, `None` has to be able to mean "clear this column", so "the field was not sent" needs a different carrier. With `Unset`, the three states — not sent / `null` / a value — become distinguishable:
+
+```python
+from sqlmodel_ext import SQLModelBase, Unset
+
+
+class Patch(SQLModelBase):
+    nickname: Unset | str | None = Unset
+
+
+assert Patch().nickname is Unset                          # not sent
+assert Patch(nickname=None).nickname is None              # sent as null
+assert Patch().model_dump() == {}                         # Unset keys are never output
+```
+
+See [Unset](./unset-three-state).
+
+## Static type checkers
+
+A static type checker (pyright, basedpyright, mypy) reads the annotations without running the code and reports calls that cannot be right: a possibly-`None` value used as if it were always present, a wrong argument name, a list used as a single object. It can also **narrow** a union after a check — inside `if x is Unset: return`, the rest of the function knows `x` is no longer `Unset`.
+
+sqlmodel-ext is designed so that as much misuse as possible becomes a type error, and it is gated on basedpyright itself. See [Type-check with basedpyright](/en/how-to/type-check-with-basedpyright).
+
 ## Polymorphic inheritance database concepts
 
 Different types of objects share base fields but each has specialized fields:

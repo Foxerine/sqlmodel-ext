@@ -14,6 +14,8 @@
 
 ```python
 from datetime import datetime
+from uuid import UUID
+from sqlmodel import Field
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
@@ -45,7 +47,16 @@ class CompletedFile(UserFile, AutoPolymorphicIdentityMixin, table=True):
 ```
 
 ::: warning 子类字段必须是 nullable
-STI 中所有子类共享一张表。`PendingFile.upload_deadline` 这一列对 `CompletedFile` 行没有意义，所以必须可空（`| None`）。sqlmodel-ext 会强制把列声明为 `nullable=True`。
+STI 中所有子类共享一张表。`PendingFile.upload_deadline` 这一列对 `CompletedFile` 行没有意义，所以必须可空（`| None`）。sqlmodel-ext 会强制把列声明为 `nullable=True`，并剥掉它的 `default` / `server_default`——于是兄弟子类的每次 INSERT 都会往这一列写**显式 NULL**。
+:::
+
+::: danger 写迁移时：共享列永远不加 NOT NULL
+数据库里这类列必须保持可空，也不能指望数据库 DEFAULT 为兄弟子类填值（显式 NULL 会绕过 DEFAULT）。`create_all` 建的测试库里这一列本来就可空，违规只会在迁移过的库上暴露。只想要求"拥有这一列的子类必须有值"时，用容忍 NULL 的 CHECK：
+
+```sql
+ALTER TABLE userfile ADD CONSTRAINT ck_userfile_completed_size
+    CHECK (_polymorphic_name <> 'completedfile' OR file_size IS NOT NULL);
+```
 :::
 
 `AutoPolymorphicIdentityMixin` 自动设置 `_polymorphic_name = 'pendingfile'` / `'completedfile'`。
@@ -83,7 +94,7 @@ pending = await PendingFile.get(session, fetch_mode='all')
 ```
 
 ::: info STI 自动过滤
-SQLAlchemy/SQLModel 默认**不会**为 STI 子类查询自动加 `WHERE _polymorphic_name IN (...)` 过滤。sqlmodel-ext 在 `get()` 中主动补上这个条件，使用 `mapper.self_and_descendants` 包含当前类及其所有子类。
+SQLAlchemy/SQLModel 默认**不会**为 STI 子类查询自动加 `WHERE _polymorphic_name IN (...)` 过滤。sqlmodel-ext 主动补上这个条件（`mapper.self_and_descendants`，包含当前类及其所有子类），并且 `get()`、`count()`、`delete(condition=...)`、keyset 游标锚点、`distinct_column()`、`group_sum()` 共用同一个条件——`PendingFile.delete(session, condition=...)` 不会误删 `CompletedFile` 的行，`PendingFile.count()` 与列表的范围一致。
 :::
 
 ## 验证表结构
@@ -99,8 +110,8 @@ userfile (
     upload_deadline TIMESTAMP NULL,         -- PendingFile 的字段，对其他子类为 NULL
     file_size BIGINT NULL,                  -- CompletedFile 的字段
     sha256 VARCHAR(64) NULL,                -- CompletedFile 的字段
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
 )
 ```
 

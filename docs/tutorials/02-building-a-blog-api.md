@@ -97,8 +97,9 @@ class ArticleCreateRequest(ArticleBase):
     pass
 
 
-class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
-    # 继承字段自动转为 ``T | None = None``，max_length / 非空 strip 等约束原样保留
+class ArticleUpdateRequest(ArticleBase, partial=True):
+    # 继承字段变为 ``Unset | T = Unset``（"没传"是 Unset，不是 None）；
+    # max_length / 非空 strip 等约束与 docstring 原样保留
     pass
 
 
@@ -133,7 +134,7 @@ class CommentResponse(CommentBase, UUIDIdDatetimeInfoMixin):
 - **`XxxBase`**：所有变体的最大公约数（"创建"和"响应"都需要的字段）
 - **`Xxx`**：表模型，加上外键和 Relationship
 - **`XxxCreateRequest`**：POST 请求体（继承 Base，所有字段必填）
-- **`XxxUpdateRequest`**：PATCH 请求体（`all_fields_optional=True` 自动把继承字段转为可选，约束保留）
+- **`XxxUpdateRequest`**：PATCH 请求体（`partial=True` 从 Base 派生：每个字段都可省略，约束与可空性保留）
 - **`XxxResponse`**：响应 DTO（继承 Base + `UUIDIdDatetimeInfoMixin` 自动加 id 和时间戳）
 
 这个分层让验证规则**只写一遍**——`NonEmptyStrippedStr256` 携带的 `max_length=256` + 非空 strip 约束自动适用于 `ArticleBase` 的所有子类。
@@ -155,11 +156,11 @@ from typing import Annotated
 from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlmodel_ext import AsyncSession
 
 # 注意：教程用 SQLite 是为了零配置；真实项目应该用 PostgreSQL
 engine = create_async_engine("sqlite+aiosqlite:///blog.db")
-SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 
 
 @asynccontextmanager
@@ -308,6 +309,15 @@ curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
   -H "Content-Type: application/json" \
   -d '{"title":"Updated title"}'
 # 注意：body 和 is_published 不传，所以保持原值（PATCH 语义）
+
+# 对基类声明为不可空的字段传 null
+curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
+  -H "Content-Type: application/json" \
+  -d '{"title":null}'
+# → 422：ArticleBase.title 不可为 null，PATCH 请求体继承了这个事实
+
+# 用 keyset 游标取下一页：传入你手上最后一条的 id
+curl "http://127.0.0.1:8000/articles?limit=10&after_id=<last_article_id>"
 ```
 
 ## 5. 关键模式回顾
@@ -330,7 +340,9 @@ curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
 return await article.update(session, data)
 ```
 
-`update()` 默认 `exclude_unset=True`：只有 `data` 中**显式设置**的字段会被写到数据库。如果客户端只传了 `{"title": "new"}`，那么 `body` 和 `is_published` 完全不动。这正是 HTTP PATCH 的语义。
+客户端没传的字段在 `data` 上是 `Unset`，而 `Unset` 字段永远不出现在 `model_dump()` 中——所以 `update()` 只写客户端传了的字段。如果客户端只传了 `{"title": "new"}`，那么 `body` 和 `is_published` 完全不动。这正是 HTTP PATCH 的语义，而你无需做任何 `exclude_unset` 之类的簿记。
+
+三种状态，三种行为：**没传**的字段不动；**传了 `null`** 的字段写成 `NULL`——前提是基类声明它可空，否则请求以 422 拒绝；**传了值**的字段按与创建时相同的约束校验。如果需要手动检查某个字段，与 `Unset` 比较（`if data.title is not Unset:`），永远不要与 `None` 比较。
 
 **`ListResponse[T]` 而不是 `list[T]`**：
 
@@ -339,6 +351,8 @@ return await article.update(session, data)
 ```
 
 返回 `{count, items}`——前端可以基于 `count` 实现分页 UI。教程 03 我们会用到这个。
+
+**offset 分页还是 keyset 分页**：`TableViewRequest` 两者都支持。"跳到第 7 页"用 `offset` 就好；"加载更多" / 无限滚动则传 `after_id`（已展示的最后一条的 id）——并发插入和删除不会让下一页错位。`after_id` 要求 `order=created_at`（默认）或 `order=id`，且不能与非零 `offset` 同用；这两种错误都会在请求模型校验时被拒绝。时间过滤参数（`created_after_datetime` 等）必须带时区，例如 `2026-01-01T00:00:00Z`。
 
 **外键 `index=True`**：
 
@@ -360,13 +374,30 @@ hello-sqlmodel-ext/
 
 ## 但是有个隐患
 
-如果你在 `ArticleResponse` 中加上 `author: UserResponse`，列表端点会立刻爆炸：
+如果你在 `ArticleResponse` 中加上 `author: UserResponse`，端点会立刻爆炸：
 
 ```
-greenlet_spawn has not been called; can't call await_only() here.
+sqlalchemy.exc.InvalidRequestError: 'Article.author' is not available due to lazy='raise_on_sql'
 ```
 
-这就是著名的 `MissingGreenlet` 错误——在异步上下文里访问没预加载的关系字段会触发隐式同步查询。教程 03 我们会引入 Redis 缓存，**顺便**学怎么处理这个问题（短答：用 `load=`）。完整的避坑指南在 [防止 MissingGreenlet 错误](/how-to/prevent-missing-greenlet)。
+在异步上下文里访问没预加载的关系字段需要一次隐式同步查询——也就是著名的 `MissingGreenlet` 错误。sqlmodel-ext 默认把每个关系设为 `lazy='raise_on_sql'`，所以你会在访问的那一行得到这个清晰的错误。教程 03 我们会引入 Redis 缓存，**顺便**学怎么处理这个问题（短答：用 `load=`）。完整的避坑指南在 [防止 MissingGreenlet 错误](/how-to/prevent-missing-greenlet)。
+
+## 更进一步
+
+有真实用户之后，两处小改动马上就会派上用场：
+
+**并发编辑**——两个编辑同时 PATCH 同一篇文章。加上 `OptimisticLockMixin`（放在基类列表最前，位于 `SQLModelBase` / `ArticleBase` 之前），表会多一个 `oplock_version` 列，每次 UPDATE 都会校验它。发生冲突时 `update()` 重新读取该行、只重新应用本次请求的变更，默认最多重试 3 次，之后才抛出 `OptimisticLockError`：
+
+```python
+from sqlmodel_ext import OptimisticLockMixin
+
+class Article(OptimisticLockMixin, ArticleBase, UUIDTableBaseMixin, table=True):
+    ...
+```
+
+**删除仍被引用的记录**——在 PostgreSQL 上，删除一篇仍有评论（且外键为 `RESTRICT`）的文章时，`delete()` 抛出 `ResourceReferencedError`（从 `sqlmodel_ext.mixins` 导入）；把它映射为 HTTP 409。参见 [配置级联删除](/how-to/configure-cascade-delete)。
+
+在 PostgreSQL 上，你还会用 `JSON100K`（`from sqlmodel_ext.field_types.dialects.postgresql import JSON100K`）保存自由格式的文章元数据：它存为 JSONB，拒绝超过 100,000 字符的载荷，返回给客户端时是 JSON 对象而不是字符串。
 
 ## 你刚才学到了什么
 
@@ -378,8 +409,8 @@ greenlet_spawn has not been called; can't call await_only() here.
 | FastAPI lifespan + `async_sessionmaker` | `db.py` |
 | `Annotated[..., Depends()]` 创建 SessionDep / TableViewDep | `db.py` / `main.py` |
 | `get_exist_one()` 自动 404 | 所有 GET/PATCH/DELETE 端点 |
-| `update()` 的 PATCH 语义 | `update_article` |
-| `get_with_count()` + `ListResponse[T]` | `list_articles` |
+| `partial=True` + `Unset`：无需簿记的 PATCH 语义 | `ArticleUpdateRequest` / `update_article` |
+| `get_with_count()` + `ListResponse[T]`，offset 或 `after_id` keyset | `list_articles` |
 
 ## 下一步
 

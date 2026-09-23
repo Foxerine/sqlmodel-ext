@@ -87,7 +87,7 @@ from sqlmodel import SQLModel
 from sqlmodel_ext import AsyncSession, CachedTableBaseMixin  # ← 新增（注意：增强版 AsyncSession）
 
 engine = create_async_engine("sqlite+aiosqlite:///blog.db")
-SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 ```
 
 ::: warning 必须用 sqlmodel_ext.AsyncSession
@@ -121,10 +121,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 ```
 
 ::: danger `decode_responses=False`
-缓存的 value 是 `bytes`（来自 `model_dump_json().encode()`）。设成 `True` 会让 redis-py 把 bytes 解成 str，破坏反序列化。
+缓存的 value 是 JSON `bytes`（行的各列经 orjson 编码）。设成 `True` 会让 redis-py 把 bytes 解成 str，破坏反序列化。
 :::
 
-`check_cache_config()` 会校验所有继承 `CachedTableBaseMixin` 的子类的 `__cache_ttl__` 是合法的正整数，并注册 SQLAlchemy 的 `after_commit` 事件钩子（用于 `commit=False` 场景的失效补偿）。
+`check_cache_config()` 会校验已配置 Redis 客户端、所有继承 `CachedTableBaseMixin` 的子类的 `__cache_ttl__` 是合法的正整数且没有直接调用失效内部方法，并注册 SQLAlchemy session 事件钩子（未提交写入跟踪，以及 commit 绕过增强 session 时使用的 `after_commit` 补偿路径）。
 
 ## 4. 验证缓存命中
 
@@ -152,12 +152,12 @@ docker exec -it blog-redis redis-cli
 > KEYS id:Article:*
 1) "id:Article:550e8400-..."
 > GET id:Article:550e8400-...
-"{\"_t\":\"single\",\"_data\":{...},\"_c\":\"Article\"}"
+"{\"_t\":\"single\",\"_data\":{\"title\":\"...\",...,\"_c\":\"Article\"}}"
 > TTL id:Article:550e8400-...
 (integer) 597
 ```
 
-`_t` 是结果类型（single / list / none），`_c` 是实际的类名（多态安全），`_data` 是 `model_dump_json()` 的结果。
+`_t` 是结果类型（single / list / none），`_data` 保存该行的各列，其中的 `_c` 是实际的类名（让多态行还原为正确的子类）。
 :::
 
 ## 5. 验证自动失效
@@ -170,7 +170,9 @@ curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
 curl http://127.0.0.1:8000/articles/<article_id>
 ```
 
-注意第二次 `curl` 又出现了 SQL 查询——为什么？因为 `update()` 内部调用了 `_invalidate_for_model()`，把 `id:Article:<id>` 失效了，同时把查询缓存的版本号 `+1`。下一次读取时缓存 miss → 查数据库 → 重新写入新缓存。
+注意第二次 `curl` 又出现了 SQL 查询——为什么？因为 `update()` 登记了被修改的行，增强版 `AsyncSession.commit()` 在提交落库后立即删除了 `id:Article:<id>`，同时把查询缓存的版本号 `+1`。下一次读取时缓存 miss → 查数据库 → 重新写入新缓存。
+
+不经过 CRUD 方法的写入也一样：裸 `session.add()`、修改属性后 `commit()`、`session.delete()` 都会在 commit 时被捕获。而在事务对某张表存在未提交写入期间，依赖该表的查询会完全跳过缓存——未提交的数据永远不会被发布给其他请求。
 
 业务代码完全没感知。
 
@@ -235,17 +237,24 @@ curl http://127.0.0.1:8000/articles/<article_id>
 某些场景你不想用缓存——例如 PATCH 后立刻读取需要拿到最新值。`get()` 接受 `no_cache=True`：
 
 ```python
-fresh = await Article.get_one(session, article_id, no_cache=True)
+fresh = await Article.get(session, Article.id == article_id, no_cache=True)
 ```
 
-不过通常你不需要——`save()` / `update()` 已经自动失效了缓存，下一次普通读取就能拿到新数据。
+用于决定"是否允许某操作"的读取（权限检查）请改用 `authoritative=True`——它同时绕过 Redis 与 SQLAlchemy 的 identity map，`get_one()` 也接受这个参数：
+
+```python
+article = await Article.get_one(session, article_id, authoritative=True)
+```
+
+不过通常两者都不需要——commit 已经让缓存失效，下一次普通读取就能拿到新数据。
 
 **自动跳过缓存的场景**（你不用手动指定）：
 
 - `with_for_update=True`（行锁需要最新数据）
 - `populate_existing=True`
-- `options=` / `join=` 非空（无法稳定哈希）
-- 当前事务内有待失效数据
+- `options=` / `join=` 非空（JOIN 目标不参与失效跟踪）
+- `load=` 中包含 ID 缓存无法提供的关系
+- 当前事务对查询所依赖的任一表存在未提交写入
 
 ## 8. 你刚才学到了什么
 
@@ -256,7 +265,9 @@ fresh = await Article.get_one(session, article_id, no_cache=True)
 | `configure_redis()` 启动时调用一次 | lifespan 中 |
 | `check_cache_config()` 校验所有子类 | lifespan 中 |
 | `decode_responses=False` 不能改 | redis 客户端配置 |
-| 缓存失效完全自动 | CRUD 登记待失效项，增强 `AsyncSession.commit()` 统一同步失效 |
+| 缓存失效完全自动 | session 中的每次写入（CRUD 或裸 ORM）都被登记；增强 `AsyncSession.commit()` 在提交落库后失效 |
+| 缓存对事务透明 | 未提交写入让依赖它的查询跳过缓存 |
+| 主动绕过 | `get()` 上的 `no_cache=True`；权限检查用 `authoritative=True` |
 | `lazy='raise_on_sql'` 是 MissingGreenlet 的安全网 | 不用配置，默认开启 |
 | `load=` 预加载关系 | `Article.get_exist_one(..., load=rel(Article.author))` |
 

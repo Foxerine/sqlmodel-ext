@@ -36,6 +36,8 @@ SQLModel / SQLAlchemy 的级联删除由三个**正交**原语控制：
 - `'SET NULL'`——把子行的 FK 置 NULL（子行留下）
 - `'RESTRICT'`——同 NO ACTION 但不可延迟
 
+`NO ACTION` / `RESTRICT` 拒绝删除时，`TableBaseMixin.delete()` 在 PostgreSQL 上把这个 `IntegrityError` 翻译成 `ResourceReferencedError`（409 语义：行存在、仍被引用）。外键违反在驱动层有两个方向（"指向不存在的父行"与"父行仍被引用"）且异常完全相同，所以翻译只在"错误在 `delete()` 内捕获**且**失败语句是 `DELETE`"时发生。见 [处理"仍被引用"的删除](/how-to/handle-referenced-deletes)。
+
 ---
 
 ## 十八种组合的实证矩阵

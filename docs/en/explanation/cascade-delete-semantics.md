@@ -36,6 +36,8 @@ In `sqlmodel-ext` (and SQLModel / SQLAlchemy):
 - `'SET NULL'` — set child FKs to NULL (child rows survive)
 - `'RESTRICT'` — same as NO ACTION but not deferrable
 
+When `NO ACTION` / `RESTRICT` rejects a delete, `TableBaseMixin.delete()` on PostgreSQL translates that `IntegrityError` into `ResourceReferencedError` (409 semantics: the row exists and is still referenced). A foreign-key violation has two directions at the driver level ("points at a non-existent parent row" and "parent row is still referenced") with exactly the same exception, so the translation only happens when "the error is caught inside `delete()` **and** the failing statement is a `DELETE`". See [Handle deletes of still-referenced rows](/en/how-to/handle-referenced-deletes).
+
 ---
 
 ## The 18-Cell Matrix

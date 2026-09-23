@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-ext"
-version = "0.4.2"
+version = "0.5.0"
 description = "Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphic inheritance, optimistic locking, relation preloading, and reusable field types."
 readme = "README.md"
 license = "MIT"
@@ -55,7 +55,7 @@ dev = [
     # cached-table (fakeredis), FastAPI-integration and pgvector/NumPy tests
     # hard-import these. Keeping them here (rather than in the CI workflow)
     # makes ``uv pip install -e ".[dev]"`` reproduce CI locally.
-    "sqlmodel-ext[fastapi,cache,pgvector]",
+    "sqlmodel-ext[fastapi,cache,pgvector,alembic]",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "aiosqlite>=0.20",
@@ -65,6 +65,10 @@ dev = [
     # release that narrows ``x is Unset`` correctly.
     "basedpyright>=1.40.1",
 ]
+
+[project.scripts]
+# Experimental: the partial-DTO basedpyright gate (see docs/how-to/check-partial-dtos.md).
+sqlmodel-ext-check-derived = "sqlmodel_ext.check_derived:main"
 
 [project.urls]
 Homepage = "https://github.com/Foxerine/sqlmodel-ext"

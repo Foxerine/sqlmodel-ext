@@ -22,8 +22,8 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
     if needs_processing(file):
         # 下面 30 秒的网络 I/O 全程占用 DB 连接
         data = await s3.download_file(file.bucket_id, file.key)
-        metadata = await extract_metadata_via_ffprobe(data)
-        file.metadata = metadata
+        media_info = await extract_metadata_via_ffprobe(data)
+        file.media_info = media_info
         await file.save(session)
     return file
 ```
@@ -46,11 +46,11 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
 
         # ↓ 下面这段不持有 DB 连接，并发请求可以拿到连接
         data = await s3.download_file(bucket_id, key)
-        metadata = await extract_metadata_via_ffprobe(data)
+        media_info = await extract_metadata_via_ffprobe(data)
 
         # ↓ 下面任何 await Model.get/save 会自动 checkout 一个新连接
         file = await UserFile.get(session, UserFile.id == file_id)  # 必须重查
-        file.metadata = metadata
+        file.media_info = media_info
         await file.save(session)
     return file
 ```
@@ -59,6 +59,8 @@ async def get_file(session: SessionDep, s3: S3APIClientDep, file_id: UUID):
 - `session.reset()` 释放当前事务和 connection，但 session 对象本身仍存活（不是 close）
 - 后续任何 `await Model.get/save` 触发 SQL 时会自动从池 checkout 新连接
 - 释放期间池有 30 个连接全部空闲（除非别的请求占用），**并发请求不会被拖死**
+- 增强版 `reset()` 同时清空 FOR UPDATE 锁跟踪、未执行的 post-commit 回调、REPEATABLE READ 标记和缓存跟踪状态——之前持有的行锁已随事务释放，`@requires_for_update` 等守卫会要求你重新加锁
+- 静态分析器（RLC）同样把 `reset()` 之后的对象建模为 detached：继续读取已加载的列不会被误报为 RLC007 / RLC010
 
 ## 3. `session.reset()` 后对象的状态：detached 但不 expired
 
@@ -118,15 +120,15 @@ await session.reset()
 await session.reset()
 
 # 长 I/O ...
-metadata = await fetch_external_metadata(...)
+media_info = await fetch_external_metadata(...)
 
 # ❌ file 还是 detached，save 会失败
-file.metadata = metadata
+file.media_info = media_info
 await file.save(session)
 
 # ✓ 重查拿 fresh attached 实例
 file = await UserFile.get(session, UserFile.id == file_id)
-file.metadata = metadata
+file.media_info = media_info
 await file.save(session)
 ```
 

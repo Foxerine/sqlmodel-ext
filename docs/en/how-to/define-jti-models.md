@@ -14,6 +14,8 @@ If subclasses only add 1–2 fields, [STI](./define-sti-models) is a better fit.
 
 ```python
 from abc import ABC, abstractmethod
+from uuid import UUID
+from sqlmodel import Field
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
@@ -45,7 +47,7 @@ class Notification(
 NotificationSubclassIdMixin = create_subclass_id_mixin('notification') # [!code highlight]
 ```
 
-This dynamically generated mixin provides `id: UUID = Field(primary_key=True, foreign_key='notification.id')` — i.e. the subclass's primary key is also the parent's foreign key. That's the heart of JTI.
+This dynamically generated mixin provides `id: UUID = Field(default_factory=uuid7, primary_key=True, foreign_key='notification.id')` — i.e. the subclass's primary key is also the parent's foreign key. That's the heart of JTI. Its `default_factory` is the same as `UUIDTableBaseMixin.id`'s (UUIDv7), so the parent and child table primary keys use the same version.
 
 ## 3. Define concrete subclasses
 

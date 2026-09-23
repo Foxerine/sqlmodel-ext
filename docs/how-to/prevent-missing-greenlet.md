@@ -119,7 +119,22 @@ account = await Account.get_exist_one(session, uid)
 await account.adjust_balance(session, amount=-100)  # RuntimeError! // [!code error]
 ```
 
-运行时通过 `session.info[SESSION_FOR_UPDATE_KEY]` 检查锁定状态。
+运行时通过 `session.info[SESSION_FOR_UPDATE_KEY]` 检查锁定状态；找不到 session 参数时同样抛 `RuntimeError`（fail-closed）。批量实例、隔离级别等其它契约装饰器见 [强制行锁与隔离级别](./enforce-locking-and-isolation)。
+
+### 签名里没有 session 的方法
+
+`@requires_relations` 在参数里找不到 session 时会**跳过**预加载（不报错）。调用这种方法之前，由编排代码显式加载：
+
+```python
+await article.ensure_relations_loaded(session, ('author',))
+article.render_byline_sync()      # 方法本身不接收 session
+```
+
+一批实例要预加载同样的关系时，先用 `ensure_relations_loaded_bulk()` 把查询数压到"每个目标表一次"，再逐个调用 `ensure_relations_loaded()`（已加载时是空操作）：
+
+```python
+await Article.ensure_relations_loaded_bulk(session, articles, {Article: ('author',)})
+```
 
 ## 第一道防线（实验性，默认关闭）：AST 静态分析
 
@@ -143,7 +158,35 @@ from sqlmodel_ext import RelationLoadCheckMiddleware
 app.add_middleware(RelationLoadCheckMiddleware)
 ```
 
-启用后，应用启动时会扫描所有模型方法和 FastAPI 路由，发现可疑模式立刻警告。规则代码（如 RLC001 / RLC007）见 [静态分析器原理](/explanation/relation-load-checker)。
+启用后，应用启动时会扫描所有模型方法和 FastAPI 路由，发现问题时记日志并阻止启动。规则代码（RLC001–RLC014）见 [静态分析器原理](/explanation/relation-load-checker)。
+
+告诉分析器你项目里哪些方法会 commit（模块级配置，分析时读取）：
+
+```python
+import sqlmodel_ext.relation_load_checker as rlc
+
+# 只在缓存未命中时 commit、调用点分不出来的方法：整体排除出 commit 发现
+rlc.conditional_commit_methods = frozenset({'get_or_create'})
+# 签名是 commit: bool = False、只在传 commit=True 时 commit 的方法：按每次调用的字面量判断
+rlc.explicit_commit_methods = frozenset({'enqueue'})
+# 在 FastAPI 依赖里调用即让兄弟依赖注入的对象过期（RLC014）的方法
+rlc.dependency_commit_methods = rlc.dependency_commit_methods | {'approve'}
+```
+
+扫描 pytest 测试代码时传 `params_share_session=False`，让测试函数的模型参数按其 fixture 是否共享测试的 session 来判断：
+
+```python
+from sqlmodel_ext import RelationLoadChecker, SQLModelBase
+
+checker = RelationLoadChecker(SQLModelBase)
+warnings = checker.check_project_coroutines(project_root, params_share_session=False)
+```
+
+个别确认无误的位置用 `# noqa: RLC007` 抑制，写在 warning 报告的那一行（端点级规则报告在第一个装饰器行）。
+
+::: warning 已知限制
+不继承任何 table 类的响应 DTO，分析器找不到把字段对应到关系的锚点，检测不到它的 RLC001 / RLC005 需求。
+:::
 
 ## 决策树
 

@@ -146,6 +146,35 @@ class User(SQLModel, table=True):
     title: Str64   # 复用同一个约束
 ```
 
+这正是 sqlmodel-ext "只声明一次"的基本构件：约束写在类型里，校验、列类型和 OpenAPI schema 都从它来。见 [单点真相](./single-source-of-truth)。
+
+## 哨兵值：当 `None` 本身是一个有意义的值
+
+**哨兵值（sentinel）**是一个独一无二的对象，唯一的作用是表示"某种特殊情况"，用 `is` 比较。Python 里早就有这种用法（`dataclasses.MISSING`、私有的 `_NOTSET = object()` 常量），[PEP 661](https://peps.python.org/pep-0661/) 把它标准化了。Pydantic 2.12 提供了一个：`pydantic.experimental.missing_sentinel.MISSING`，sqlmodel-ext 以 `Unset` 的名字导出它。
+
+为什么需要它：在 PATCH 请求体里，`None` 必须能表示"清空这一列"，于是"这个字段没传"就需要另一个载体。有了 `Unset`，三种状态——没传 / `null` / 有值——就能区分开：
+
+```python
+from sqlmodel_ext import SQLModelBase, Unset
+
+
+class Patch(SQLModelBase):
+    nickname: Unset | str | None = Unset
+
+
+assert Patch().nickname is Unset                          # 没传
+assert Patch(nickname=None).nickname is None              # 传了 null
+assert Patch().model_dump() == {}                         # Unset 的键永远不会被输出
+```
+
+详见 [Unset 三态](./unset-three-state)。
+
+## 静态类型检查器
+
+静态类型检查器（pyright、basedpyright、mypy）不运行代码，只读注解，报告"不可能正确"的用法：可能为 `None` 的值被当成一定存在、参数名写错、把列表当单个对象用。它还能在判断之后**收窄**联合类型——在 `if x is Unset: return` 之后，函数余下部分知道 `x` 已经不是 `Unset`。
+
+sqlmodel-ext 的设计目标之一是让尽可能多的误用成为类型错误，库本身也以 basedpyright 为门禁。见 [用 basedpyright 做类型检查](/how-to/type-check-with-basedpyright)。
+
 ## 多态继承的数据库概念
 
 不同类型的对象共享基础字段，但各自有专属字段：

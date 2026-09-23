@@ -75,7 +75,7 @@ class Child(SQLModelBase, UUIDTableBaseMixin, table=True):
     )
 ```
 
-**Flow**: deleting parent while children still exist raises `ForeignKeyViolationError` from the DB. Business code must clean up children first.
+**Flow**: deleting parent while children still exist is rejected by the database. On PostgreSQL, `Parent.delete(session, parent)` translates this into `ResourceReferencedError` (`status_code = 409`; the message can be registered per constraint name with `TableBaseMixin.register_fk_delete_restrict_message()`). Business code must clean up children first. See [Handle deletes of still-referenced rows](./handle-referenced-deletes).
 
 ---
 
@@ -204,22 +204,22 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 @pytest.mark.asyncio
 async def test_cascade_delete_removes_children(session: AsyncSession) -> None:
-    parent = Parent(id=uuid4())
-    await parent.save(session)
-    child = Child(id=uuid4(), parent_id=parent.id)
-    await child.save(session)
+    parent = await Parent().save(session)          # must use the return value: the original object is expired after commit
+    parent_id = parent.id
+    child = await Child(parent_id=parent_id).save(session)
+    child_id = child.id
 
     await Parent.delete(session, parent)
 
-    # Use no_cache=True to bypass ORM/Redis cache, verify DB directly
+    # Use raw SQL to bypass the ORM identity map / Redis cache, verify DB directly
     remaining = (await session.execute(
         text("SELECT COUNT(*) FROM child WHERE id = :id"),
-        {'id': str(child.id)},
+        {'id': str(child_id)},
     )).scalar()
     assert remaining == 0, "child should be deleted with parent"
 ```
 
-For SET NULL intent: assert `FK IS NULL` instead. For RESTRICT: `assert session.commit()` raises `IntegrityError`.
+For SET NULL intent: assert `FK IS NULL` instead. For RESTRICT (PostgreSQL): use `with pytest.raises(ResourceReferencedError): await Parent.delete(session, parent)` instead.
 
 ---
 

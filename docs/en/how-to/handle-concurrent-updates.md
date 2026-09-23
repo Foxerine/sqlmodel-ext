@@ -1,6 +1,6 @@
 # Handle concurrent updates
 
-**Goal**: prevent two concurrent operations from overwriting each other's changes (the "lost update" problem) — make conflicts detectable and retryable.
+**Goal**: prevent two concurrent operations from overwriting each other's changes (the "lost update" problem) — make conflicts detectable and automatically retryable.
 
 **Prerequisites**:
 
@@ -30,65 +30,94 @@ class Order(OptimisticLockMixin, OrderBase, UUIDTableBaseMixin, table=True): # [
 `OptimisticLockMixin` **must** appear before `UUIDTableBaseMixin` / `TableBaseMixin`.
 :::
 
-After mixing in, the model gains a `version: int` field that is auto-incremented on every UPDATE.
+After mixing in, the model automatically gains an `oplock_version` column (`BIGINT`, auto-incremented on every UPDATE). It is internal ORM state: it **does not appear in `model_dump()`**, and the model cannot redeclare it itself. For a domain-level "version" field, pick a different name (`version`, `revision`).
 
-## 2. Let `save()` / `update()` retry automatically
+## 2. Write nothing: conflicts are retried 3 times by default
 
 ```python
-order = await order.save(session, optimistic_retry_count=3)
-# On conflict, retries up to 3 times: re-reads latest version from DB,
-# re-applies your changes, then commits again.
+order = await order.save(session)
+# On conflict, automatically: rollback → re-read the latest row → replay only the columns you changed → commit again, up to 3 times
 
-# update() supports it too
-order = await order.update(session, update_data, optimistic_retry_count=3)
+order = await order.update(session, patch)
+# Also retries 3 times by default: re-reads the latest row, then applies the changes in patch
 ```
 
-**What happens during a retry**:
+The retry count is the model policy `__optimistic_retry_default__` (`3` on `OptimisticLockMixin`), so call sites don't need to remember to pass a parameter.
 
-1. First commit → `StaleDataError` (the `WHERE version = ?` doesn't match, 0 rows affected)
+**What happens during a retry** (using `save()` as the example):
+
+1. commit → `StaleDataError` (`WHERE oplock_version = ?` matches 0 rows)
 2. rollback
-3. Save your changes via `model_dump(exclude={'id', 'version', 'created_at', 'updated_at'})`
-4. Read the latest record via `cls.get(session, cls.id == self.id)`
-5. Re-apply your changes field-by-field via `setattr` onto the latest record
+3. Collect **the columns you actually changed** from SQLAlchemy attribute history (excluding `id` / `oplock_version` / `created_at` / `updated_at`)
+4. `cls.get(session, cls.id == ...)` reads the latest record
+5. `setattr` your changes column by column onto the latest record — other columns someone else just committed stay untouched
 6. Commit again → success (or keep retrying)
 
-**Business code is completely unaware** that retries happened — that's the value of automatic retry.
+Effect: when two people edit different fields of the same order at the same time, both sets of changes are kept, and the client notices nothing.
 
-## 3. Handling exhausted retries
+```python
+# Two sessions read the same row at the same time
+a = await Order.get_one(s1, order_id)
+b = await Order.get_one(s2, order_id)
+
+a.status = OrderStatusEnum.paid
+a = await a.save(s1)             # oplock_version +1
+
+b.amount = Decimal('200')
+b = await b.save(s2)             # conflict → automatic retry → success
+assert b.status == OrderStatusEnum.paid and b.amount == Decimal('200')
+```
+
+## 3. When you need to handle conflicts yourself: pass `0` explicitly
 
 ```python
 from sqlmodel_ext import OptimisticLockError
 
 try:
-    order = await order.save(session, optimistic_retry_count=3)
+    order = await order.save(session, optimistic_retry_count=0)   # explicitly ask for no retries
 except OptimisticLockError as e:
-    # The exception carries rich context
     logger.warning(
         f"Optimistic lock conflict: model={e.model_class} id={e.record_id} "
         f"version={e.expected_version}"
     )
-    # Typical handling: return 409 Conflict, ask the user to refresh and retry
     raise HTTPException(status_code=409, detail="Record was modified by someone else. Please refresh and retry.")
 ```
+
+The same `except` also handles **exhausted retries** (under the default policy it is raised only after 3 consecutive conflicts), as well as the case where a retry finds the record has been deleted.
+
+## 4. Conflicts on delete
+
+Deleting a versioned model also checks the version:
+
+```python
+try:
+    await Order.delete(session, order)
+except OptimisticLockError:
+    # Someone modified (or deleted) this row after you read it — whether to still delete is your call
+    await session.rollback()
+    ...
+```
+
+`delete()` **never retries** ("it was just modified — do I still want to delete it?" is a business decision), and `record_id` / `expected_version` are always `None`: at the flush level the conflict cannot be reliably attributed to a specific row.
 
 ## Choosing `optimistic_retry_count`
 
 | Value | When to use |
 |-------|-------------|
-| `0` (default) | You want to handle conflicts yourself (catch `OptimisticLockError`) |
-| `1`–`3` | Most web endpoints. Conflicts are rare and the first retry almost always succeeds |
-| `> 5` | Not recommended. High retry counts indicate severe contention — consider other approaches (row locking, message queues, CRDTs) |
+| Not passed (`None`) | The vast majority of cases. Uses the model policy: optimistic-lock models retry 3 times, other models 0 times |
+| `0` | You want to handle conflicts yourself (catch `OptimisticLockError`, return 409 so the user refreshes) |
+| `> 5` | Not recommended. Too many retries means the resource is too heavily contended — consider row locks (see [Enforce row locks and isolation levels](./enforce-locking-and-isolation)), message queues, or CRDTs |
 
 ## When this isn't a fit
 
 | Scenario | Why | Use instead |
 |----------|-----|-------------|
-| Log / audit tables | Insert-only | Direct INSERT |
+| Log / audit tables | Insert-only, never updated | Direct INSERT |
 | Simple counters | High contention | `UPDATE table SET count = count + 1` atomic operation |
-| High-frequency writes (thousands per second) | Too many conflicts, retry cost is high | Row locking + queues, or CRDT data structures |
+| High-frequency writes (thousands per second) | Too many conflicts, retry cost is high | `get(with_for_update=True)` row lock + queues, or CRDT data structures |
 
 ## Related reference
 
-- [`OptimisticLockMixin` field details](/en/reference/mixins#optimisticlockmixin)
+- [`OptimisticLockMixin` full fields](/en/reference/mixins#optimisticlockmixin)
 - [`OptimisticLockError` exception fields](/en/reference/mixins#optimisticlockerror)
-- [Optimistic lock mechanism explanation](/en/explanation/optimistic-lock) (the "why")
+- [Optimistic lock mechanism explanation](/en/explanation/optimistic-lock) (explains why it's designed this way)

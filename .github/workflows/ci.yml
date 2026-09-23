@@ -50,6 +50,51 @@ jobs:
         run: .venv/bin/python -m pytest tests/ -v
 
   # -------------------------------------------------------------------
+  # Job 1b: static type check. basedpyright reads pyrightconfig.json from
+  # the repository root (src only, pythonVersion 3.12 = lowest supported).
+  # The gate is 0 errors; warnings are printed but do not fail the job.
+  # The alembic extra is installed so the optional-import module
+  # `mixins/migration_cache_invalidation.py` resolves its imports.
+  # "0 errors" is also what an empty scan prints, so the job additionally
+  # fails when the verbose log does not report a non-zero source-file count.
+  # -------------------------------------------------------------------
+  typecheck:
+    name: basedpyright (py3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Create venv and install project with dev extras
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e ".[dev,alembic]"
+
+      - name: Run basedpyright
+        # Activate the venv so basedpyright resolves imports against it.
+        run: |
+          source .venv/bin/activate
+          status=0
+          basedpyright --verbose > basedpyright.log 2>&1 || status=$?
+          grep -E " - (error|warning)" basedpyright.log || true
+          grep -E "^[0-9]+ errors?, [0-9]+ warnings?" basedpyright.log
+          grep -E "^Found [0-9]+ source files" basedpyright.log
+          if ! grep -qE "^Found [1-9][0-9]* source files" basedpyright.log; then
+            echo "::error::basedpyright scanned no source files (check pyrightconfig.json include/exclude)"
+            exit 1
+          fi
+          exit $status
+
+  # -------------------------------------------------------------------
   # Job 2: build wheel + sdist, then install the wheel into a clean
   # virtualenv with zero dev deps and run the consumer integration
   # script. This simulates an external PyPI consumer.

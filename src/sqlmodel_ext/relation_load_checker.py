@@ -154,10 +154,10 @@ defense so the checker is harder to break than the code it checks."""
 # Conditional FastAPI import: the library must be usable without FastAPI installed.
 try:
     from fastapi.params import Depends as _FastAPIDependsClass
-    _HAS_FASTAPI = True
 except ImportError:
-    _FastAPIDependsClass = None  # type: ignore
-    _HAS_FASTAPI = False
+    _FastAPIDependsClass = None
+
+_HAS_FASTAPI = _FastAPIDependsClass is not None
 
 
 # ========================= Auto-check configuration =========================

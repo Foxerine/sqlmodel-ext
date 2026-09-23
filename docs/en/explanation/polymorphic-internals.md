@@ -66,7 +66,7 @@ JTI subclasses need a foreign key pointing to the parent table. Dynamically gene
 def create_subclass_id_mixin(parent_table_name: str) -> type:
     class SubclassIdMixin(SQLModelBase):
         id: UUID = Field(
-            default_factory=uuid.uuid4,
+            default_factory=uuid7,
             foreign_key=f'{parent_table_name}.id',
             primary_key=True,
         )
@@ -74,7 +74,7 @@ def create_subclass_id_mixin(parent_table_name: str) -> type:
     return SubclassIdMixin
 ```
 
-Why dynamic generation instead of manual writing: different parent table names lead to different foreign key targets; the function parameter handles this.
+Why dynamic generation instead of manual writing: different parent table names lead to different foreign key targets; the function parameter handles this. `default_factory` must stay consistent with `UUIDTableBaseMixin.id` (both UUIDv7): this Mixin overrides the parent's `id` via the MRO, and a mismatch would make JTI subclasses silently get a different UUID version from every other table.
 
 **MRO order is critical**: The Mixin must be **first** in the inheritance list so its `id` overrides `UUIDTableBaseMixin`'s `id`:
 
@@ -145,8 +145,16 @@ def _register_sti_columns(cls):
 
         column = get_column_from_field(field_info)
         column.nullable = True            # STI subclass fields must be nullable // [!code warning]
+        column.default = None
+        column.server_default = None
         parent_table.append_column(column) # [!code focus]
 ```
+
+`default` / `server_default` are stripped because Pydantic already writes field defaults as instance attributes in `__init__`, and the ORM reads instance values directly at flush time, never consulting `Column.default`. The cost: a column with neither a default nor a server default enters SQLAlchemy's `mapper._insert_cols_as_none`, so **every INSERT of a sibling subclass writes an explicit NULL into this column** — and an explicit NULL bypasses the database DEFAULT (a DEFAULT only applies when the INSERT omits the column).
+
+::: warning Invariant migration authors must uphold (not checked here)
+**STI shared columns registered here must be nullable in the database — never add NOT NULL to them, and don't rely on a database DEFAULT to fill values for sibling subclasses.** A violation only fails on migrated databases; in a test database built by `create_all` the column is nullable anyway, and the tests stay green. If you only want to require non-null for the subclass that owns the column, use a NULL-tolerant CHECK: `discriminator <> 'owner_identity' OR col IS NOT NULL`.
+:::
 
 ### Phase 2: `_register_sti_column_properties()`
 

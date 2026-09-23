@@ -16,25 +16,32 @@ Install extras for full support::
     pip install sqlmodel-ext[postgresql]   # Array + JSON100K/JSONList100K
     pip install sqlmodel-ext[pgvector]     # NumpyVector (includes postgresql)
 """
+# Re-exports use the redundant ``X as X`` form so type checkers treat them as
+# public (the package ships ``py.typed``).
+
 # Array is always available (uses only sqlalchemy.dialects.postgresql)
-from .array import Array
+from .array import Array as Array
 
 # Exceptions are always available (pure Python)
 from .exceptions import (
-    VectorDecodeError,
-    VectorDimensionError,
-    VectorDTypeError,
-    VectorError,
+    VectorDecodeError as VectorDecodeError,
+    VectorDimensionError as VectorDimensionError,
+    VectorDTypeError as VectorDTypeError,
+    VectorError as VectorError,
 )
 
 # JSONB types require orjson; install sqlmodel-ext[postgresql]
 try:
-    from .jsonb_types import JSON100K, JSONList100K, ensure_json_within_limits
+    from .jsonb_types import (
+        JSON100K as JSON100K,
+        JSONList100K as JSONList100K,
+        ensure_json_within_limits as ensure_json_within_limits,
+    )
 except ImportError:
     pass
 
 # NumpyVector requires numpy + pgvector; install sqlmodel-ext[pgvector]
 try:
-    from .numpy_vector import NumpyVector
+    from .numpy_vector import NumpyVector as NumpyVector
 except ImportError:
     pass

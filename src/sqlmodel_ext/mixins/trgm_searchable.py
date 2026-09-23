@@ -190,7 +190,7 @@ class TrgmSearchableMixin:
 
 
 class TrgmSearchRequest(SQLModelBase):
-    """Fuzzy-search request DTO -- carries the ``?search=`` query parameter and applies it to a query.
+    """Fuzzy-search request DTO -- carries the ``?query=`` query parameter and applies it to a query.
 
     Same "query-parameter DTO with behavior" pattern as ``TableViewRequest``:
     inject it into an endpoint, then call ``apply_condition`` to AND the fuzzy

@@ -78,16 +78,14 @@ import logging
 from collections.abc import Callable
 
 try:
-    import orjson as _json_lib
+    import orjson
 
     def _json_dumps(obj: Any) -> bytes:
-        return _json_lib.dumps(obj)
+        return orjson.dumps(obj)
 
     def _json_loads(data: bytes | str) -> Any:
-        return _json_lib.loads(data)
+        return orjson.loads(data)
 except ImportError:
-    _json_lib = None  # type: ignore[assignment]
-
     def _json_dumps(obj: Any) -> bytes:
         return json.dumps(obj, separators=(",", ":"), default=str).encode("utf-8")
 
@@ -2343,7 +2341,10 @@ class CachedTableBaseMixin(TableBaseMixin):
             for child_id in child_ids:
                 cls._register_pending_invalidation(session, target_cls, child_id)
 
-        result = await super().delete(session, instances, condition=condition, commit=commit)
+        # Pass-through of the implementation signature: the base overloads reject
+        # "both/neither of instances and condition" for external callers, and the
+        # base implementation re-validates that combination at runtime (ValueError).
+        result = await super().delete(session, instances, condition=condition, commit=commit)  # pyright: ignore[reportCallIssue]  # forwarding to the overloaded base: no overload accepts the implementation signature, the base re-validates at runtime
         # Cache invalidation has moved up into session.commit() (the
         # sqlmodel-ext enhanced AsyncSession):
         # - cls itself + the pre-queried passive_deletes=True targets were
@@ -2715,6 +2716,6 @@ class CachedTableBaseMixin(TableBaseMixin):
         logger.warning(
             f"raw execute({statement.__class__.__name__}) hits cached table {tablename!r} "
             f"without registered invalidation -- this bypasses cache invalidation. "
-            f"Use {classes[0].__name__}.save()/delete() (auto-invalidates), or call "
-            f"await {classes[0].__name__}.invalidate_by_id(...) explicitly after raw DML."
+            f"Use {classes[0].__name__}.save()/delete() (auto-invalidates), or register "
+            f"{classes[0].__name__}.invalidate_on_commit(session, ...) before committing the raw DML."
         )

@@ -4,285 +4,276 @@
 `src/sqlmodel_ext/mixins/table.py` — `TableBaseMixin` 和 `UUIDTableBaseMixin`
 :::
 
-本章解释 `save()` / `get()` / `update()` 等方法的内部如何工作。要看完整方法签名，去 [CRUD 方法参考](/reference/crud-methods)；要看典型用法，去 [操作指南](/how-to/)。
+本章解释 `save()` / `get()` / `update()` / `delete()` 等方法的内部如何工作。完整签名见 [CRUD 方法参考](/reference/crud-methods)；典型用法见 [操作指南](/how-to/)。
 
 ## `TableBaseMixin` 的基础
 
 ```python
 class TableBaseMixin(AsyncAttrs):
-    _has_table_mixin: ClassVar[bool] = True   # 让元类识别"这是 table 类"
+    _has_table_mixin: ClassVar[bool] = True          # 让元类识别"这是 table 类"
+    __optimistic_retry_default__: ClassVar[int] = 0  # 乐观锁重试策略（OptimisticLockMixin 覆盖为 3）
 
     id: int | None = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=now)
+    created_at: datetime = Field(default_factory=now, sa_type=DateTime(timezone=True))
     updated_at: datetime = Field(
-        sa_type=DateTime,
+        sa_type=DateTime(timezone=True),
         sa_column_kwargs={'default': now, 'onupdate': now},
         default_factory=now,
     )
+
+class UUIDTableBaseMixin(TableBaseMixin):
+    id: uuid.UUID = Field(default_factory=uuid7, primary_key=True)
 ```
 
-继承 `AsyncAttrs` 让模型对象支持 `await obj.awaitable_attrs.some_relation` 语法，提供额外的异步安全保障。
-
-`_has_table_mixin = True` 是一个标记，让元类在 `__new__` 中自动添加 `table=True`。
+- 继承 `AsyncAttrs` 让模型对象支持 `await obj.awaitable_attrs.some_relation`。
+- `_has_table_mixin = True` 让元类在 `__new__` 中自动添加 `table=True`。
+- 时间戳都是**时区感知**的 UTC。
+- UUID 主键用 **UUIDv7**：前 48 位是毫秒时间戳，字节序即创建顺序，B-tree 插入集中在右边缘，页分裂远少于 UUIDv4。Python 3.14+ 直接用标准库 `uuid.uuid7`，更早的版本用内置的 RFC 9562 实现（同一进程内严格递增）。`create_subclass_id_mixin()` 生成的 JTI 子表主键使用同一个工厂——两边不一致会让 JTI 子类悄悄得到不同版本的 UUID。
 
 ## `save()` 实现
 
-`save()` 是最核心的方法，包含乐观锁重试逻辑：
-
 ```python
-async def save(self, session, ..., optimistic_retry_count=0):
-    cls = type(self)
-    instance = self
-    retries_remaining = optimistic_retry_count
-    current_data = None
-
+async def save(self, session, load=None, refresh=True, commit=True,
+               jti_subclasses=None, optimistic_retry_count=None):
+    retries_remaining = (optimistic_retry_count if optimistic_retry_count is not None
+                         else cls.__optimistic_retry_default__)
     while True:
+        # flush 前快照 id / oplock_version（冲突回滚后所有属性过期，再读会发 SQL）
+        # 需要重试时，按属性历史记录"我实际改过的列"
         session.add(instance)
+        if <持久化实例且列有变更>:
+            instance.updated_at = now()      # 显式赋值，见下
         try:
-            await session.commit() # [!code focus]
-            break                              # 成功，退出 // [!code focus]
-        except StaleDataError as e:            # 版本冲突！ // [!code error]
-            await session.rollback()
+            await (session.commit() if commit else session.flush())
+            break
+        except StaleDataError:
+            ...                              # 乐观锁重试，见"乐观锁机制"
 
-            if retries_remaining <= 0:
-                raise OptimisticLockError(
-                    message=f"optimistic lock conflict",
-                    model_class=cls.__name__,
-                    record_id=str(instance.id),
-                    expected_version=instance.version,
-                    original_error=e,
-                ) from e
-
-            retries_remaining -= 1
-
-            # 保存当前修改（排除元数据字段）
-            if current_data is None:
-                current_data = self.model_dump(
-                    exclude={'id', 'version', 'created_at', 'updated_at'}
-                )
-
-            # 从数据库获取最新记录
-            fresh = await cls.get(session, cls.id == self.id) # [!code focus]
-            if fresh is None:
-                raise OptimisticLockError("record has been deleted") from e
-
-            # 把我的修改重新应用到最新记录上
-            for key, value in current_data.items(): # [!code focus]
-                if hasattr(fresh, key): # [!code focus]
-                    setattr(fresh, key, value) # [!code focus]
-            instance = fresh
-
-    # commit 后用 sa_inspect 安全读取 ID（避免 MissingGreenlet）
-    _insp = inspect(instance)
-    _instance_id = _insp.identity[0] if _insp.identity else None
-    result = await cls.get(session, cls.id == _instance_id, load=load) # [!code highlight]
-    return result
+    if not refresh:
+        return instance
+    _insp = inspect(instance)                # commit 后用 identity 安全读 id
+    return await cls.get(session, cls.id == _insp.identity[0], load=load, jti_subclasses=jti_subclasses)
 ```
 
-### `session.add()` 行为
+### 为什么显式赋值 `updated_at`
 
-`session.add()` **不执行 SQL**。SQLAlchemy 在 `commit()` 或 `flush()` 时自动决定：
-- 对象是新的 → `INSERT`
-- 对象已在 Session 中且有变更 → `UPDATE`
+列级 `onupdate` 只在**该表**被 UPDATE 时触发。JTI 下如果只改了子表的列，父表（`updated_at` 所在的表）根本不会被 UPDATE，`onupdate` 不会触发，时间戳就停在旧值。所以只要持久化实例有列变更（`session.is_modified(instance, include_collections=False)`——纯集合变化不会 UPDATE 本行，不算），`save()` 就显式写入 `updated_at`；`update()` 对任何非空更新同样处理。INSERT 的时间戳来自字段默认值。
 
-### 为什么必须用返回值？
+### 为什么必须用返回值
 
 ::: danger 对象过期
-`session.commit()` 让**所有 Session 中的对象过期**。原 `user` 对象属性变成"过期"状态，访问时触发隐式查询。`save()` 返回经过 `cls.get()` 重新读取的新鲜对象——这一步同时穿过 Redis 缓存（如果 `CachedTableBaseMixin` 启用）。
+`session.commit()` 让**所有 Session 中的对象过期**。原对象的属性再被访问会触发隐式查询——在异步里就是 `MissingGreenlet`。`save()` 返回经过 `cls.get()` 重新读取的新鲜对象（缓存模型会绕过缓存读取并回填）。
 :::
 
 ## `update()` 实现
 
 ```python
-async def update(self, session, other, extra_data=None,
-                 exclude_unset=True, exclude=None, ...):
-    update_data = other.model_dump(exclude_unset=exclude_unset, exclude=exclude) # [!code focus]
+async def update(self, session, other, extra_data=None, exclude_unset=True, exclude=None, ...):
+    update_data = other.model_dump(exclude_unset=exclude_unset, exclude=exclude)
     instance.sqlmodel_update(update_data, update=extra_data)
+    if update_data or extra_data:
+        instance.updated_at = now()
     session.add(instance)
     await session.commit()
 ```
 
-::: tip PATCH 语义
-核心是 `exclude_unset=True`：只有显式设置的字段才会被更新，未设置的字段保持原值。这就是 PATCH 的语义——区别于 PUT（整体替换）。
+::: tip PATCH 语义来自类型，不来自开关
+`partial=True` 派生的 DTO 字段默认值是 `Unset`，而 `Unset` 字段永远不会出现在 `model_dump()` 里——"客户端没传"的字段在数据层面就不存在，自然不会被写入；客户端显式传的 `null` 是一个真实的值，会写成 NULL。`exclude_unset=True` 仍是默认值，但 PATCH 的正确性不再依赖它。
 :::
 
-## `get()` 实现
-
-这是最长的方法（~300 行），分层处理多种场景。完整签名见 [reference/crud-methods](/reference/crud-methods)。
-
-### 第一层：基本查询
-
-```python
-statement = select(cls)
-if condition is not None:
-    statement = statement.where(condition)
-```
-
-### 第二层：分页 + 排序
-
-```python
-if table_view:
-    order_column = cls.created_at if table_view.order == "created_at" else cls.updated_at
-    order_by = [desc(order_column) if table_view.desc else asc(order_column)]
-    statement = statement.order_by(*order_by).offset(table_view.offset).limit(table_view.limit)
-```
-
-### 第三层：时间过滤
+## `delete()` 实现
 
 ```python
 @classmethod
-def _build_time_filters(cls, created_before_datetime, created_after_datetime, ...):
-    filters = []
-    if created_after_datetime is not None:
-        filters.append(col(cls.created_at) >= created_after_datetime)
-    if created_before_datetime is not None:
-        filters.append(col(cls.created_at) < created_before_datetime)
-    ...
-    return filters
+async def delete(cls, session, instances=None, *, condition=None, commit=True) -> int:
+    try:
+        if condition is not None:
+            stmt = sql_delete(cls).where(condition)
+            if (sti := cls._sti_descendants_condition()) is not None:
+                stmt = stmt.where(sti)            # 不误删 STI 兄弟子类的行
+            deleted = (await session.execute(stmt)).rowcount
+        else:
+            for inst in instances_list:
+                await session.delete(inst)
+        if commit:
+            await session.commit()
+    except IntegrityError as e:
+        if sqlstate == '23503' and e.statement.lstrip().upper().startswith('DELETE'):
+            raise ResourceReferencedError(<注册的消息或兜底消息>, constraint, e) from e
+        raise
+    except StaleDataError as e:
+        raise OptimisticLockError(..., record_id=None, expected_version=None) from e
 ```
 
-### 第四层：关系预加载
+两处值得注意：
+
+- **外键违反的方向只能由调用点决定**。"插入子行但父行不存在"与"删除仍被引用的父行"在驱动层是同一个异常；而且 commit 会 flush session 里所有待执行的操作，一条之前排队的坏 INSERT 也可能在这里冒出来。所以翻译需要两个条件同时成立：在 `delete()` 内捕获，**且**失败语句是 `DELETE`（`IntegrityError.statement` 由 SQLAlchemy 生成，与服务器语言无关）。
+- **两个 `@overload`** 让"`instances` 和 `condition` 都不传"在类型检查阶段就报"没有匹配的重载"，把运行时不变式提升为编译期约束。
+
+## `get()` 实现
+
+完整签名见 [reference/crud-methods](/reference/crud-methods#get)。处理顺序：
+
+### 1. `table_view` 合并 + 排序决胜列 + keyset 游标
 
 ```python
-if load:
-    load_list = load if isinstance(load, list) else [load]
-    load_chains = cls._build_load_chains(load_list) # [!code focus]
-
-    for chain in load_chains:
-        loader = selectinload(chain[0]) # [!code focus]
-        for rel in chain[1:]:
-            loader = loader.selectinload(rel) # [!code focus]
-        statement = statement.options(loader)
+if isinstance(table_view, TimeFilterRequest):   # 时间过滤：显式参数优先
+    ...
+if isinstance(table_view, PageWindowRequest):   # offset / limit：显式参数优先
+    ...
+if isinstance(table_view, PaginationRequest):
+    if table_view.after_id is not None and (order_by is not None or join is not None):
+        raise KeysetCursorUnsupportedError(...)
+    if order_by is None:
+        order_col = col(getattr(cls, table_view.order or 'created_at'))
+        direction = desc if table_view.desc else asc
+        order_by = [direction(order_col)]
+        if order_field != 'id':
+            order_by.append(direction(col(cls.id)))     # id 决胜列
+    if table_view.after_id is not None:
+        keyset_condition = await cls._build_keyset_condition(session, table_view, condition, filter)
 ```
 
-`_build_load_chains` 自动检测关系依赖，构建嵌套加载链。比如 `load=[rel(User.profile), rel(Profile.avatar)]` → `selectinload(User.profile).selectinload(Profile.avatar)`。
+**id 决胜列**：`created_at` 不唯一（同一批创建的行共享时间戳），相等的行之间没有确定顺序，offset 与 keyset 分页都会在页边界上跳过或重复行。追加同方向的 `id` 让顺序成为全序。
 
-### 第五层：多态查询
+**keyset 锚点查询**用与主查询相同的 FROM（JTI 基类用 `with_polymorphic`）和相同的可见性（`condition` + `filter` + STI 过滤）：锚点的排序值在服务端查出，客户端只传 id；锚点不可见时与"不存在"报同一个错，避免通过差异探测作用域外的行。
+
+### 2. 多态
 
 ```python
 if is_jti:
-    polymorphic_cls = with_polymorphic(cls, '*')
-    statement = select(polymorphic_cls)   # 自动 JOIN 所有子表
-
-if is_sti:
-    descendant_identities = [m.polymorphic_identity for m in mapper.self_and_descendants]
-    statement = statement.where(poly_on.in_(descendant_identities))
+    statement = select(with_polymorphic(cls, '*'))   # 自动 JOIN 所有子表，避免 N+1
+else:
+    statement = select(cls)
+if (sti := cls._sti_descendants_condition()) is not None:
+    statement = statement.where(sti)                 # WHERE _polymorphic_name IN (...)
 ```
 
-JTI 使用 `with_polymorphic` 自动 JOIN 子表。STI 需要手动添加 `WHERE _polymorphic_name IN (...)` 过滤——SQLAlchemy/SQLModel 不会自动加这个条件，是 sqlmodel-ext 主动补的。
+SQLAlchemy/SQLModel 不会给 STI 子类查询自动加鉴别列过滤（sqlalchemy#5018、sqlmodel#488）。`_sti_descendants_condition()` 是 `get()` / `count()` / `delete(condition=)` / keyset 锚点 / 聚合方法**共用**的同一个条件，保证它们看到的范围一致。
 
-### 第六层：`fetch_mode` 决定返回值
+### 3. 条件、时间过滤、JOIN、options
+
+`condition` → keyset 条件 → 时间过滤（左闭右开）→ `join` → `options`。
+
+### 4. 关系预加载
+
+```python
+load_chains = cls._build_load_chains(load_list)
+for chain in load_chains:
+    loader = selectinload(chain[0])
+    for rel in chain[1:]:
+        loader = loader.selectinload(rel)
+    statement = statement.options(loader)
+```
+
+`_build_load_chains` 自动检测依赖：`[rel(User.profile), rel(Profile.avatar)]` → `selectinload(User.profile).selectinload(Profile.avatar)`。双向关系对（`A.b` + `B.a`）会让每个关系都成为别人的后继、不出现在任何根下；这时按列表顺序在第一个成员处断环，而不是静默丢掉请求的加载。
+
+### 5. 排序、分页、行锁
+
+```python
+if with_for_update:
+    statement = statement.with_for_update(of=cls if polymorphic else None, skip_locked=skip_locked)
+if with_for_update or populate_existing or authoritative:
+    statement = statement.execution_options(populate_existing=True)
+```
+
+- 多态模型用 `FOR UPDATE OF <主表>`（PostgreSQL 不允许锁 LEFT OUTER JOIN 的可空侧）。
+- **加锁读强制 `populate_existing`**：数据库返回最新行，但 identity map 默认会交还已加载的旧对象——随后的读-改-写就是一次丢失更新。
+- `authoritative` 在本层就是 `populate_existing`（缓存模型额外绕过 Redis），与调用方的 `populate_existing` 取 `or`，永不削弱。
+
+### 6. `fetch_mode` 决定返回值 + 锁跟踪
 
 ```python
 result = await session.exec(statement)
-
-if fetch_mode == "first":   return result.first()
-elif fetch_mode == "one":   return result.one()
-elif fetch_mode == "all":   return list(result.all())
+if fetch_mode == "one":   instance = result.one()
+elif fetch_mode == "first": instance = result.first()
+else:                     instances = list(result.all())
+# with_for_update 时把 id(instance) 记入 session.info[SESSION_FOR_UPDATE_KEY]
 ```
 
-## `rel()` 和 `cond()` — 类型安全辅助函数
+## FOR UPDATE 追踪
+
+`with_for_update=True` 时锁定实例的 `id()` 写入 `session.info[SESSION_FOR_UPDATE_KEY]`，供 `@requires_for_update` / `@requires_locked_param` 在运行时检查。这个集合的生命周期由模块级的 session 事件监听器维护（与缓存无关，始终生效）：
+
+| 事件 | 处理 |
+|------|------|
+| 最外层 commit / rollback | 清空（锁随事务释放） |
+| savepoint 开始 | 压入当前集合的快照 |
+| savepoint 回滚 | 恢复快照（PostgreSQL 释放 savepoint 内取得的锁，保留之前的） |
+| savepoint 释放（RELEASE） | 只弹出快照（锁转移给外层事务，保留） |
+| savepoint 经 `close()` 结束 | 保守地恢复快照（丢弃内层锁——fail-closed，迫使重新加锁） |
+
+增强 session 的 `reset()` / `close()` 也会清空它。
+
+## `rel()` 和 `cond()`
 
 ```python
 def rel(relationship: object) -> QueryableAttribute[Any]:
-    """Cast Relationship 字段为 QueryableAttribute，解决 basedpyright 推断问题"""
     if not isinstance(relationship, QueryableAttribute):
         raise AttributeError(...)
     return relationship
 
 def cond(expr: ColumnElement[bool] | bool) -> ColumnElement[bool]:
-    """Narrow 列比较表达式为 ColumnElement[bool]，解决 & | 运算符类型错误"""
     return cast(ColumnElement[bool], expr)
 ```
 
-这两个函数类似 SQLModel 的 `col()`，都是在运行时做类型断言/转换，让静态类型检查器（basedpyright）满意。
+类似 SQLModel 的 `col()`：basedpyright 会把 `User.profile` 推断为 `Profile`、把 `Model.field == value` 推断为 `bool`，这两个函数把它们窄化成可以传给 `load=` / 用 `&` `|` 组合的类型。
 
-## `get_one()` 实现
-
-```python
-@classmethod
-async def get_one(cls, session, id, *, load=None, with_for_update=False):
-    return await cls.get(
-        session, col(cls.id) == id,
-        fetch_mode='one', load=load, with_for_update=with_for_update,
-    )
-```
-
-本质是 `get(fetch_mode='one')` 的快捷方式。`UUIDTableBaseMixin` 提供了类型更精确的 override（只接受 `uuid.UUID`）。
-
-## `get_exist_one()` 的 FastAPI 集成
+## `get_one()` / `get_exist_one()`
 
 ```python
 @classmethod
-async def get_exist_one(cls, session, id, load=None):
-    instance = await cls.get(session, col(cls.id) == id, load=load)
-    if not instance:
-        if _HAS_FASTAPI:
-            raise _FastAPIHTTPException(status_code=404, detail="Not found") # [!code highlight]
-        raise RecordNotFoundError("Not found") # [!code highlight]
+async def get_one(cls, session, id, *, load=None, with_for_update=False, authoritative=False):
+    return await cls.get(session, col(cls.id) == id, fetch_mode='one',
+                         load=load, with_for_update=with_for_update, authoritative=authoritative)
+
+@classmethod
+async def get_exist_one(cls, session, id, load=None, *, detail="Not found", with_for_update=False):
+    instance = await cls.get(session, col(cls.id) == id, load=load, with_for_update=with_for_update)
+    if instance is None:
+        if _FastAPIHTTPException is not None:   # 模块导入时 `from fastapi import HTTPException`，失败则为 None
+            raise _FastAPIHTTPException(status_code=404, detail=detail)
+        raise RecordNotFoundError(detail)
     return instance
 ```
 
-::: info 自适应异常
-在**模块导入时**检测 FastAPI 是否安装，有则抛 `HTTPException(404)`，无则抛 `RecordNotFoundError`。这避免了把 FastAPI 变成硬依赖。
-:::
+`UUIDTableBaseMixin` 重载二者，只接受 `uuid.UUID`。FastAPI 是否安装在**模块导入时**检测，避免把 FastAPI 变成硬依赖。
 
-## `sanitize_integrity_error()` 实现
+## IntegrityError 友好消息
 
-```python
-@staticmethod
-def sanitize_integrity_error(e: IntegrityError, default_message: str = "...") -> str:
-    orig = e.orig
-    # SQLSTATE 23514 (check_violation): PostgreSQL 触发器的 RAISE EXCEPTION
-    if orig is not None and getattr(orig, 'sqlstate', None) == '23514':
-        error_msg = str(orig)
-        if '\n' in error_msg:
-            error_msg = error_msg.split('\n')[0]  # 取第一行
-        if error_msg.startswith('ERROR:'):
-            error_msg = error_msg[6:].strip()
-        return error_msg
-    return default_message
-```
+`sanitize_integrity_error()` / `lookup_integrity_violation_message()` 按 SQLSTATE 分派：
 
-PostgreSQL 触发器通过 `RAISE EXCEPTION ... USING ERRCODE = 'check_violation'` 可以产生业务语义的错误消息，可以安全地展示给用户。其他约束错误（FK、唯一等）可能泄露表结构信息，返回默认消息。
+| SQLSTATE | 处理 |
+|------|------|
+| `23505` 唯一约束 | 查 `register_unique_violation_message` 注册表 |
+| `23503` 外键 | 查 `register_foreign_key_violation_message` 注册表（"引用的资源不存在"方向） |
+| `23514` 且有 `constraint_name` | 查 `register_check_violation_message` 注册表；绝不返回原始消息（CHECK 表达式可能含列名） |
+| `23514` 且无 `constraint_name` | 触发器 `RAISE EXCEPTION`：消息本身就是开发者写给用户的，取首行返回 |
 
-## FOR UPDATE 追踪
+asyncpg 适配器只转发 `sqlstate`、不转发 `constraint_name`，所以约束名回退从 `orig.__cause__`（真正的驱动异常）读取——否则每次查表都会落空。触发器消息同样从 `__cause__` 读，避免把驱动异常类名前缀泄露给用户。
 
-`get()` 方法中 `with_for_update=True` 时，将锁定实例的 `id()` 记录到 `session.info`：
+## `count()` / `distinct_column()` / `group_sum()`
+
+都是一条数据库级聚合语句，共用 STI 过滤：
 
 ```python
-SESSION_FOR_UPDATE_KEY = '_for_update_locked'
+count_expr = func.count(distinct(distinct_column)) if distinct_column is not None else func.count()
+statement = select(count_expr).select_from(cls)
 
-# get() 中：
-if with_for_update:
-    locked: set[int] = session.info.setdefault(SESSION_FOR_UPDATE_KEY, set())
-    locked.add(id(instance))
+statement = select(distinct(column)).select_from(cls)                # distinct_column
+
+sum_exprs = [func.coalesce(func.sum(c), 0) for c in sum_columns]      # group_sum
+statement = select(group_by, func.count(), *sum_exprs).select_from(cls).group_by(group_by)
 ```
 
-供 `@requires_for_update` 装饰器在运行时检查。
-
-## `count()` 实现
-
-```python
-@classmethod
-async def count(cls, session, condition=None, ...):
-    statement = select(func.count()).select_from(cls)
-    if condition is not None:
-        statement = statement.where(condition)
-    result = await session.scalar(statement)
-    return result or 0
-```
-
-使用数据库级 `COUNT(*)` 而非 Python `len()`。
+`group_sum()` 的求和值统一转成 `Decimal`（PostgreSQL `NUMERIC` 本来就是 `Decimal`；SQLite 可能给 `int` / `float`，经 `str()` 转换避免二进制浮点残差）。`GroupSumRow` 是 `SQLModelBase` 泛型：它只是方法返回值、不进入 OpenAPI，不受 SQLModel 泛型 JSON schema 问题影响（`ListResponse` 受影响，所以它继承 `BaseModel`）。
 
 ## `get_with_count()` 实现
 
 ```python
-@classmethod
-async def get_with_count(cls, session, condition=None, *, table_view=None, ...):
-    total_count = await cls.count(session, condition, ...)
-    items = await cls.get(session, condition, fetch_mode="all", table_view=table_view, ...)
-    return ListResponse(count=total_count, items=items)
+items = await cls.get(session, condition, fetch_mode="all", table_view=table_view, ...)
+total_count = await cls.count(session, condition, time_filter=time_filter)
+return ListResponse(count=total_count, items=items)
 ```
 
-本质是 `count()` + `get(fetch_mode="all")` 的组合。注意先 `count()` 再 `get()`——顺序不影响结果但让代码更易读。
+**先取数据再计数**：`get()` 负责 keyset 游标的全部校验（`after_id` 与 `order_by` / `join`、锚点有效性），先计数会在一个注定失败的请求上浪费一次聚合查询。`count` 不受 `after_id` 影响。

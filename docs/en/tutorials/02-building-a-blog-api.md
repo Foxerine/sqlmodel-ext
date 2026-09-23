@@ -97,9 +97,9 @@ class ArticleCreateRequest(ArticleBase):
     pass
 
 
-class ArticleUpdateRequest(ArticleBase, all_fields_optional=True):
-    # Inherited fields auto-convert to ``T | None = None``;
-    # max_length / non-empty-stripped constraints are preserved as-is
+class ArticleUpdateRequest(ArticleBase, partial=True):
+    # Inherited fields become ``Unset | T = Unset`` ("not sent" is Unset, not None);
+    # max_length / non-empty-stripped constraints and docstrings are preserved as-is
     pass
 
 
@@ -134,7 +134,7 @@ class CommentResponse(CommentBase, UUIDIdDatetimeInfoMixin):
 - **`XxxBase`**: the greatest common factor across every variant (fields needed by both "create" and "response")
 - **`Xxx`**: the table model, with foreign keys and `Relationship` added
 - **`XxxCreateRequest`**: POST body (inherits Base, all fields required)
-- **`XxxUpdateRequest`**: PATCH body (`all_fields_optional=True` auto-converts inherited fields to optional, constraints preserved)
+- **`XxxUpdateRequest`**: PATCH body (`partial=True` derives it from Base: every field omissible, constraints and nullability preserved)
 - **`XxxResponse`**: response DTO (inherits Base + `UUIDIdDatetimeInfoMixin` to add id and timestamps)
 
 This layering means validation rules are **written once** — the `max_length=256` + non-empty-stripped constraints carried by `NonEmptyStrippedStr256` automatically apply to every subclass of `ArticleBase`.
@@ -156,11 +156,11 @@ from typing import Annotated
 from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlmodel_ext import AsyncSession
 
 # Note: SQLite is used for zero-config tutorials; real projects should use PostgreSQL
 engine = create_async_engine("sqlite+aiosqlite:///blog.db")
-SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 
 
 @asynccontextmanager
@@ -309,6 +309,15 @@ curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
   -H "Content-Type: application/json" \
   -d '{"title":"Updated title"}'
 # Note: body and is_published aren't sent, so they keep their original values (PATCH semantics)
+
+# null for a field the base declares non-nullable
+curl -X PATCH http://127.0.0.1:8000/articles/<article_id> \
+  -H "Content-Type: application/json" \
+  -d '{"title":null}'
+# → 422: ArticleBase.title is not nullable, and the PATCH body inherited that fact
+
+# Next page with a keyset cursor: pass the id of the last item you already have
+curl "http://127.0.0.1:8000/articles?limit=10&after_id=<last_article_id>"
 ```
 
 ## 5. Key patterns recap
@@ -331,7 +340,9 @@ In endpoints, **always** use `get_exist_one()` — it converts "not found" into 
 return await article.update(session, data)
 ```
 
-`update()` defaults to `exclude_unset=True`: only the fields **explicitly set** on `data` are written to the database. If the client only sent `{"title": "new"}`, then `body` and `is_published` are completely untouched. That's exactly HTTP PATCH semantics.
+Fields the client did not send are `Unset` on `data`, and `Unset` fields never appear in `model_dump()` — so `update()` writes only what was sent. If the client only sent `{"title": "new"}`, then `body` and `is_published` are completely untouched. That's exactly HTTP PATCH semantics, with no `exclude_unset` bookkeeping on your side.
+
+Three states, three behaviors: a field that was **not sent** is left alone; a field **sent as `null`** is written as `NULL` — but only if the base declares it nullable, otherwise the request is rejected with 422; a field **sent with a value** is validated with the same constraints as on create. If you need to check a field by hand, compare with `Unset` (`if data.title is not Unset:`), never with `None`.
 
 **`ListResponse[T]` instead of `list[T]`**:
 
@@ -340,6 +351,8 @@ return await article.update(session, data)
 ```
 
 Returns `{count, items}` — the frontend can build pagination UI from `count`. Tutorial 03 uses this.
+
+**Offset or keyset pagination**: `TableViewRequest` accepts both. `offset` is fine for "jump to page 7"; for "load more" / infinite scroll, pass `after_id` (the id of the last item already shown) — concurrent inserts and deletes can't shift the next page. `after_id` needs `order=created_at` (the default) or `order=id` and cannot be combined with a non-zero `offset`; the request model rejects both mistakes at validation. Time filters (`created_after_datetime`, ...) must carry a timezone, e.g. `2026-01-01T00:00:00Z`.
 
 **`index=True` on foreign keys**:
 
@@ -361,13 +374,30 @@ hello-sqlmodel-ext/
 
 ## But there's a hidden trap
 
-If you add `author: UserResponse` to `ArticleResponse`, the list endpoint would explode immediately:
+If you add `author: UserResponse` to `ArticleResponse`, the endpoints would explode immediately:
 
 ```
-greenlet_spawn has not been called; can't call await_only() here.
+sqlalchemy.exc.InvalidRequestError: 'Article.author' is not available due to lazy='raise_on_sql'
 ```
 
-That's the famous `MissingGreenlet` error — accessing an unloaded relation in async land triggers an implicit synchronous query. Tutorial 03 introduces Redis caching and **along the way** teaches you how to handle it (short answer: use `load=`). The full guide lives at [Prevent MissingGreenlet errors](/en/how-to/prevent-missing-greenlet).
+Accessing an unloaded relation in async land would need an implicit synchronous query — the famous `MissingGreenlet` error. sqlmodel-ext sets every relationship to `lazy='raise_on_sql'` by default, so you get this clear error at the exact access instead. Tutorial 03 introduces Redis caching and **along the way** teaches you how to handle it (short answer: use `load=`). The full guide lives at [Prevent MissingGreenlet errors](/en/how-to/prevent-missing-greenlet).
+
+## Going further
+
+Two small additions that matter as soon as real users arrive:
+
+**Concurrent edits** — two editors PATCH the same article at once. Add `OptimisticLockMixin` (first in the bases, before `SQLModelBase` / `ArticleBase`) and the table gets an `oplock_version` column; every UPDATE checks it. On a conflict `update()` re-reads the row and re-applies only this request's changes, up to 3 times by default, before raising `OptimisticLockError`:
+
+```python
+from sqlmodel_ext import OptimisticLockMixin
+
+class Article(OptimisticLockMixin, ArticleBase, UUIDTableBaseMixin, table=True):
+    ...
+```
+
+**Deleting something that is still referenced** — on PostgreSQL, deleting an article that still has comments (and a `RESTRICT` foreign key) makes `delete()` raise `ResourceReferencedError` (import it from `sqlmodel_ext.mixins`); map it to HTTP 409. See [Configure cascade delete](/en/how-to/configure-cascade-delete).
+
+On PostgreSQL you'd also reach for `JSON100K` (`from sqlmodel_ext.field_types.dialects.postgresql import JSON100K`) for free-form article metadata: it stores JSONB, rejects payloads over 100,000 characters, and is returned to clients as a JSON object, not a string.
 
 ## What you just learned
 
@@ -379,8 +409,8 @@ That's the famous `MissingGreenlet` error — accessing an unloaded relation in 
 | FastAPI lifespan + `async_sessionmaker` | `db.py` |
 | `Annotated[..., Depends()]` for SessionDep / TableViewDep | `db.py` / `main.py` |
 | `get_exist_one()` auto-404 | every GET/PATCH/DELETE endpoint |
-| `update()`'s PATCH semantics | `update_article` |
-| `get_with_count()` + `ListResponse[T]` | `list_articles` |
+| `partial=True` + `Unset`: PATCH semantics without bookkeeping | `ArticleUpdateRequest` / `update_article` |
+| `get_with_count()` + `ListResponse[T]`, offset or `after_id` keyset | `list_articles` |
 
 ## Next
 

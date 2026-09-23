@@ -49,7 +49,7 @@ degrades to the upstream behavior when no cached model is involved.
 """
 import asyncio
 import logging
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from collections.abc import Awaitable, Callable, Generator, Iterable
 
 from sqlalchemy import func, text
@@ -387,31 +387,37 @@ class AsyncSession(_AsyncSessionBase):
     # -- none of them route through ``execute()`` (only ``scalars()`` does),
     # so each needs its own hook. Writes issued on a raw connection remain
     # invisible.
+    #
+    # The hooks are defined only at runtime. Type checkers keep seeing the
+    # parent's overloaded signatures, so ``await session.exec(select(User))``
+    # still infers ``ScalarResult[User]`` instead of collapsing to ``Any``;
+    # the wide passthrough signatures below exist purely to forward arguments.
 
-    async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]  # wide passthrough signature
-        """Pass ``execute`` through after registering raw-DML write tables (see ``CachedTableBaseMixin.register_raw_dml_write``)."""
-        CachedTableBaseMixin.register_raw_dml_write(self, statement)
-        return await super().execute(statement, *args, **kwargs)
+    if not TYPE_CHECKING:
+        async def execute(self, statement, *args, **kwargs):
+            """Pass ``execute`` through after registering raw-DML write tables (see ``CachedTableBaseMixin.register_raw_dml_write``)."""
+            CachedTableBaseMixin.register_raw_dml_write(self, statement)
+            return await super().execute(statement, *args, **kwargs)
 
-    async def exec(self, statement: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]  # wide passthrough signature
-        """Pass ``exec`` (SQLModel's preferred entry point) through after registering raw-DML write tables."""
-        CachedTableBaseMixin.register_raw_dml_write(self, statement)
-        return await super().exec(statement, *args, **kwargs)
+        async def exec(self, statement, *args, **kwargs):
+            """Pass ``exec`` (SQLModel's preferred entry point) through after registering raw-DML write tables."""
+            CachedTableBaseMixin.register_raw_dml_write(self, statement)
+            return await super().exec(statement, *args, **kwargs)
 
-    async def scalar(self, statement: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]  # wide passthrough signature
-        """Pass ``scalar`` through after registering raw-DML write tables."""
-        CachedTableBaseMixin.register_raw_dml_write(self, statement)
-        return await super().scalar(statement, *args, **kwargs)
+        async def scalar(self, statement, *args, **kwargs):
+            """Pass ``scalar`` through after registering raw-DML write tables."""
+            CachedTableBaseMixin.register_raw_dml_write(self, statement)
+            return await super().scalar(statement, *args, **kwargs)
 
-    async def stream(self, statement: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]  # wide passthrough signature
-        """Pass ``stream`` through after registering raw-DML write tables."""
-        CachedTableBaseMixin.register_raw_dml_write(self, statement)
-        return await super().stream(statement, *args, **kwargs)
+        async def stream(self, statement, *args, **kwargs):
+            """Pass ``stream`` through after registering raw-DML write tables."""
+            CachedTableBaseMixin.register_raw_dml_write(self, statement)
+            return await super().stream(statement, *args, **kwargs)
 
-    async def stream_scalars(self, statement: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]  # wide passthrough signature
-        """Pass ``stream_scalars`` through after registering raw-DML write tables."""
-        CachedTableBaseMixin.register_raw_dml_write(self, statement)
-        return await super().stream_scalars(statement, *args, **kwargs)
+        async def stream_scalars(self, statement, *args, **kwargs):
+            """Pass ``stream_scalars`` through after registering raw-DML write tables."""
+            CachedTableBaseMixin.register_raw_dml_write(self, statement)
+            return await super().stream_scalars(statement, *args, **kwargs)
 
 
 class _PostCommitAwareSessionBegin:

@@ -18,12 +18,20 @@ from sqlmodel import Field
 
 from ._internal.path import _DirectoryPathHandler, _FilePathHandler
 from .dialects.postgresql.array import _ArrayTypeHandler
-from .ip_address import ClientIPAddress, IPAddress
-from .mixins import ModuleNameMixin
-from .url import HttpUrl, SafeHttpUrl, Url, WebSocketUrl
+# Re-exports use the redundant ``X as X`` form: the package ships ``py.typed``, and
+# type checkers treat a plain ``from .m import X`` in a typed package as private
+# (consumers would get ``reportPrivateImportUsage``).
+from .ip_address import ClientIPAddress as ClientIPAddress, IPAddress as IPAddress
+from .mixins import ModuleNameMixin as ModuleNameMixin
+from .url import (
+    HttpUrl as HttpUrl,
+    SafeHttpUrl as SafeHttpUrl,
+    Url as Url,
+    WebSocketUrl as WebSocketUrl,
+)
 
 # Re-export SSRF utilities
-from ._ssrf import UnsafeURLError, validate_not_private_host
+from ._ssrf import UnsafeURLError as UnsafeURLError, validate_not_private_host as validate_not_private_host
 
 # ---------------------------------------------------------------------------
 #  Public, Database-Agnostic Types

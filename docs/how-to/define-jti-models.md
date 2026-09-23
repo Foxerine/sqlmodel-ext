@@ -14,6 +14,8 @@
 
 ```python
 from abc import ABC, abstractmethod
+from uuid import UUID
+from sqlmodel import Field
 from sqlmodel_ext import (
     SQLModelBase, UUIDTableBaseMixin,
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
@@ -45,7 +47,7 @@ class Notification(
 NotificationSubclassIdMixin = create_subclass_id_mixin('notification') # [!code highlight]
 ```
 
-这个动态生成的 Mixin 提供 `id: UUID = Field(primary_key=True, foreign_key='notification.id')`——也就是子类的主键同时是父表的外键，组成 JTI 的核心。
+这个动态生成的 Mixin 提供 `id: UUID = Field(default_factory=uuid7, primary_key=True, foreign_key='notification.id')`——也就是子类的主键同时是父表的外键，组成 JTI 的核心。它的 `default_factory` 与 `UUIDTableBaseMixin.id` 相同（UUIDv7），父表与子表的主键版本一致。
 
 ## 3. 定义具体子类
 

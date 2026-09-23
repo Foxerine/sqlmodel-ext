@@ -24,7 +24,7 @@ from typing import Any, Self, Sequence, get_args, get_origin
 from pydantic import AliasChoices, BaseModel, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined as Undefined
-from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import Column, inspect as sa_inspect
 from sqlalchemy.orm import Mapped, declared_attr, relationship as sa_relationship
 from sqlmodel import Field, SQLModel
 from sqlmodel.main import (
@@ -43,7 +43,7 @@ from sqlmodel.main import (
 # get_definitions().  Restore identity-based hashing until upstream fixes it.
 # Ref: https://github.com/fastapi/sqlmodel/pull/1889
 if getattr(FieldInfoMetadata, '__hash__') is None:
-    FieldInfoMetadata.__hash__ = object.__hash__  # type: ignore[assignment]
+    FieldInfoMetadata.__hash__ = object.__hash__  # pyright: ignore[reportAttributeAccessIssue]  # the dataclass stub declares __hash__ as None -- that is the upstream defect being patched here
 
 # sqlmodel's FieldInfoMetadata fields default to sqlmodel's own Undefined
 # sentinel (distinct from pydantic_core PydanticUndefined imported above);
@@ -79,10 +79,10 @@ try:
 except ModuleNotFoundError as _exc:
     if _exc.name != 'orjson':
         raise
-    _ORJSON_CHECKED_TYPES: tuple[type, ...] = ()
+    _orjson_checked_types: tuple[type, ...] = ()
     _ensure_json_within_limits: typing.Callable[[Any], None] | None = None
 else:
-    _ORJSON_CHECKED_TYPES = (JSON100K, JSONList100K)
+    _orjson_checked_types = (JSON100K, JSONList100K)
     _ensure_json_within_limits = ensure_json_within_limits
 
 # Python 3.14+ support
@@ -319,7 +319,7 @@ def _annotation_contains_orjson_checked_type(annotation: Any) -> bool:
     type annotation is the declaration, no manual registration needed.
     Always ``False`` when ``orjson`` is not installed.
     """
-    if any(annotation is checked for checked in _ORJSON_CHECKED_TYPES):
+    if any(annotation is checked for checked in _orjson_checked_types):
         return True
     return any(_annotation_contains_orjson_checked_type(arg) for arg in get_args(annotation))
 
@@ -755,7 +755,7 @@ def _resolve_relationship_target(
 def _make_sti_fk_resolver(
     fk_string: str,
     sa_registry: typing.Any,
-) -> typing.Callable:
+) -> str | typing.Callable[[], list[Column[Any]]]:
     """
     Convert string-format foreign_keys to a callable for deferred resolution in STI.
 
@@ -769,7 +769,8 @@ def _make_sti_fk_resolver(
 
     :param fk_string: String-format foreign_keys, e.g. '[Order.billing_address_id]'
     :param sa_registry: SQLAlchemy registry for class-name lookup
-    :return: callable returning list of Column objects
+    :return: callable returning list of Column objects, or ``fk_string`` unchanged
+        when it cannot be parsed (SQLAlchemy then resolves it as usual)
     """
     inner = fk_string.strip('[]')
     specs = [s.strip() for s in inner.split(',')]
@@ -778,13 +779,13 @@ def _make_sti_fk_resolver(
     for spec in specs:
         m = re.match(r'^(\w+)\.(\w+)$', spec)
         if not m:
-            return fk_string  # type: ignore  # cannot parse, return original
+            return fk_string  # cannot parse, return original
         parsed.append((m.group(1), m.group(2)))
 
     _registry = sa_registry
 
-    def _resolve() -> list:
-        columns = []
+    def _resolve() -> list[Column[Any]]:
+        columns: list[Column[Any]] = []
         for cls_name, col_name in parsed:
             for mapper in _registry.mappers:
                 if mapper.class_.__name__ == cls_name:
@@ -869,7 +870,13 @@ class __DeclarativeMeta(SQLModelMetaclass):
         "concrete",
     }
 
-    def __new__(cls, name, bases, attrs, **kwargs):
+    def __new__(
+        cls,
+        name: str,
+        bases: tuple[type, ...],
+        attrs: dict[str, typing.Any],
+        **kwargs: typing.Any,
+    ) -> typing.Any:
         # 1. Convention over configuration: auto table=True
         is_intended_as_table = any(getattr(b, '_has_table_mixin', False) for b in bases)
         if is_intended_as_table and 'table' not in kwargs:
@@ -1186,10 +1193,10 @@ class __DeclarativeMeta(SQLModelMetaclass):
 
     def __init__(
         cls,
-        classname: str,
+        name: str,
         bases: tuple[type, ...],
-        dict_: dict[str, typing.Any],
-        **kw: typing.Any,
+        attrs: dict[str, typing.Any],
+        **kwargs: typing.Any,
     ) -> None:
         """
         Override SQLModel's __init__ to support Joined Table Inheritance.
@@ -1201,14 +1208,14 @@ class __DeclarativeMeta(SQLModelMetaclass):
         from sqlmodel.main import is_table_model_class, DeclarativeMeta, ModelMetaclass
 
         if not is_table_model_class(cls):
-            ModelMetaclass.__init__(cls, classname, bases, dict_, **kw)
+            ModelMetaclass.__init__(cls, name, bases, attrs, **kwargs)
             return
 
         base_is_table = any(is_table_model_class(base) for base in bases)
 
         if not base_is_table:
             cls._setup_relationships()
-            DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)
+            DeclarativeMeta.__init__(cls, name, bases, attrs, **kwargs)
             return
 
         # Detect JTI scenario
@@ -1231,7 +1238,7 @@ class __DeclarativeMeta(SQLModelMetaclass):
         def _normalize_tablename(name: str) -> str:
             return name.replace('_', '').lower()
 
-        def _fk_matches_parent(fk_str: str, parent_table: str) -> bool:
+        def _fk_matches_parent(fk_str: str, parent_table: str | None) -> bool:
             if not fk_str or not parent_table:
                 return False
             parts = fk_str.split('.')
@@ -1356,10 +1363,10 @@ class __DeclarativeMeta(SQLModelMetaclass):
             if child_own_relationships:
                 cls._setup_relationships(only_these=child_own_relationships)
 
-            DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)
+            DeclarativeMeta.__init__(cls, name, bases, attrs, **kwargs)
         else:
             # STI: child shares parent table
-            ModelMetaclass.__init__(cls, classname, bases, dict_, **kw)
+            ModelMetaclass.__init__(cls, name, bases, attrs, **kwargs)
 
             is_sti_child = (
                 current_tablename is not None

@@ -22,7 +22,7 @@ def requires_relations(*relations):
             async def wrapper(self, *args, **kwargs):
                 session = _extract_session(func, args, kwargs) # [!code focus]
                 if session is not None:
-                    await self._ensure_relations_loaded(session, relations) # [!code focus]
+                    await self.ensure_relations_loaded(session, relations) # [!code focus]
                 async for item in func(self, *args, **kwargs):
                     yield item
         else:
@@ -30,7 +30,7 @@ def requires_relations(*relations):
             async def wrapper(self, *args, **kwargs):
                 session = _extract_session(func, args, kwargs) # [!code focus]
                 if session is not None:
-                    await self._ensure_relations_loaded(session, relations) # [!code focus]
+                    await self.ensure_relations_loaded(session, relations) # [!code focus]
                 return await func(self, *args, **kwargs)
 
         wrapper._required_relations = relations # [!code highlight]
@@ -40,7 +40,7 @@ def requires_relations(*relations):
 
 逻辑：
 1. 从方法参数中**自动提取 `session`**
-2. 调用 `_ensure_relations_loaded()` 确保关系已加载
+2. 调用 `ensure_relations_loaded()` 确保关系已加载（找不到 session 时跳过——这种方法的调用方必须自己先调用它）
 3. 执行原方法
 
 同时支持普通异步方法和异步生成器。`_required_relations` 属性存储声明信息，供导入时验证使用。
@@ -108,10 +108,10 @@ def _is_relation_loaded(self, rel_name):
 
 使用 SQLAlchemy 的 `inspect()` 获取对象内部状态。`state.unloaded` 包含所有未加载的关系名。
 
-### `_ensure_relations_loaded()` — 增量加载
+### `ensure_relations_loaded()` — 增量加载（公开入口）
 
 ```python
-async def _ensure_relations_loaded(self, session, relations):
+async def ensure_relations_loaded(self, session, relations):
     to_load = []
 
     for rel in relations:
@@ -150,6 +150,20 @@ async def _ensure_relations_loaded(self, session, relations):
 1. **增量加载** — 已加载的关系不重复查询
 2. **嵌套感知** — 加载 `Generator.config` 时，如果 `generator` 本身也没加载，会一起加载
 3. **原地更新** — 用 `object.__setattr__` 直接修改 `self`，不需要替换实例
+4. **公开入口** — 它是公开方法，而不只是装饰器的内部细节：`@requires_relations` 在参数里找不到 session 时会跳过预加载，那种方法的调用方必须自己先调用 `ensure_relations_loaded()`——正确性不能依赖那个"跳过"分支
+
+### `ensure_relations_loaded_bulk()` — 批量预加载
+
+对一批（可能异构的）实例逐个调用 `ensure_relations_loaded()` 是 N 次查询。`ensure_relations_loaded_bulk(session, instances, specs_by_class)` 把它压到 **0–1 次属主刷新 + 每个目标继承树根 1 次**：
+
+1. **属主刷新（按需）**：只有需要的外键列未加载 / 已过期的属主，才用一次 `id IN (...)` 刷新（新鲜实例零额外查询）。
+2. **按目标树根分组**：从属主的外键列收集目标 id，对每个目标继承树的根只查一次（同一 STI/JTI 树的多个关系合并成一个多态 `IN`），再用 SQLAlchemy 公开的手动预加载 API `set_committed_value` 挂上——之后 `inspect().unloaded` 里不再有这个关系，与 loader 加载的效果相同。
+
+能力边界由唯一真相源 `bulk_preload_unsupported_reason(spec)` 判定：只批量处理"直接字符串关系名、多对一、单列外键指向目标 `id`、`primaryjoin` 就是纯外键等式"的关系。额外谓词（如 `AND target.is_enabled`）会在 ORM loader 里过滤行，而手动按 id 组装会绕过它们——并且组装之后关系就算"已加载"，逐个回退也纠正不了——所以这类关系被排除。
+
+**外键非空但目标行不存在时刻意不组装**：关系保持未加载，`lazy='raise_on_sql'` 的访问会响亮失败，而不是假装"没有关联"。
+
+这是**查询数优化，不是正确性来源**：之后仍应对每个实例调用 `ensure_relations_loaded()`（已加载时是空操作的快速路径）。
 
 ### `_find_relation_to_class()` — 查找关系路径
 
@@ -170,19 +184,21 @@ def _find_relation_to_class(from_class, to_class):
 ## `requires_for_update` 装饰器实现
 
 ```python
-def requires_for_update(func):
+def requires_for_update(func: Callable[P, Awaitable[R]]) -> Callable[P, Coroutine[Any, Any, R]]:
     @wraps(func)
-    async def wrapper(self, *args, **kwargs):
-        session = _extract_session(func, args, kwargs)
-        if session is not None:
-            locked: set[int] = session.info.get(SESSION_FOR_UPDATE_KEY, set()) # [!code focus]
-            if id(self) not in locked: # [!code focus]
-                cls_name = type(self).__name__
-                raise RuntimeError( # [!code error]
-                    f"{cls_name}.{func.__name__}() requires a FOR UPDATE locked instance. "
-                    f"Call {cls_name}.get(session, ..., with_for_update=True) first."
-                )
-        return await func(self, *args, **kwargs)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        self = args[0]
+        cls_name = type(self).__name__
+        session = _extract_session(func, args[1:], kwargs)
+        if session is None: # [!code focus]
+            raise RuntimeError("... cannot extract an AsyncSession ...; the row-lock guard cannot verify") # [!code error]
+        locked: set[int] = session.info.get(SESSION_FOR_UPDATE_KEY, set()) # [!code focus]
+        if id(self) not in locked: # [!code focus]
+            raise RuntimeError( # [!code error]
+                f"{cls_name}.{func.__name__}() requires a FOR UPDATE locked instance. "
+                f"Call {cls_name}.get(session, ..., with_for_update=True) first."
+            )
+        return await func(*args, **kwargs)
 
     wrapper._requires_for_update = True
     return wrapper
@@ -190,8 +206,19 @@ def requires_for_update(func):
 
 工作原理：
 1. 从参数中提取 session（复用 `_extract_session()`）
-2. 检查 `session.info[SESSION_FOR_UPDATE_KEY]` 中是否包含 `id(self)`
-3. 不在锁定集合中 → 立即 `RuntimeError`
-4. 设置 `_requires_for_update = True` 元数据，供静态分析器检测未锁定的调用
+2. **找不到 session → `RuntimeError`（fail-closed）**。提取失败恰恰是"守卫已经失效"的信号（例如内层装饰器没用 `@wraps`，`inspect.signature` 看不到 `session` 参数），它不能看起来像"守卫通过"
+3. 检查 `session.info[SESSION_FOR_UPDATE_KEY]` 中是否包含 `id(self)`，不在 → `RuntimeError`
+4. 用 `ParamSpec` 声明，被装饰方法的签名对类型检查器保持可见（`Callable[..., Any]` 会把参数擦掉）
+5. 设置 `_requires_for_update = True` 元数据，供静态分析器检测未锁定的调用
 
-`SESSION_FOR_UPDATE_KEY` 由 `get()` 方法在 `with_for_update=True` 时写入。
+`SESSION_FOR_UPDATE_KEY` 由 `get()` 在 `with_for_update=True` 时写入，由模块级 session 事件监听器维护生命周期（最外层 commit / rollback 清空，savepoint 回滚恢复快照），见 [CRUD 实现](./crud-pipeline#for-update-追踪)。
+
+## 同一家族的其它契约装饰器
+
+| 装饰器 | 契约 | 定位 session 的方式 |
+|------|------|------|
+| `@requires_locked_param(name)` | 参数 `name` 中的实例都已加锁；空序列视为违约 | `Signature.bind` 绑定完整调用参数 |
+| `@requires_repeatable_read` | session 已**验证**处于 REPEATABLE READ（`session.info` 标记只由 `enter_repeatable_read()` 在读回确认后写入） | `Signature.bind` |
+| `@requires_read_committed` | 事务处于 READ COMMITTED（每次实时 `SHOW transaction_isolation`，不信任标记） | `Signature.bind` |
+
+后三者用 `Signature.bind` 而不是 `_extract_session` 的"`args[0]` 是 `self`"启发式：让 Python 自己完成绑定，实例方法、classmethod、普通函数、关键字参数、默认值都能正确处理。它们同样是 fail-closed 的。用法见 [强制行锁与隔离级别](/how-to/enforce-locking-and-isolation)。

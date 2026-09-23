@@ -75,7 +75,7 @@ class Child(SQLModelBase, UUIDTableBaseMixin, table=True):
     )
 ```
 
-**生效流程**：删 parent 时如果还有 child，DB 抛 `ForeignKeyViolationError`。业务代码需要先处理完子数据才能删 parent。
+**生效流程**：删 parent 时如果还有 child，数据库拒绝删除。在 PostgreSQL 上 `Parent.delete(session, parent)` 把它翻译成 `ResourceReferencedError`（`status_code = 409`，消息可以用 `TableBaseMixin.register_fk_delete_restrict_message()` 按约束名注册）。业务代码需要先处理完子数据才能删 parent。详见 [处理"仍被引用"的删除](./handle-referenced-deletes)。
 
 ---
 
@@ -204,22 +204,22 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 @pytest.mark.asyncio
 async def test_cascade_delete_removes_children(session: AsyncSession) -> None:
-    parent = Parent(id=uuid4())
-    await parent.save(session)
-    child = Child(id=uuid4(), parent_id=parent.id)
-    await child.save(session)
+    parent = await Parent().save(session)          # 必须用返回值：commit 后原对象已过期
+    parent_id = parent.id
+    child = await Child(parent_id=parent_id).save(session)
+    child_id = child.id
 
     await Parent.delete(session, parent)
 
-    # 用 no_cache=True 绕过 ORM/Redis 缓存，直接验证 DB
+    # 用原生 SQL 绕过 ORM identity map / Redis 缓存，直接验证 DB
     remaining = (await session.execute(
         text("SELECT COUNT(*) FROM child WHERE id = :id"),
-        {'id': str(child.id)},
+        {'id': str(child_id)},
     )).scalar()
     assert remaining == 0, "child 应已随 parent 删除"
 ```
 
-对 SET NULL 意图：改 assert 为 `FK IS NULL`；对 RESTRICT：改为 `assert session.commit()` 抛 `IntegrityError`。
+对 SET NULL 意图：改 assert 为 `FK IS NULL`；对 RESTRICT（PostgreSQL）：改为 `with pytest.raises(ResourceReferencedError): await Parent.delete(session, parent)`。
 
 ---
 
