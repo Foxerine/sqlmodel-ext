@@ -504,10 +504,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[FAIL] {len(errors)} partial class(es) could not be expanded", file=sys.stderr)
         return 2
 
-    holder = pathlib.Path(tempfile.mkdtemp(prefix='check-derived-'))
+    # Refuse before writing anything: validate the parent first, so a system
+    # temporary directory configured inside the project never gets a directory
+    # created in it.
+    temp_parent = pathlib.Path(tempfile.gettempdir())
+    if _is_under(temp_parent, root):
+        raise SystemExit(
+            f"[ABORT] the system temporary directory {temp_parent} is inside the project {root}; "
+            f"point TMPDIR / TEMP / TMP outside the project"
+        )
+    holder = pathlib.Path(tempfile.mkdtemp(prefix='check-derived-', dir=temp_parent))
+    if _is_under(holder, root):
+        # Defense in depth (e.g. a patched mkdtemp or a symlinked temp dir):
+        # remove what was just created regardless of --keep, then refuse.
+        shutil.rmtree(holder, ignore_errors=True)
+        raise SystemExit(f"[ABORT] the temporary directory {holder} is inside the project {root}")
     try:
-        if _is_under(holder, root):
-            raise SystemExit(f"[ABORT] the temporary directory {holder} is inside the project {root}")
         expanded = holder / 'expanded'
         snapshot(root, expanded, names, config, extra_paths)
         spans = derived_decls.write_into(expanded, root, expansions)

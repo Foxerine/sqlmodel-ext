@@ -196,18 +196,9 @@ The repository ships a rule set that teaches AI assistants the library's convent
 | File | For |
 |------|-----|
 | `ai-rules/CLAUDE.md` | Claude Code (project instructions) |
-| `ai-rules/AGENTS.md` | Codex, Copilot and other tools that read `AGENTS.md` |
-| `ai-rules/.claude/rules/` | Claude Code path-scoped rules |
+| `ai-rules/AGENTS.md` | Codex, Copilot and other tools that read `AGENTS.md` — the single copy of the rules |
 
-Copy them into your project (merge with your own files if you already have them):
-
-```bash
-git clone --depth 1 https://github.com/Foxerine/sqlmodel-ext /tmp/sqlmodel-ext
-mkdir -p .claude/rules
-cp -r /tmp/sqlmodel-ext/ai-rules/.claude/rules/. .claude/rules/
-cat /tmp/sqlmodel-ext/ai-rules/CLAUDE.md >> CLAUDE.md
-cat /tmp/sqlmodel-ext/ai-rules/AGENTS.md >> AGENTS.md
-```
+`CLAUDE.md` only imports `AGENTS.md`, so there is one copy of the rules to keep current. Installation (for a project with or without its own `AGENTS.md` / `CLAUDE.md`) is described in [`ai-rules/README.md`](ai-rules/README.md).
 
 The rules and the type checker complement each other: the rules steer the assistant toward the intended API, and basedpyright rejects what slips through.
 

@@ -245,8 +245,17 @@ class AsyncSession(_AsyncSessionBase):
             invalidation, each callback) is individually fail-soft (catches
             ``BaseException`` including cancellation, logs, continues), so no
             failure can drop the remaining already-popped callbacks.
-            Default ``False``: invalidation errors propagate; callback
-            ``Exception``\\s are logged and skipped, cancellation propagates.
+            Default ``False``: errors raised by the invalidation step itself
+            and cancellation propagate; callback ``Exception``\\s are logged
+            and skipped.
+
+        Redis failures are **not** among the propagated errors, in either
+        mode: each cached model's invalidation catches and logs its own Redis
+        error (the database has committed; failing the request would not undo
+        it), and the affected cache entries converge when their TTL expires.
+        Until then those entries can serve pre-commit data. Callers that need
+        a hard guarantee must not rely on the cache for that read
+        (``no_cache=True``).
         """
         CachedTableBaseMixin._autoregister_session_mutations(self)  # pyright: ignore[reportPrivateUsage]
         captured = CachedTableBaseMixin._capture_session_pending(self)  # pyright: ignore[reportPrivateUsage]

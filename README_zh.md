@@ -196,18 +196,9 @@ def label(f: ArticleFilter) -> str:
 | 文件 | 适用于 |
 |------|--------|
 | `ai-rules/CLAUDE.md` | Claude Code（项目指令） |
-| `ai-rules/AGENTS.md` | Codex、Copilot 等读取 `AGENTS.md` 的工具 |
-| `ai-rules/.claude/rules/` | Claude Code 按路径加载的规则 |
+| `ai-rules/AGENTS.md` | Codex、Copilot 等读取 `AGENTS.md` 的工具——规则的唯一正文 |
 
-把它们拷进你的项目（如果已有同名文件，合并进去）：
-
-```bash
-git clone --depth 1 https://github.com/Foxerine/sqlmodel-ext /tmp/sqlmodel-ext
-mkdir -p .claude/rules
-cp -r /tmp/sqlmodel-ext/ai-rules/.claude/rules/. .claude/rules/
-cat /tmp/sqlmodel-ext/ai-rules/CLAUDE.md >> CLAUDE.md
-cat /tmp/sqlmodel-ext/ai-rules/AGENTS.md >> AGENTS.md
-```
+`CLAUDE.md` 只是导入 `AGENTS.md`，所以需要维护的规则只有一份。安装方法（无论你的项目是否已有自己的 `AGENTS.md` / `CLAUDE.md`）见 [`ai-rules/README.md`](ai-rules/README.md)。
 
 规则与类型检查器互补：规则把助手引向正确的 API，basedpyright 拦下漏网的误用。
 

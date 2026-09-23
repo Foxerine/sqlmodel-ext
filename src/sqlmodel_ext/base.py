@@ -362,6 +362,24 @@ Excluded on purpose:
 """
 
 
+def _contains_forward_ref(annotation: typing.Any) -> bool:
+    """Whether ``annotation`` still contains an unresolved string / ``ForwardRef`` anywhere.
+
+    ``Literal`` arguments are values, not types (``Literal['a']`` holds the
+    string ``'a'``), and ``Annotated`` metadata is not a type either, so
+    neither is searched.
+    """
+    if isinstance(annotation, (str, typing.ForwardRef)):
+        return True
+    origin = get_origin(annotation)
+    if origin is typing.Literal:
+        return False
+    args = get_args(annotation)
+    if origin is typing.Annotated:
+        args = args[:1]
+    return any(_contains_forward_ref(arg) for arg in args)
+
+
 def _union_member_annotation(original_ann: typing.Any) -> typing.Any:
     """
     Reduce the ``FieldInfo`` items of an ``Annotated`` annotation to what works on a union member.
@@ -540,23 +558,6 @@ def _apply_partial(
         # anything injects inherited annotations.
         if field_name in own_names:
             continue
-        original_ann: typing.Any = None
-        for base in bases:
-            for cls in base.__mro__:
-                if cls is object:
-                    continue
-                cls_ann = getattr(cls, '__annotations__', None)
-                if not cls_ann or field_name not in cls_ann:
-                    continue
-                candidate = cls_ann[field_name]
-                if isinstance(candidate, str):
-                    continue
-                original_ann = candidate
-                break
-            if original_ann is not None:
-                break
-        if original_ann is None:
-            continue
 
         # The base class's resolved field: the single source of truth for what
         # the author declared, whichever syntax was used.
@@ -568,6 +569,32 @@ def _apply_partial(
                 break
         if base_field_info is None:
             continue
+
+        # The declared annotation, from the most-derived class declaring it
+        # (keeps ``Annotated`` metadata such as custom schema handlers). A
+        # string / ForwardRef declaration (``child: 'Node | None'``) is replaced
+        # by the resolved annotation Pydantic already computed for the base --
+        # skipping it would leave the field non-omissible (it would default to
+        # ``None`` and a PATCH would silently clear it).
+        original_ann: typing.Any = None
+        for base in bases:
+            for cls in base.__mro__:
+                if cls is object:
+                    continue
+                cls_ann = getattr(cls, '__annotations__', None)
+                if cls_ann and field_name in cls_ann:
+                    original_ann = cls_ann[field_name]
+                    break
+            if original_ann is not None:
+                break
+        if original_ann is None or isinstance(original_ann, (str, typing.ForwardRef)):
+            original_ann = base_field_info.annotation
+            if _contains_forward_ref(original_ann):
+                raise TypeError(
+                    f"partial=True: field {field_name!r} still has an unresolved forward reference "
+                    f"({original_ann!r}); define the referenced class and call "
+                    f"model_rebuild() on the base class before deriving the partial class"
+                )
 
         # When a field is declared as ``field: T = Field(gt=..., le=...)`` (non-Annotated form),
         # MRO ``__annotations__`` only stores the bare ``T``; the constraints live on the

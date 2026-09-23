@@ -34,7 +34,7 @@ features:
   - title: 为 basedpyright 而生
     details: "约束与字段三态都在类型里，basedpyright（≥ 1.40.1）能在运行前标出几乎所有误用"
   - title: 给 AI 编码助手的规则
-    details: "仓库附带 CLAUDE.md / AGENTS.md / .claude/rules，让 Claude、Codex 等按正确方式使用本库"
+    details: "仓库附带 AGENTS.md（CLAUDE.md 导入它，规则只有一份），让 Claude、Codex 等按正确方式使用本库"
 ---
 
 ::: warning 开发中

@@ -34,7 +34,7 @@ features:
   - title: Built for basedpyright
     details: "Constraints and the three field states live in types, so basedpyright (≥ 1.40.1) flags almost every misuse before the code runs"
   - title: Rules for AI coding assistants
-    details: "The repository ships CLAUDE.md / AGENTS.md / .claude/rules so Claude, Codex and friends use the library the intended way"
+    details: "The repository ships AGENTS.md (imported by CLAUDE.md, so there is one copy of the rules) so Claude, Codex and friends use the library the intended way"
 ---
 
 ::: warning Work in progress

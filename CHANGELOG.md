@@ -160,6 +160,10 @@ Upgrade guide: [Migrate from 0.4.x to 0.5.0](docs/en/how-to/migrate-to-0-5.md)
 
 ### Known limitations
 
+- A Redis failure during post-commit cache invalidation is logged, not raised (the
+  database has already committed): the affected cache entries keep serving
+  pre-commit data until their TTL expires. Use `no_cache=True` for reads that must
+  not rely on the cache.
 - Every commit of a cached model through the enhanced `AsyncSession` logs a spurious
   `WARNING` "fallback compensation triggered: ..." (pre-existing in 0.4.x). The only
   effect is one redundant cache invalidation; correctness is unaffected.

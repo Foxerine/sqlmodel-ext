@@ -2638,6 +2638,18 @@ class CachedTableBaseMixin(TableBaseMixin):
                     CachedTableBaseMixin._register_pending_invalidation(session, type(inst), _id)
 
     _cached_tablename_index: ClassVar[dict[str, list[type['CachedTableBaseMixin']]] | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Drop the table-name index whenever a cached model class is created.
+
+        The index is built lazily and cached; a model defined (or imported)
+        after it was first built -- e.g. after ``check_cache_config()`` warmed
+        it at startup -- would otherwise be invisible to raw-DML registration,
+        and a raw ``INSERT`` into its table would not invalidate its query
+        caches. Rebuilding is a class-creation-time cost only.
+        """
+        super().__init_subclass__(**kwargs)
+        CachedTableBaseMixin._cached_tablename_index = None
     """Lazily-built {SQL table name: [cached model classes mapped to it]} index for register_raw_dml_write."""
 
     @classmethod
