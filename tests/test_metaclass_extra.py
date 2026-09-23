@@ -336,8 +336,10 @@ class TestJsonFieldPostInitCheck:
 
     def test_too_deep_value_rejected_at_construction(self) -> None:
         # Table models skip Pydantic validators; the base model_post_init catches it.
+        # 400 levels exceed both orjson's (255) and pydantic_core's limit on
+        # every platform (the latter is platform-dependent, ~98 on Windows).
         with pytest.raises(ValueError):
-            MetaJsonRow(data=_nested(150))
+            MetaJsonRow(data=_nested(400))
 
     def test_too_long_value_rejected_at_construction(self) -> None:
         with pytest.raises(ValueError):

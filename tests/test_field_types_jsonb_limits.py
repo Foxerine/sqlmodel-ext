@@ -14,6 +14,8 @@ Covers ``sqlmodel_ext.field_types.dialects.postgresql.jsonb_types``:
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import orjson
 import pydantic_core
 import pytest
@@ -34,6 +36,14 @@ class FtJsonLimitDictModel(SQLModelBase):
 
 class FtJsonLimitListModel(SQLModelBase):
     items: JSONList100K
+
+
+def _serializes(serializer: Callable[[object], bytes], value: object) -> bool:
+    try:
+        _ = serializer(value)
+    except (orjson.JSONEncodeError, pydantic_core.PydanticSerializationError):
+        return False
+    return True
 
 
 def _deep_dict(depth: int) -> dict[str, object]:
@@ -113,13 +123,19 @@ class TestDeepNestingRejectedAtInput:
             FtJsonLimitListModel(items=[_deep_dict(400)])
 
     def test_depth_beyond_pydantic_limit_rejected(self) -> None:
+        # pydantic_core's recursion limit is platform-dependent (about 98
+        # levels on Windows builds, higher elsewhere), so measure it here
+        # instead of hard-coding a depth that only exceeds it on one platform.
+        pydantic_limit = next(
+            (depth for depth in range(1, 1000) if not _serializes(pydantic_core.to_json, _deep_dict(depth))),
+            None,
+        )
+        if pydantic_limit is None or not _serializes(orjson.dumps, _deep_dict(pydantic_limit)):
+            pytest.skip("on this platform pydantic_core is not stricter than orjson; the case cannot occur")
         # orjson CAN encode this depth, so the rejection must come from the
         # Pydantic serializer check -- otherwise this value would be accepted
         # and fail only when the response is serialized.
-        value = _deep_dict(150)
-        _ = orjson.dumps(value)
-        with pytest.raises(pydantic_core.PydanticSerializationError):
-            pydantic_core.to_json(value)
+        value = _deep_dict(pydantic_limit)
         with pytest.raises(ValidationError, match="nested too deeply"):
             FtJsonLimitDictModel(data=value)
 

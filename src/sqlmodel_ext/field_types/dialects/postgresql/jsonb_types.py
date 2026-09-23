@@ -62,9 +62,11 @@ def ensure_json_within_limits(value: dict[str, typing.Any] | list[typing.Any]) -
     limits automatically.
 
     **Both serializers are exercised.** Outbound values are serialized
-    recursively by Pydantic, whose depth limit (``pydantic_core.to_json``
-    fails from roughly 98 nesting levels) is an order of magnitude lower than
-    orjson's. Checking only orjson would accept a value that later fails at
+    recursively by Pydantic, whose depth limit is platform-dependent and can be
+    well below orjson's (``pydantic_core.to_json`` fails from about 98 nesting
+    levels on Windows builds, and higher elsewhere); running the real
+    serializer keeps the check equal to whatever limit applies where the code
+    runs. Checking only orjson would accept a value that later fails at
     response time; checking only ``to_json`` would accept non-JSON types such
     as ``set`` (which it silently turns into an array while orjson rejects
     them). The union of both checks is enforced.
