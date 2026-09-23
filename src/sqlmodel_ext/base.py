@@ -337,7 +337,7 @@ constructs from an empty payload and dumps to ``{}``.
 
 _UNION_INCOMPATIBLE_FIELD_ATTRS: typing.Final = (
     'exclude', 'alias', 'validation_alias', 'serialization_alias',
-    'repr', 'frozen',
+    'repr', 'frozen', 'deprecated',
 )
 """
 ``FieldInfo`` attributes that have no effect on a union member and must be hoisted outside the union.
@@ -357,6 +357,43 @@ Excluded on purpose:
 - constraints (``ge`` / ``max_length`` / ...): they keep working on the union
   member, and hoisting them would apply them to the sentinel as well.
 """
+
+
+def _union_member_annotation(original_ann: typing.Any) -> typing.Any:
+    """
+    Reduce the ``FieldInfo`` items of an ``Annotated`` annotation to what works on a union member.
+
+    Inside ``Unset | Annotated[T, *meta]``, a plain Pydantic ``FieldInfo`` only
+    contributes its constraints (``FieldInfo.metadata``) and its
+    ``discriminator``; every field-level attribute on it (``alias`` /
+    ``exclude`` / ``frozen`` / ``default`` / ...) is ignored and Pydantic emits
+    an ``UnsupportedFieldAttributeWarning`` per attribute. ``partial`` carries
+    the field-level attributes on the outer layer instead (see
+    ``_hoist_field_metadata``), so each such ``FieldInfo`` is replaced by its
+    constraints plus, if set, a ``Field(discriminator=...)``.
+
+    Only items whose type is exactly ``pydantic.fields.FieldInfo`` are
+    rewritten -- the same test Pydantic uses for the warning. Other metadata
+    (``annotated_types`` constraints, validators, schema handlers, SQLModel's
+    ``FieldInfo`` subclass) is kept in place and in order.
+
+    :param original_ann: the annotation that becomes the union member
+    :returns: the annotation unchanged if it is not ``Annotated``, otherwise the rewritten ``Annotated``
+    """
+    if get_origin(original_ann) is not typing.Annotated:
+        return original_ann
+    inner, *metadata = get_args(original_ann)
+    reduced: list[typing.Any] = []
+    for meta in metadata:
+        if type(meta) is not FieldInfo:
+            reduced.append(meta)
+            continue
+        reduced.extend(meta.metadata)
+        if meta.discriminator is not None:
+            reduced.append(PydanticField(discriminator=meta.discriminator))
+    if not reduced:
+        return inner
+    return typing.Annotated[inner, *reduced]
 
 
 _ALIAS_FIELD_ATTRS: typing.Final = frozenset({'alias', 'validation_alias', 'serialization_alias'})
@@ -520,7 +557,9 @@ def _apply_partial(
 
         # Field-level attributes (exclude / alias / ...) do not work on a union
         # member and would be silently dropped -- hoist them outside the union.
-        annotations[field_name] = _hoist_field_metadata(Unset | original_ann, base_field_info)
+        annotations[field_name] = _hoist_field_metadata(
+            Unset | _union_member_annotation(original_ann), base_field_info,
+        )
         if field_name not in attrs:
             attrs[field_name] = Unset
 

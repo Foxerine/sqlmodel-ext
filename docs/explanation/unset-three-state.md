@@ -112,7 +112,7 @@ class ArticleUpdate(ArticleBase, partial=True):
 - 基类 `T | None` → `Unset | T | None`（`null` 是真实的值）
 - 默认值统一变成 `Unset`；`default_factory` 不会被调用（没传的列表字段是 `Unset`，不是 `[]`）
 - **约束原样保留**：`Unset` 由 pydantic-core 专门的 missing-sentinel 分支校验，永远不会进入约束校验器，所以 `Unset | Annotated[int, Field(ge=0)]` 不需要任何特殊嵌套
-- 字段级属性（`exclude` / `alias` / `validation_alias` / `serialization_alias` / `repr` / `frozen`）会被提升到联合类型外层——否则 Pydantic 会静默丢弃它们。这些属性从基类已解析的字段读取，所以 `Annotated[T, Field(...)]`、`x: T = Field(...)` 以及两者混用都有效。`alias_generator` 生成的别名不提升：与普通继承一样，派生类会用自己的生成器重新生成
+- 字段级属性（`exclude` / `alias` / `validation_alias` / `serialization_alias` / `repr` / `frozen` / `deprecated`）会被提升到联合类型外层（否则 Pydantic 会静默丢弃它们），并从联合成员内移除，因此派生 partial 类不会产生 `UnsupportedFieldAttributeWarning`。这些属性从基类已解析的字段读取，所以 `Annotated[T, Field(...)]`、`x: T = Field(...)` 以及两者混用都有效。`alias_generator` 生成的别名不提升：与普通继承一样，派生类会用自己的生成器重新生成
 - `discriminator` 留在联合成员内部，嵌套的判别联合照常工作
 - 字段描述（docstring）会从基类继承
 

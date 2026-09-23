@@ -112,7 +112,7 @@ The metaclass transforms every inherited field:
 - base `T | None` → `Unset | T | None` (`null` is a real value)
 - the default becomes `Unset`; a `default_factory` is not called (an omitted list field is `Unset`, not `[]`)
 - **constraints are preserved**: `Unset` is validated by pydantic-core's dedicated missing-sentinel branch and never reaches constraint validators, so `Unset | Annotated[int, Field(ge=0)]` needs no special nesting
-- field-level attributes (`exclude` / `alias` / `validation_alias` / `serialization_alias` / `repr` / `frozen`) are hoisted outside the union — otherwise Pydantic would silently drop them. They are read from the base's resolved field, so `Annotated[T, Field(...)]`, `x: T = Field(...)` and mixes of the two all work. Aliases produced by an `alias_generator` are not hoisted: as in plain inheritance, a derived class regenerates them with its own generator
+- field-level attributes (`exclude` / `alias` / `validation_alias` / `serialization_alias` / `repr` / `frozen` / `deprecated`) are hoisted outside the union — otherwise Pydantic would silently drop them — and removed from the union member, so deriving a partial class emits no `UnsupportedFieldAttributeWarning`. They are read from the base's resolved field, so `Annotated[T, Field(...)]`, `x: T = Field(...)` and mixes of the two all work. Aliases produced by an `alias_generator` are not hoisted: as in plain inheritance, a derived class regenerates them with its own generator
 - `discriminator` stays on the union member, where a nested tagged union works as usual
 - field descriptions (docstrings) are inherited from the base
 
