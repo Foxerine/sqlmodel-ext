@@ -37,7 +37,7 @@ next_page = await Article.get(
 
 一直重复，直到返回的列表为空。`get_with_count()` 同样接受 `after_id`；它返回的 `count` 是整个过滤集的大小，**不受游标影响**。
 
-在 FastAPI 里端点代码不用改：`TableViewRequest` 作为依赖时，客户端直接传 `?after_id=<上一页最后一条的 id>&limit=20`（记得注册把 `ValidationError` 映射为 422 的处理器，见下文约束表）。
+在 FastAPI 里端点代码不用改：`TableViewRequest` 作为依赖时，客户端直接传 `?after_id=<上一页最后一条的 id>&limit=20`（用 `query_dependency(TableViewRequest)` 声明依赖，下表中被拒绝的组合就是 422，见 [给列表端点加分页](./paginate-a-list-endpoint#为什么要用-query-dependency)）。
 
 ## 它怎么保证不重不漏
 
@@ -49,8 +49,8 @@ next_page = await Article.get(
 
 | 组合 | 何时拒绝 | 错误 |
 |------|---------|------|
-| `after_id` + 非零 `offset` | 构造 `TableViewRequest` 时 | `ValidationError`（在 FastAPI 依赖里需要映射为 422，见 [给列表端点加分页](./paginate-a-list-endpoint#把跨字段校验错误映射为-422)） |
-| `after_id` + `order='updated_at'`（或任何可变的领域排序列） | 构造时 | `ValidationError` |
+| `after_id` + 非零 `offset` | 构造 `TableViewRequest` 时 | `ValidationError`，位置 `after_id`（经 `query_dependency()` 是 422，位置 `["query", "after_id"]`） |
+| `after_id` + `order='updated_at'`（或任何可变的领域排序列） | 构造时 | `ValidationError`，位置 `after_id`（经 `query_dependency()` 是 422） |
 | `after_id` + 显式 `order_by=` | `get()` 时 | `KeysetCursorUnsupportedError` |
 | `after_id` + `join=` | `get()` 时 | `KeysetCursorUnsupportedError` |
 | 锚点不存在，或不在本查询可见范围（`condition` + `filter` + STI 过滤） | `get()` 时 | `KeysetCursorInvalidError` |

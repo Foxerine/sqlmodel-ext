@@ -140,8 +140,8 @@ async def _invalidate_id_cache(cls, instance_id):
 
 ## 失效的两条路径
 
-1. **同步路径**（增强 `AsyncSession.commit()`）：commit 前快照登记项，commit 后 `await` 失效快照项与级联子项。
-2. **补偿路径**（`after_commit` 事件）：事件处理器是同步的、无法 `await`，于是调度一个 fire-and-forget 任务，失效同步路径没有覆盖到的部分（按 ID 与 `synced` 记录去重）。它兜住没有经过增强 `commit()` 的提交，存在极短的 stale 窗口，TTL 提供最终一致性。
+1. **同步路径**（增强 `AsyncSession.commit()`）：真正 commit 前给 session 打上标记；`after_commit` 事件看到标记，把完整的登记项（包括 commit 自身 flush 期间登记的，如级联子项）移交给 `commit()`，由它在返回前 `await` 失效。每项只失效一次，不记告警。
+2. **补偿路径**（没有标记的 `after_commit` 事件）：事件处理器是同步的、无法 `await`，于是调度一个 fire-and-forget 任务失效这些登记项，并记录 `WARNING` "fallback compensation triggered: ..."。它兜住没有经过增强 `commit()` 的提交（普通 SQLAlchemy / SQLModel session、`run_sync(lambda s: s.commit())`），以及在数据库已提交之后失败或被取消的增强 `commit()`；存在极短的 stale 窗口，TTL 提供最终一致性。
 
 哨兵对象：
 

@@ -7,6 +7,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > there is no stability or backward-compatibility guarantee between versions, and
 > you use it at your own risk. Pin the exact version you depend on.
 
+## [0.5.1]
+
+### Added
+
+- **`query_dependency(Model)`**: FastAPI dependency for query-parameter DTOs
+  (`TableViewRequest`, `PaginationRequest`, `PageWindowRequest`, `TimeFilterRequest`,
+  `TrgmSearchRequest`, your subclasses):
+  `Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]`. It declares
+  one query parameter per field (same OpenAPI schema), builds the model itself and
+  re-raises a failed construction as `RequestValidationError` with locations prefixed by
+  `'query'`, so FastAPI answers 422. Requires the `fastapi` extra when called. See
+  [Paginate a list endpoint](docs/en/how-to/paginate-a-list-endpoint.md).
+
+### Fixed
+
+- A cross-field validation failure of `TableViewRequest` (and the other query DTOs) used
+  as a FastAPI dependency (`after_id` with a non-zero `offset`, `after_id` with a mutable
+  `order`, an inverted time range) was a 500. Declared through `query_dependency()` it is
+  a 422 located at the offending query parameter; the documented `ValidationError`
+  exception-handler workaround is no longer needed.
+- Every commit of a cached model through the enhanced `AsyncSession` logged a spurious
+  `WARNING` "fallback compensation triggered: ..." and invalidated the cache a second
+  time. The `after_commit` event now hands the committed pendings over to the enhanced
+  `commit()`, which invalidates each of them once. Commits that bypass the enhanced
+  `commit()` (a plain SQLAlchemy / SQLModel session, `run_sync(lambda s: s.commit())`)
+  keep the fire-and-forget compensation and its `WARNING`; it now also takes over when
+  the enhanced `commit()` fails or is cancelled after the database committed.
+
+### Changed
+
+- The cross-field rules of `PaginationRequest` and `TimeFilterRequest` are field validators:
+  a violation is still a `ValidationError` with the same message, but located at the
+  field the rule constrains (`after_id`, `created_before_datetime`,
+  `updated_before_datetime`) instead of the model root, and independent violations are
+  reported together. `TimeFilterRequest` no longer overrides `model_post_init`.
+
 ## [0.5.0]
 
 Upgrade guide: [Migrate from 0.4.x to 0.5.0](docs/en/how-to/migrate-to-0-5.md)
@@ -164,14 +200,6 @@ Upgrade guide: [Migrate from 0.4.x to 0.5.0](docs/en/how-to/migrate-to-0-5.md)
   database has already committed): the affected cache entries keep serving
   pre-commit data until their TTL expires. Use `no_cache=True` for reads that must
   not rely on the cache.
-- Every commit of a cached model through the enhanced `AsyncSession` logs a spurious
-  `WARNING` "fallback compensation triggered: ..." (pre-existing in 0.4.x). The only
-  effect is one redundant cache invalidation; correctness is unaffected.
-- When `TableViewRequest` is used as a `Depends()` dependency, a cross-field validation
-  failure (e.g. `after_id` with a non-zero `offset`) surfaces as a 500 instead of a 422,
-  because FastAPI constructs the object outside its per-parameter validation. Register
-  the `ValidationError` → 422 handler shown in
-  [Paginate a list endpoint](docs/en/how-to/paginate-a-list-endpoint.md).
 - On Python 3.12, `JSON100K | None` as a `table=True` field raises
   `has no matching SQLAlchemy type`; declare the column explicitly with
   `Field(default=None, sa_type=JSONB)` (pre-existing).

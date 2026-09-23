@@ -46,7 +46,7 @@ from sqlmodel_ext import PaginationRequest
 
 `get()` 总会在 `order` 之后追加同方向的 `id` 作为决胜列（组合 `(排序列, id)`），因此共享同一时间戳的行在 offset 与 keyset 分页的页边界上都不会重复或遗漏。
 
-**构造期校验**（`model_validator`，违反即 `ValidationError`）：
+**构造期校验**（`after_id` 上的字段校验器，违反即 `ValidationError`，位置为 `after_id`）：
 
 | 规则 | 原因 |
 |------|------|
@@ -70,11 +70,11 @@ from sqlmodel_ext import TimeFilterRequest
 
 时间区间为左闭右开 `[after, before)`。所有边界都是 **`AwareDatetime`**：不带时区的 datetime 在校验时就被拒绝（它无法与时区感知的数据库值比较，会被静默按数据库时区解释）。
 
-**`model_post_init` 校验**：
+**构造期校验**（字段校验器，违反即 `ValidationError`，位置为下面标出的 `*_before_datetime` 字段）：
 
-- `created_after_datetime >= created_before_datetime` → `ValueError`
-- `updated_after_datetime >= updated_before_datetime` → `ValueError`
-- `created_after_datetime >= updated_before_datetime` → `ValueError`（记录的更新时间不可能早于创建时间）
+- `created_after_datetime >= created_before_datetime` → 位置 `created_before_datetime`
+- `updated_after_datetime >= updated_before_datetime` → 位置 `updated_before_datetime`
+- `created_after_datetime >= updated_before_datetime` → 位置 `updated_before_datetime`（记录的更新时间不可能早于创建时间）
 
 ## `TableViewRequest`
 
@@ -88,6 +88,27 @@ class TableViewRequest(TimeFilterRequest, PaginationRequest):
 ```
 
 同时承载分页 + 排序 + keyset 游标 + 时间过滤参数。`get()` / `get_with_count()` 接受 `table_view` 参数；显式传入的 `offset` / `limit` / `order_by` / 时间参数优先，未提供时回退到 `table_view`。
+
+## `query_dependency()`
+
+```python
+from sqlmodel_ext import query_dependency
+
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
+```
+
+把查询参数 DTO（`TableViewRequest`、`PaginationRequest`、`PageWindowRequest`、`TimeFilterRequest`、`TrgmSearchRequest` 或你自己的子类）变成 FastAPI 依赖。需要 `fastapi` extra（没有 FastAPI 时调用会抛 `ImportError`；`import sqlmodel_ext` 本身不需要它）。
+
+| 行为 | 说明 |
+|------|------|
+| 查询参数 | 每个模型字段一个，名字取字段别名（没有别名就是字段名），类型、约束、默认值、docstring 说明都来自字段——OpenAPI 与模型一致 |
+| 校验 | 由依赖自己构造模型，所有校验器（包括跨字段的）都会运行 |
+| 错误 | `ValidationError` 被转成 `fastapi.exceptions.RequestValidationError`，每个位置前加 `'query'`（`["query", "after_id"]`；没有字段位置的模型级错误变成 `["query"]`），由 FastAPI 默认处理器返回 422 |
+| 其它查询参数 | 忽略；端点可以在依赖旁边声明自己的查询参数 |
+| 缓存 | 每个模型类只生成一个可调用对象，FastAPI 的请求级依赖缓存把重复使用视为同一个依赖 |
+| 拒绝的模型（`TypeError`） | `table=True` 模型（它们跳过校验）、带 `default_factory` 的字段、`validation_alias` 不是单个字符串的字段 |
+
+为什么不在类上直接用 `Depends()`：FastAPI 逐个校验参数后调用这个类，那次调用抛出的 `ValidationError` 不是 `RequestValidationError`，跨字段错误就成了 500。见 [给列表端点加分页](/how-to/paginate-a-list-endpoint#为什么要用-query-dependency)。
 
 ## 常量
 

@@ -13,33 +13,28 @@
 ```python
 from typing import Annotated
 from fastapi import Depends
-from sqlmodel_ext import TableViewRequest
+from sqlmodel_ext import TableViewRequest, query_dependency
 
-TableViewDep = Annotated[TableViewRequest, Depends()]
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 ```
 
-`TableViewRequest` carries pagination (`offset` / `limit` / `desc` / `order`), a keyset cursor (`after_id`) and time filtering (`created_after_datetime` / `created_before_datetime` / `updated_after_datetime` / `updated_before_datetime`). FastAPI's `Depends()` parses the query string into this object automatically.
+`TableViewRequest` carries pagination (`offset` / `limit` / `desc` / `order`), a keyset cursor (`after_id`) and time filtering (`created_after_datetime` / `created_before_datetime` / `updated_after_datetime` / `updated_before_datetime`). `query_dependency()` declares one query parameter per model field (same type, constraints, default and description as the model, so the OpenAPI schema is generated as usual) and constructs the `TableViewRequest` itself.
 
-### Map cross-field validation errors to 422
+### Why `query_dependency()`
 
-Single-field errors (`limit=0`, a time without a timezone) are validated per parameter by FastAPI and are a 422 directly. But **cross-field** rules — `after_id` and `offset` are mutually exclusive, `after_id` can't be combined with `order=updated_at`, time ranges must be in order — only fire when FastAPI calls `TableViewRequest(...)` to construct the dependency object. They raise a Pydantic `ValidationError`, which is a **500** if left unhandled. Register a handler that maps it to 422:
+Single-field errors (`limit=0`, a time without a timezone) are validated per parameter by FastAPI and are a 422 directly. But **cross-field** rules — `after_id` and `offset` are mutually exclusive, `after_id` can't be combined with `order=updated_at`, time ranges must be in order — only fire when the `TableViewRequest` is constructed. With a bare `Depends()`, FastAPI calls `TableViewRequest(...)` itself; the Pydantic `ValidationError` raised there is not a `RequestValidationError`, FastAPI does not catch it, and the request fails with a **500**.
 
-```python
-from fastapi import Request
-from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+`query_dependency()` re-raises that `ValidationError` as a `RequestValidationError` whose error locations start with `query`, so FastAPI's default handler answers **422** in the same shape as any other query-parameter error — no exception handler to register:
 
-@app.exception_handler(ValidationError)
-async def dto_validation_error_handler(request: Request, exc: ValidationError) -> JSONResponse:
-    return JSONResponse(
-        status_code=422,
-        content={"detail": jsonable_encoder(exc.errors(include_url=False, include_context=False))},
-    )
+```json
+{"detail": [{"type": "value_error", "loc": ["query", "after_id"],
+             "msg": "Value error, after_id and offset cannot be combined: ...", "input": "..."}]}
 ```
 
-::: warning Don't switch to `Annotated[TableViewRequest, Query()]` to "fix" this
-A Pydantic query model does turn cross-field errors into 422, but only when it is the endpoint's **only** query parameter: add one more ordinary query parameter to the endpoint (e.g. `status: str | None = None`) and FastAPI no longer hands the whole query string to the model, so requests fail outright with 422 `Field required`. On top of that, `SQLModelBase`'s `extra='forbid'` turns any undeclared query parameter (such as a cache-busting `?_=123`) into a 422.
+A cross-field error is located at the field its rule constrains: both `after_id` rules report `after_id`, the time-range rules report the `*_before_datetime` field. The same form works for `PageWindowRequest`, `PaginationRequest`, `TimeFilterRequest`, `TrgmSearchRequest` and your own subclasses (`query_dependency(MyTableViewRequest)`). The endpoint can still declare further query parameters next to it; undeclared query parameters (such as a cache-busting `?_=123`) are ignored.
+
+::: warning Don't switch to `Annotated[TableViewRequest, Query()]`
+A Pydantic query model only works when it is the endpoint's **only** query parameter: add one more ordinary query parameter to the endpoint (e.g. `status: str | None = None`) and FastAPI no longer hands the whole query string to the model, so requests fail outright with 422 `Field required`. On top of that, `SQLModelBase`'s `extra='forbid'` turns any undeclared query parameter (such as `?_=123`) into a 422.
 :::
 
 ## 2. Call `get_with_count()` in the endpoint
@@ -98,7 +93,7 @@ Sorting always appends `id` in the same direction as a tiebreaker column, so row
 - **Time parameters must carry a timezone** (`...Z` or `+08:00`). All time bounds are `AwareDatetime`; a value without a timezone is a 422 outright — otherwise it would be silently interpreted in the database's timezone.
 - **Time intervals are half-open** `[after, before)`. `created_after_datetime=2026-01-01T00:00:00Z` + `created_before_datetime=2026-02-01T00:00:00Z` means "all of January (UTC)".
 - **`order` only accepts values in the `Literal`**; any other string makes FastAPI return `422`.
-- **`after_id` can't be used with a non-zero `offset`**, nor with `order=updated_at` — both are rejected when `TableViewRequest` is constructed (a 422 once you register the handler above).
+- **`after_id` can't be used with a non-zero `offset`**, nor with `order=updated_at` — both are rejected when `TableViewRequest` is constructed (a 422 at `["query", "after_id"]` through `query_dependency()`).
 
 ## Related reference
 

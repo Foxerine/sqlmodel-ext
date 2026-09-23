@@ -95,14 +95,13 @@ Register first, then execute, and the warning won't fire (the table already has 
 CRUD methods (`save` / `update` / `delete` / `add`) **don't invalidate** themselves; they only register pending invalidations into `session.info`. The enhanced `AsyncSession.commit()` orchestrates:
 
 1. Auto-register every change of cached models in the session (covering bare `add` / attribute mutation / `delete` that bypass the CRUD methods)
-2. Snapshot the pending invalidations (the `after_commit` event pops them during commit)
-3. Actually commit
-4. Synchronously invalidate the snapshot items + the children cascade-deleted in this flush
-5. Run post-commit callbacks
+2. Actually commit. The `after_commit` event pops the complete set of registered items — including those registered by this commit's own flush, such as cascade-deleted children — and hands it over to `commit()`
+3. Synchronously invalidate the handed-over items, each exactly once
+4. Run post-commit callbacks
 
 With `commit=False` nothing is invalidated (the data isn't committed yet); the registered items wait for your final `session.commit()` — "several `commit=False` operations + one commit" is naturally correct. Rollback discards the registered items.
 
-A fire-and-forget compensation task is also attached to the `after_commit` event, covering commit paths that don't go through the enhanced `commit()` (e.g. a plain sqlmodel session); it deduplicates by ID and only fills in what the synchronous path didn't cover.
+For a commit that doesn't go through the enhanced `commit()` (e.g. a plain sqlmodel session, or `run_sync(lambda s: s.commit())`), the `after_commit` event instead schedules a fire-and-forget compensation task that invalidates the popped items and logs a `WARNING` "fallback compensation triggered: ..." — there is a brief stale window, TTL provides eventual consistency. The same fallback takes over if the enhanced `commit()` fails or is cancelled after the database has committed. A commit through the enhanced session never logs that warning.
 
 ### Savepoints
 

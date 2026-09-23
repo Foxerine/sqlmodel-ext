@@ -12,7 +12,8 @@ Class hierarchy::
     TableViewRequest             TimeFilterRequest + PaginationRequest
 """
 import uuid
-from typing import TypeVar, Literal, Generic, Any
+from datetime import datetime
+from typing import TypeVar, Literal, Generic
 
 # Generic container choice:
 # - A generic container used as a FastAPI **response_model** (ListResponse)
@@ -23,7 +24,7 @@ from typing import TypeVar, Literal, Generic, Any
 # - A generic container that is only a method return value and never enters
 #   OpenAPI (``GroupSumRow``) is unaffected by that bug and inherits
 #   ``SQLModelBase`` like every other data carrier.
-from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationInfo, field_validator
 from sqlmodel import Field
 
 from sqlmodel_ext.base import SQLModelBase
@@ -124,27 +125,40 @@ class TimeFilterRequest(SQLModelBase):
     updated_before_datetime: AwareDatetime | None = None
     """Filter updated_at < datetime (None means no limit). Must carry a timezone."""
 
-    def model_post_init(self, __context: Any) -> None:
-        """
-        Validate time range consistency.
+    # Time range consistency. Rules:
+    # 1. Same-type: after must be less than before
+    # 2. Cross-type: created_after cannot be >= updated_before
+    # Each rule is a field validator on its ``*_before_datetime`` field (declared
+    # after the ``*_after_datetime`` fields it reads from ``info.data``), so the
+    # error location names that field -- ``query_dependency`` reports it as
+    # ``('query', '<field>')``. A key missing from ``info.data`` means that
+    # field already failed its own validation, which is reported on its own.
 
-        Rules:
-        1. Same-type: after must be less than before
-        2. Cross-type: created_after cannot be greater than updated_before
-        """
-        if self.created_after_datetime and self.created_before_datetime:
-            if self.created_after_datetime >= self.created_before_datetime:
-                raise ValueError("created_after_datetime must be less than created_before_datetime")
-        if self.updated_after_datetime and self.updated_before_datetime:
-            if self.updated_after_datetime >= self.updated_before_datetime:
-                raise ValueError("updated_after_datetime must be less than updated_before_datetime")
+    @field_validator('created_before_datetime')
+    @classmethod
+    def _validate_created_range(cls, before: datetime | None, info: ValidationInfo) -> datetime | None:
+        """``created_after_datetime < created_before_datetime``."""
+        after = info.data.get('created_after_datetime')
+        if before is not None and after is not None and after >= before:
+            raise ValueError("created_after_datetime must be less than created_before_datetime")
+        return before
 
-        if self.created_after_datetime and self.updated_before_datetime:
-            if self.created_after_datetime >= self.updated_before_datetime:
-                raise ValueError(
-                    "created_after_datetime cannot be >= updated_before_datetime "
-                    "(a record's update time cannot be earlier than its creation time)"
-                )
+    @field_validator('updated_before_datetime')
+    @classmethod
+    def _validate_updated_range(cls, before: datetime | None, info: ValidationInfo) -> datetime | None:
+        """``updated_after_datetime < updated_before_datetime`` and ``created_after_datetime < updated_before_datetime``."""
+        if before is None:
+            return before
+        updated_after = info.data.get('updated_after_datetime')
+        if updated_after is not None and updated_after >= before:
+            raise ValueError("updated_after_datetime must be less than updated_before_datetime")
+        created_after = info.data.get('created_after_datetime')
+        if created_after is not None and created_after >= before:
+            raise ValueError(
+                "created_after_datetime cannot be >= updated_before_datetime "
+                "(a record's update time cannot be earlier than its creation time)"
+            )
+        return before
 
 
 class PageWindowRequest(SQLModelBase):
@@ -205,19 +219,33 @@ class PaginationRequest(PageWindowRequest):
     UUID primary-key tables.
     """
 
-    @model_validator(mode='after')
-    def _validate_keyset_anchor_column(self) -> 'PaginationRequest':
+    # The two cross-field rules below are field validators on ``after_id`` (not
+    # ``model_validator``s) so that the error location is ``('after_id',)``
+    # instead of the model root: ``query_dependency`` turns it into
+    # ``('query', 'after_id')``. They can read ``offset`` / ``order`` from
+    # ``info.data`` because both are declared before ``after_id`` (a subclass
+    # re-declaring ``order`` keeps its position). A key missing from
+    # ``info.data`` means that field already failed its own validation, which
+    # is reported on its own.
+
+    @field_validator('after_id')
+    @classmethod
+    def _validate_keyset_anchor_column(cls, after_id: uuid.UUID | None, info: ValidationInfo) -> uuid.UUID | None:
         """``after_id`` may only anchor an immutable sort column (see ``after_id``)."""
-        if self.after_id is not None and self.order not in ('created_at', 'id', None):
+        if after_id is None or 'order' not in info.data:
+            return after_id
+        order = info.data['order']
+        if order not in ('created_at', 'id', None):
             raise ValueError(
-                f"after_id keyset cursor does not support order={self.order}: a mutable sort "
+                f"after_id keyset cursor does not support order={order}: a mutable sort "
                 "column moves rows after updates and breaks the no-gap/no-duplicate "
                 "guarantee; use an immutable sort column (e.g. order=created_at)"
             )
-        return self
+        return after_id
 
-    @model_validator(mode='after')
-    def _reject_keyset_with_offset(self) -> 'PaginationRequest':
+    @field_validator('after_id')
+    @classmethod
+    def _reject_keyset_with_offset(cls, after_id: uuid.UUID | None, info: ValidationInfo) -> uuid.UUID | None:
         """``after_id`` and a non-zero ``offset`` are **mutually exclusive** -- they would stack, not alternate.
 
         ``get()`` adds the keyset condition to ``WHERE`` ("after the anchor")
@@ -228,14 +256,17 @@ class PaginationRequest(PageWindowRequest):
         reset it" is the most natural misuse; the combination is therefore
         made unrepresentable at construction.
         """
-        if self.after_id is not None and self.offset:
+        if after_id is None or 'offset' not in info.data:
+            return after_id
+        offset = info.data['offset']
+        if offset:
             raise ValueError(
                 "after_id and offset cannot be combined: the keyset cursor already means "
-                f"'continue after the anchor'; adding offset={self.offset} would additionally "
-                f"skip {self.offset} records after the anchor (they would become unreachable). "
+                f"'continue after the anchor'; adding offset={offset} would additionally "
+                f"skip {offset} records after the anchor (they would become unreachable). "
                 "Pass only after_id and omit offset when paging."
             )
-        return self
+        return after_id
 
 
 class TableViewRequest(TimeFilterRequest, PaginationRequest):
@@ -247,10 +278,12 @@ class TableViewRequest(TimeFilterRequest, PaginationRequest):
 
     Example::
 
+        TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
+
         @router.get("/list")
         async def list_items(
             session: SessionDep,
-            table_view: TableViewRequestDep
+            table_view: TableViewDep,
         ):
             items = await Item.get(session, fetch_mode="all", table_view=table_view)
             return items

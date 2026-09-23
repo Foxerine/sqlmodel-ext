@@ -46,7 +46,7 @@ Inherits `PageWindowRequest`, adding the ordering column and the keyset cursor.
 
 `get()` always appends `id` in the same direction after `order` as a tiebreaker (the composite `(ordering column, id)`), so rows sharing the same timestamp are neither duplicated nor skipped at page boundaries, for both offset and keyset pagination.
 
-**Construction-time validation** (`model_validator`; a violation raises `ValidationError`):
+**Construction-time validation** (field validators on `after_id`; a violation raises `ValidationError` located at `after_id`):
 
 | Rule | Reason |
 |------|------|
@@ -70,11 +70,11 @@ from sqlmodel_ext import TimeFilterRequest
 
 Time ranges are left-closed, right-open `[after, before)`. All bounds are **`AwareDatetime`**: a datetime without a timezone is rejected at validation time (it can't be compared with timezone-aware database values and would be silently interpreted in the database's timezone).
 
-**`model_post_init` validation**:
+**Construction-time validation** (field validators; a violation raises `ValidationError` located at the `*_before_datetime` field named below):
 
-- `created_after_datetime >= created_before_datetime` → `ValueError`
-- `updated_after_datetime >= updated_before_datetime` → `ValueError`
-- `created_after_datetime >= updated_before_datetime` → `ValueError` (a record's update time can't be earlier than its creation time)
+- `created_after_datetime >= created_before_datetime` → at `created_before_datetime`
+- `updated_after_datetime >= updated_before_datetime` → at `updated_before_datetime`
+- `created_after_datetime >= updated_before_datetime` → at `updated_before_datetime` (a record's update time can't be earlier than its creation time)
 
 ## `TableViewRequest`
 
@@ -88,6 +88,27 @@ class TableViewRequest(TimeFilterRequest, PaginationRequest):
 ```
 
 Carries pagination + ordering + keyset cursor + time filter parameters together. `get()` / `get_with_count()` accept a `table_view` parameter; explicitly passed `offset` / `limit` / `order_by` / time parameters take precedence, falling back to `table_view` when not provided.
+
+## `query_dependency()`
+
+```python
+from sqlmodel_ext import query_dependency
+
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
+```
+
+Turns a query-parameter DTO (`TableViewRequest`, `PaginationRequest`, `PageWindowRequest`, `TimeFilterRequest`, `TrgmSearchRequest`, or a subclass of your own) into a FastAPI dependency. Requires the `fastapi` extra (`ImportError` when called without FastAPI; importing `sqlmodel_ext` never needs it).
+
+| Behavior | Detail |
+|------|------|
+| Query parameters | One per model field, named after the field's alias (the field name when it has none), with the field's type, constraints, default and docstring description — the OpenAPI schema matches the model |
+| Validation | The dependency constructs the model, so every validator runs, cross-field ones included |
+| Errors | A `ValidationError` is re-raised as `fastapi.exceptions.RequestValidationError` with every location prefixed by `'query'` (`["query", "after_id"]`; a model-level error without a field becomes `["query"]`). FastAPI's default handler answers 422 |
+| Other query parameters | Ignored; the endpoint can declare its own next to the dependency |
+| Caching | One callable per model class, so FastAPI's per-request dependency cache treats repeated uses as one dependency |
+| Rejected models (`TypeError`) | `table=True` models (they skip validation), fields with a `default_factory`, fields whose `validation_alias` is not a single string |
+
+Why not `Depends()` on the class: FastAPI validates each parameter, then calls the class; a `ValidationError` from that call is not a `RequestValidationError`, so cross-field errors become 500s. See [Paginate a list endpoint](/en/how-to/paginate-a-list-endpoint#why-query-dependency).
 
 ## Constants
 

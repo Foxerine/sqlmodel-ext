@@ -140,8 +140,8 @@ The query cache `INCR`s the version keys of itself and all ancestors in one pipe
 
 ## The two invalidation paths
 
-1. **Synchronous path** (enhanced `AsyncSession.commit()`): snapshots the registered items before commit; after commit it `await`s invalidation of the snapshot items and cascade children.
-2. **Compensation path** (`after_commit` event): the event handler is synchronous and cannot `await`, so it schedules a fire-and-forget task that invalidates whatever the synchronous path did not cover (deduplicated by ID against the `synced` record). It catches commits that did not go through the enhanced `commit()`; there is a very short stale window, and TTL provides eventual consistency.
+1. **Synchronous path** (enhanced `AsyncSession.commit()`): it marks the session before the real commit; the `after_commit` event sees the mark and hands the complete set of registered items (including those registered during the commit's own flush, e.g. cascade children) over to `commit()`, which `await`s their invalidation before returning. Each item is invalidated once; no warning is logged.
+2. **Compensation path** (`after_commit` event without the mark): the event handler is synchronous and cannot `await`, so it schedules a fire-and-forget task that invalidates the items and logs a `WARNING` "fallback compensation triggered: ...". It catches commits that did not go through the enhanced `commit()` (a plain SQLAlchemy / SQLModel session, `run_sync(lambda s: s.commit())`), and an enhanced `commit()` that failed or was cancelled after the database committed; there is a very short stale window, and TTL provides eventual consistency.
 
 Sentinel objects:
 

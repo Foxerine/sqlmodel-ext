@@ -343,7 +343,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import Field
 from sqlmodel_ext import (
     AsyncSession, SQLModelBase, UUIDTableBaseMixin, Str64, Text10K,
-    ListResponse, TableViewRequest, UUIDIdDatetimeInfoMixin,
+    ListResponse, TableViewRequest, UUIDIdDatetimeInfoMixin, query_dependency,
 )
 
 # ── 依赖注入层：声明一次（例如放在共享的 deps 模块），
@@ -359,9 +359,10 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 """请求级 AsyncSession。端点访问数据库的唯一途径。"""
 
-# TableViewRequest 是 Pydantic 模型 → FastAPI 自动把字段绑定为查询参数。
-# 无需手写 offset/limit/order 的管道代码。
-TableViewRequestDep = Annotated[TableViewRequest, Depends()]
+# query_dependency() 把 TableViewRequest 的每个字段绑定为查询参数（无需手写
+# offset/limit/order 的管道代码），并把跨字段错误（如 after_id + offset）变成
+# 422 而不是 500。
+TableViewRequestDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 
 async def get_current_user(session: SessionDep) -> "User":
     ...  # 解析 bearer token、加载用户——沿用你自己的认证逻辑

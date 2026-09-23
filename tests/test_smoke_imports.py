@@ -184,6 +184,8 @@ def test_toplevel_import() -> None:
         "DEFAULT_PAGE_SIZE",
         "MAX_PAGE_SIZE",
         "MAX_TABLE_VIEW_OFFSET",
+        # FastAPI dependency for query-parameter DTOs
+        "query_dependency",
         # Table extras
         "SESSION_REPEATABLE_READ_KEY",
         "GroupSumRow",

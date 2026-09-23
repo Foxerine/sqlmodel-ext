@@ -229,13 +229,18 @@ class AsyncSession(_AsyncSessionBase):
         """Commit + synchronously invalidate every involved ``CachedTableBaseMixin`` model + run post-commit callbacks.
 
         Ordering: auto-register new/dirty/deleted cached models (covers bare
-        add/mutate/delete + commit paths) -> snapshot the pendings (the
-        ``after_commit`` event pops them during commit) -> pop the callback
-        queue -> ``super().commit()`` actually commits (flush may append
-        cascade children via the ``persistent_to_deleted`` event) -> bump
-        ``commit_count`` -> synchronously invalidate the snapshot + cascade
-        children -> run the callbacks in order. Degrades to a plain commit
-        when nothing is pending.
+        add/mutate/delete + commit paths) -> pop the callback queue -> mark
+        the session as inside the enhanced commit -> ``super().commit()``
+        actually commits (its flush may register more pendings, e.g. cascade
+        children via the ``persistent_to_deleted`` event); the ``after_commit``
+        event pops the complete pending set and, because of the mark, hands
+        it over to this method instead of scheduling the fire-and-forget
+        fallback -> clear the mark, take the hand-over -> bump
+        ``commit_count`` -> synchronously invalidate the hand-over (each
+        pending exactly once) -> run the callbacks in order. Degrades to a
+        plain commit when nothing is pending. If ``super().commit()`` raises
+        after the database committed, the hand-over goes to the fallback
+        compensation before the error propagates.
 
         :param fail_soft_when_observed: "observed-commit" completion mode.
             When ``True``: if ``super().commit()`` itself raises
@@ -258,15 +263,28 @@ class AsyncSession(_AsyncSessionBase):
         (``no_cache=True``).
         """
         CachedTableBaseMixin._autoregister_session_mutations(self)  # pyright: ignore[reportPrivateUsage]
-        captured = CachedTableBaseMixin._capture_session_pending(self)  # pyright: ignore[reportPrivateUsage]
         callbacks: list[Callable[[], Awaitable[None]]] = self.info.pop(POST_COMMIT_CALLBACKS_KEY, [])
-        await super().commit()
+        # While marked, the after_commit event hands its popped pendings to
+        # this method instead of scheduling the fire-and-forget fallback.
+        CachedTableBaseMixin._begin_enhanced_commit(self)  # pyright: ignore[reportPrivateUsage]
+        try:
+            await super().commit()
+        except BaseException:
+            # A non-empty hand-over means after_commit fired, i.e. the database
+            # committed before the failure; the synchronous path below will not
+            # run, so fall back to the fire-and-forget compensation.
+            CachedTableBaseMixin._schedule_fallback_compensation(  # pyright: ignore[reportPrivateUsage]
+                CachedTableBaseMixin._end_enhanced_commit(self),  # pyright: ignore[reportPrivateUsage]
+                "super().commit() raised after the database committed",
+            )
+            raise
+        committed = CachedTableBaseMixin._end_enhanced_commit(self)  # pyright: ignore[reportPrivateUsage]
         # Count right after the real commit and before invalidation/callbacks:
         # their failure does not change the fact that the database committed.
         self.info[SESSION_COMMIT_COUNT_KEY] = self.commit_count + 1
         if fail_soft_when_observed:
             try:
-                await CachedTableBaseMixin._flush_invalidations(self, captured)  # pyright: ignore[reportPrivateUsage]
+                await CachedTableBaseMixin._flush_invalidations(self, committed)  # pyright: ignore[reportPrivateUsage]
             except BaseException:
                 logger.exception(
                     "cache invalidation after commit failed (including cancellation) -- the database "
@@ -281,7 +299,7 @@ class AsyncSession(_AsyncSessionBase):
                         "committed; suppressed (fail-soft), continuing with the next callback"
                     )
             return
-        await CachedTableBaseMixin._flush_invalidations(self, captured)  # pyright: ignore[reportPrivateUsage]
+        await CachedTableBaseMixin._flush_invalidations(self, committed)  # pyright: ignore[reportPrivateUsage]
         for callback in callbacks:
             try:
                 await callback()

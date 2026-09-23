@@ -138,13 +138,14 @@ class Tag(SQLModelBase, UUIDTableBaseMixin, TrgmSearchableMixin, table=True):
 ```python
 from typing import Annotated
 from fastapi import Depends
+from sqlmodel_ext import query_dependency
 from sqlmodel_ext.mixins import TrgmSearchRequest
 
 @router.get("", response_model=ListResponse[TagResponse])
 async def list_tags(
     session: SessionDep,
-    table_view: Annotated[TableViewRequest, Depends()],
-    search: Annotated[TrgmSearchRequest, Depends()],
+    table_view: Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))],
+    search: Annotated[TrgmSearchRequest, Depends(query_dependency(TrgmSearchRequest))],
 ) -> ListResponse[Tag]:
     condition = search.apply_condition(Tag, col(Tag.name) != 'hidden')   # AND 进你已有的作用域条件
     return await Tag.get_with_count(session, condition, table_view=table_view)

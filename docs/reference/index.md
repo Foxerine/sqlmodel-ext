@@ -15,7 +15,7 @@ from sqlmodel_ext import (
     PolymorphicBaseMixin, AutoPolymorphicIdentityMixin,
     create_subclass_id_mixin,
     RelationPreloadMixin, requires_relations, requires_for_update,
-    ListResponse, TableViewRequest, PaginationRequest, TimeFilterRequest,
+    ListResponse, TableViewRequest, PaginationRequest, TimeFilterRequest, query_dependency,
     Str64, Port, HttpUrl, SafeHttpUrl, IPAddress, ...
 )
 ```
@@ -29,7 +29,7 @@ from sqlmodel_ext import (
 | [字段类型](./field-types) | `Str16`–`Text1M`、`Port`、`Percentage`、`PositiveInt`、`HttpUrl`、`SafeHttpUrl`、`IPAddress`、`Array[T]`、`JSON100K`、`NumpyVector` |
 | [Mixin 类](./mixins) | `CachedTableBaseMixin`、`OptimisticLockMixin`、`PolymorphicBaseMixin`、`AutoPolymorphicIdentityMixin`、`RelationPreloadMixin`、信息响应 Mixin |
 | [装饰器与辅助函数](./decorators) | `@requires_relations`、`@requires_for_update`、`rel()`、`cond()`、增强 `session.reset()` |
-| [分页类型](./pagination-types) | `ListResponse[T]`、`TableViewRequest`、`PaginationRequest`、`TimeFilterRequest` |
+| [分页类型](./pagination-types) | `ListResponse[T]`、`TableViewRequest`、`PaginationRequest`、`TimeFilterRequest`、`query_dependency()` |
 
 ## 常量
 

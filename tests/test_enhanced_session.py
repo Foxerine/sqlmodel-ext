@@ -30,9 +30,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession as _AsyncSessionBase
 from sqlmodel_ext import AsyncSession, SESSION_FOR_UPDATE_KEY, SQLModelBase, UUIDTableBaseMixin
 from sqlmodel_ext.mixins.cached_table import (
     _SESSION_CASCADE_DELETED_KEY,
+    _SESSION_COMMITTED_PENDING_KEY,
+    _SESSION_ENHANCED_COMMIT_KEY,
     _SESSION_FLUSHED_TABLES,
     _SESSION_PENDING_CACHE_KEY,
-    _SESSION_SYNCED_CACHE_KEY,
 )
 from sqlmodel_ext.mixins.table import SESSION_REPEATABLE_READ_KEY
 from sqlmodel_ext.session import (
@@ -76,15 +77,17 @@ async def test_commit_plain_model_degrades_to_plain_commit(
 async def test_reset_clears_tracking_state(enhanced_session: AsyncSession) -> None:
     enhanced_session.info[SESSION_FOR_UPDATE_KEY] = {123}
     enhanced_session.info[_SESSION_PENDING_CACHE_KEY] = {}
-    enhanced_session.info[_SESSION_SYNCED_CACHE_KEY] = {}
     enhanced_session.info[_SESSION_CASCADE_DELETED_KEY] = {}
+    enhanced_session.info[_SESSION_ENHANCED_COMMIT_KEY] = True
+    enhanced_session.info[_SESSION_COMMITTED_PENDING_KEY] = {}
 
     await enhanced_session.reset()
 
     assert SESSION_FOR_UPDATE_KEY not in enhanced_session.info
     assert _SESSION_PENDING_CACHE_KEY not in enhanced_session.info
-    assert _SESSION_SYNCED_CACHE_KEY not in enhanced_session.info
     assert _SESSION_CASCADE_DELETED_KEY not in enhanced_session.info
+    assert _SESSION_ENHANCED_COMMIT_KEY not in enhanced_session.info
+    assert _SESSION_COMMITTED_PENDING_KEY not in enhanced_session.info
 
 
 @pytest.mark.asyncio

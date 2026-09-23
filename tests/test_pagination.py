@@ -137,6 +137,15 @@ class TestPaginationRequest:
     def test_after_id_default_none(self) -> None:
         assert PaginationRequest().after_id is None
 
+    def test_cross_field_errors_are_located_at_after_id(self) -> None:
+        # The location is what ``query_dependency`` reports as ('query', 'after_id').
+        with pytest.raises(ValidationError) as offset_error:
+            PaginationRequest(after_id=uuid.uuid4(), offset=2)
+        assert [e['loc'] for e in offset_error.value.errors()] == [('after_id',)]
+        with pytest.raises(ValidationError) as order_error:
+            PaginationRequest(after_id=uuid.uuid4(), order="updated_at")
+        assert [e['loc'] for e in order_error.value.errors()] == [('after_id',)]
+
     def test_after_id_with_mutable_order_rejected(self) -> None:
         with pytest.raises(ValidationError, match="does not support order=updated_at"):
             PaginationRequest(after_id=uuid.uuid4(), order="updated_at")
@@ -221,6 +230,20 @@ class TestTimeFilterRequest:
                 created_after_datetime=_utc(2024, 3, 1),
                 updated_before_datetime=_utc(2024, 2, 1),
             )
+
+    def test_range_errors_are_located_at_the_before_field(self) -> None:
+        with pytest.raises(ValidationError) as created_error:
+            TimeFilterRequest(
+                created_after_datetime=_utc(2024, 2, 1),
+                created_before_datetime=_utc(2024, 1, 1),
+            )
+        assert [e['loc'] for e in created_error.value.errors()] == [('created_before_datetime',)]
+        with pytest.raises(ValidationError) as cross_error:
+            TimeFilterRequest(
+                created_after_datetime=_utc(2024, 3, 1),
+                updated_before_datetime=_utc(2024, 2, 1),
+            )
+        assert [e['loc'] for e in cross_error.value.errors()] == [('updated_before_datetime',)]
 
     def test_cross_type_valid_combination_accepted(self) -> None:
         tf = TimeFilterRequest(

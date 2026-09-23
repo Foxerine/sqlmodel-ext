@@ -64,10 +64,11 @@ if patch.subtitle is not Unset:
 from typing import Annotated
 from uuid import UUID
 from fastapi import APIRouter, Depends
-from sqlmodel_ext import ListResponse, TableViewRequest
+from sqlmodel_ext import ListResponse, TableViewRequest, query_dependency
 
 router = APIRouter(prefix="/articles", tags=["articles"])
-TableViewDep = Annotated[TableViewRequest, Depends()]
+# query_dependency()：跨字段校验失败（after_id + offset 等）是 422 而不是 500，见「给列表端点加分页」
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 
 @router.post("", response_model=ArticleResponse)
 async def create_article(
@@ -117,19 +118,11 @@ async def delete_article(
 
 ```python
 from fastapi import FastAPI, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 from sqlmodel_ext import OptimisticLockError
 from sqlmodel_ext.mixins import KeysetCursorError, ResourceReferencedError
 
 app = FastAPI()
-
-@app.exception_handler(ValidationError)          # 查询参数 DTO 的跨字段校验（after_id + offset 等）
-async def dto_validation_error_handler(request: Request, exc: ValidationError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={
-        "detail": jsonable_encoder(exc.errors(include_url=False, include_context=False)),
-    })
 
 @app.exception_handler(KeysetCursorError)        # 游标失效 / 不支持，status_code = 422
 async def keyset_error_handler(request: Request, exc: KeysetCursorError) -> JSONResponse:
@@ -144,7 +137,7 @@ async def oplock_handler(request: Request, exc: OptimisticLockError) -> JSONResp
     return JSONResponse(status_code=409, content={"detail": "数据已被其他人修改，请刷新后重试"})
 ```
 
-为什么需要第一个处理器：FastAPI 对 `Depends()` 类依赖逐个校验查询参数（单字段错误是 422），但跨字段的 `model_validator` 在 FastAPI 调用 `TableViewRequest(...)` 构造对象时才触发，不处理就是 500。
+查询参数 DTO 的跨字段校验不需要处理器：`query_dependency()` 已把它转成 FastAPI 的 `RequestValidationError`（422，位置以 `query` 开头）。若写成裸 `Depends()`，同样的错误会是 500——FastAPI 自己调用 `TableViewRequest(...)` 时抛出的 `ValidationError` 不在它的请求校验路径上。
 
 ## 关键约定
 

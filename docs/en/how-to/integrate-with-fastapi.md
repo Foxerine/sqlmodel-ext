@@ -64,10 +64,11 @@ if patch.subtitle is not Unset:
 from typing import Annotated
 from uuid import UUID
 from fastapi import APIRouter, Depends
-from sqlmodel_ext import ListResponse, TableViewRequest
+from sqlmodel_ext import ListResponse, TableViewRequest, query_dependency
 
 router = APIRouter(prefix="/articles", tags=["articles"])
-TableViewDep = Annotated[TableViewRequest, Depends()]
+# query_dependency(): a failed cross-field rule (after_id + offset, ...) is a 422, not a 500 -- see "Paginate a list endpoint"
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 
 @router.post("", response_model=ArticleResponse)
 async def create_article(
@@ -117,19 +118,11 @@ The `with_for_update=True` in the `delete` endpoint closes the TOCTOU window bet
 
 ```python
 from fastapi import FastAPI, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 from sqlmodel_ext import OptimisticLockError
 from sqlmodel_ext.mixins import KeysetCursorError, ResourceReferencedError
 
 app = FastAPI()
-
-@app.exception_handler(ValidationError)          # cross-field validation of query-parameter DTOs (after_id + offset, etc.)
-async def dto_validation_error_handler(request: Request, exc: ValidationError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={
-        "detail": jsonable_encoder(exc.errors(include_url=False, include_context=False)),
-    })
 
 @app.exception_handler(KeysetCursorError)        # cursor invalid / unsupported, status_code = 422
 async def keyset_error_handler(request: Request, exc: KeysetCursorError) -> JSONResponse:
@@ -144,7 +137,7 @@ async def oplock_handler(request: Request, exc: OptimisticLockError) -> JSONResp
     return JSONResponse(status_code=409, content={"detail": "Record was modified by someone else. Please refresh and retry."})
 ```
 
-Why the first handler is needed: FastAPI validates the query parameters of a `Depends()` class dependency one by one (single-field errors are 422), but a cross-field `model_validator` only fires when FastAPI calls `TableViewRequest(...)` to construct the object — left unhandled, that is a 500.
+Cross-field validation of query-parameter DTOs needs no handler: `query_dependency()` already turns it into FastAPI's `RequestValidationError` (422, locations starting with `query`). With a bare `Depends()` the same error would be a 500 — the `ValidationError` raised when FastAPI itself calls `TableViewRequest(...)` is outside its request-validation path.
 
 ## Key conventions
 

@@ -190,7 +190,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI
-from sqlmodel_ext import ListResponse, TableViewRequest
+from sqlmodel_ext import ListResponse, TableViewRequest, query_dependency
 
 from db import SessionDep, lifespan
 from models import (
@@ -200,7 +200,7 @@ from models import (
 )
 
 app = FastAPI(lifespan=lifespan)
-TableViewDep = Annotated[TableViewRequest, Depends()]
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 
 
 # ============ Users ============
@@ -407,7 +407,7 @@ On PostgreSQL you'd also reach for `JSON100K` (`from sqlmodel_ext.field_types.di
 | Bidirectional `Relationship` + `back_populates` | User ↔ Article ↔ Comment |
 | FK `index=True` | `author_id` / `article_id` |
 | FastAPI lifespan + `async_sessionmaker` | `db.py` |
-| `Annotated[..., Depends()]` for SessionDep / TableViewDep | `db.py` / `main.py` |
+| `Annotated[..., Depends(...)]` for SessionDep / TableViewDep (`query_dependency()`: cross-field errors are a 422) | `db.py` / `main.py` |
 | `get_exist_one()` auto-404 | every GET/PATCH/DELETE endpoint |
 | `partial=True` + `Unset`: PATCH semantics without bookkeeping | `ArticleUpdateRequest` / `update_article` |
 | `get_with_count()` + `ListResponse[T]`, offset or `after_id` keyset | `list_articles` |

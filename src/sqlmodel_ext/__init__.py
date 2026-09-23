@@ -66,6 +66,9 @@ from sqlmodel_ext.pagination import (
     TableViewRequest as TableViewRequest,
 )
 
+# FastAPI dependency for query-parameter DTOs (cross-field errors -> 422; requires the `fastapi` extra when called)
+from sqlmodel_ext.dependencies import query_dependency as query_dependency
+
 # Mixins
 from sqlmodel_ext.mixins import (
     # Table

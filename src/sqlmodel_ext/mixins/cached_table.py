@@ -143,8 +143,22 @@ _WRAPPER_CLASS_KEY = '_c'  # Actual class name (restores the correct subclass fo
 
 # session.info keys -- cache invalidation state tracking
 _SESSION_PENDING_CACHE_KEY = '_pending_cache_invalidation_types'
-_SESSION_SYNCED_CACHE_KEY = '_synced_cache_invalidation_types'
 _SESSION_CASCADE_DELETED_KEY = '_cascade_deleted_for_sync_invalidation'
+
+# Hand-over between the ``after_commit`` event and the enhanced
+# ``AsyncSession.commit()``. The enhanced commit sets
+# ``_SESSION_ENHANCED_COMMIT_KEY`` immediately before ``super().commit()`` and
+# removes it right after (``_begin_enhanced_commit`` / ``_end_enhanced_commit``).
+# While it is set, ``after_commit`` does NOT schedule the fire-and-forget
+# fallback compensation: it moves the pending dict it popped -- the complete
+# set as of the real commit, including entries registered during that
+# commit's own flush (cascade deletes, autoregistered mutations) -- into
+# ``_SESSION_COMMITTED_PENDING_KEY``, which the enhanced commit then
+# invalidates synchronously (``_flush_invalidations``). Without the flag
+# (a commit that bypassed the enhanced ``commit()``) the fallback
+# compensation still runs and logs a WARNING.
+_SESSION_ENHANCED_COMMIT_KEY = '_enhanced_commit_in_progress'
+_SESSION_COMMITTED_PENDING_KEY = '_committed_cache_invalidations'
 
 # Tables touched by writes that were already sent to the DB connection in this
 # transaction but are NOT yet committed -- a set[TableClause] fed by two entry
@@ -383,8 +397,9 @@ class CachedTableBaseMixin(TableBaseMixin):
         """Delete a cache key. Propagates Redis errors (caller decides whether to swallow).
 
         ``RuntimeError`` (client not configured) propagates. Other exceptions
-        also propagate so the sync invalidation path can detect failure,
-        skip marking the type as synced, and let the compensation path retry.
+        also propagate so each caller decides: the post-commit invalidation
+        (``_do_sync_invalidation``) logs them, ``invalidate_all(strict=True)``
+        re-raises.
         """
         await cls._get_client().delete(key)
 
@@ -579,14 +594,19 @@ class CachedTableBaseMixin(TableBaseMixin):
         Idempotent: repeated calls install the hooks only once (also called
         by ``configure_redis()``).
 
-        Limitation (fire-and-forget): ``after_commit`` handlers are synchronous
-        by SQLAlchemy contract and cannot ``await`` async invalidation.
-        ``loop.create_task()`` schedules a compensation task, leaving a tiny
-        window (typically < 1 ms) between commit return and cache clearing.
-        ``commit=True`` CRUD methods already invalidate synchronously during
-        ``await`` (no window), so this path only matters for
-        ``commit=False`` -> ``session.commit()``. TTL provides the eventual
-        consistency backstop.
+        Two outcomes of ``after_commit`` (see ``_SESSION_ENHANCED_COMMIT_KEY``):
+
+        - Commit through the enhanced ``AsyncSession.commit()`` (also
+          ``async with session.begin()`` and every ``commit=True`` CRUD
+          method): the popped pendings are handed over to that ``commit()``,
+          which invalidates them synchronously before returning -- no
+          fire-and-forget task, no WARNING, no second invalidation.
+        - Any other commit (a plain SQLAlchemy / SQLModel session,
+          ``run_sync(lambda s: s.commit())``): ``after_commit`` handlers are
+          synchronous by SQLAlchemy contract and cannot ``await``, so
+          ``loop.create_task()`` schedules a fallback compensation task and
+          logs a WARNING. This leaves a small window between commit return
+          and cache clearing; TTL is the eventual-consistency backstop.
         """
         if cls._commit_hook_registered:
             return
@@ -613,81 +633,23 @@ class CachedTableBaseMixin(TableBaseMixin):
             pending: dict[type, set[Any]] | None = session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
             if not pending:
                 return
-            loop = asyncio.get_running_loop()
-
-            # Create the sync-invalidation tracking dict for this commit cycle.
-            # After super() returns (i.e. after this handler runs), CRUD methods
-            # push their successfully-invalidated (type, instance_ids) pairs
-            # into this dict. The _compensate task then dedupes by instance_id
-            # and only compensates IDs that were not sync-invalidated.
-            synced: dict[type, set[Any]] = {}
-            session.info[_SESSION_SYNCED_CACHE_KEY] = synced
-
-            async def _compensate(
-                    to_invalidate: dict[type, set[Any]],
-                    already_synced: dict[type, set[Any]],
-            ) -> None:
-                sentinels = {_QUERY_ONLY_INVALIDATION, _FULL_MODEL_INVALIDATION}
-                for model_type, pending_ids in to_invalidate.items():
-                    if not issubclass(model_type, CachedTableBaseMixin):
-                        continue
-
-                    needs_full = _FULL_MODEL_INVALIDATION in pending_ids
-                    synced_ids = already_synced.get(model_type)
-
-                    if synced_ids is not None:
-                        # Sync path already invalidated this type (query cache covered).
-                        if needs_full and _FULL_MODEL_INVALIDATION not in synced_ids:
-                            # Pending includes the full-invalidation sentinel but
-                            # the sync path did not perform a full invalidation —
-                            # compensate at the model level now.
-                            try:
-                                await model_type._invalidate_for_model()
-                            except Exception:
-                                logger.exception(f"post-commit model-level invalidation failed ({model_type.__name__})")
-                            continue
-                        # Compensate only the ID caches that the sync path missed.
-                        remaining = pending_ids - synced_ids - sentinels
-                        if remaining:
-                            try:
-                                for _id in remaining:
-                                    await model_type._invalidate_id_cache(_id)
-                            except Exception:
-                                logger.exception(f"post-commit ID-cache invalidation failed ({model_type.__name__})")
-                        continue
-
-                    # This type was not touched by the sync path at all — full
-                    # compensation (non-migrated callers).
-                    logger.warning(
-                        f"fallback compensation triggered: {model_type.__name__} "
-                        f"did not go through the sync invalidation path "
-                        f"(pending_ids={len(pending_ids)}; this commit bypassed the "
-                        f"enhanced AsyncSession.commit() -- typically a "
-                        f"begin()/savepoint path, covered by this fallback)"
-                    )
-                    try:
-                        if needs_full:
-                            await model_type._invalidate_for_model()
-                        else:
-                            real_ids = pending_ids - sentinels
-                            has_query_only = _QUERY_ONLY_INVALIDATION in pending_ids
-                            if real_ids:
-                                for _id in real_ids:
-                                    await model_type._invalidate_id_cache(_id)
-                                await model_type._invalidate_query_caches()
-                            elif has_query_only:
-                                await model_type._invalidate_query_caches()
-                            else:
-                                await model_type._invalidate_for_model()
-                    except Exception:
-                        logger.exception(f"post-commit compensation failed ({model_type.__name__})")
-
-            # fire-and-forget: instance_ids handled by the sync path get deduped
-            # via `synced`; only commit=False accumulations that were not
-            # sync-invalidated end up being compensated here.
-            _task = loop.create_task(_compensate(pending, synced))
-            _COMPENSATE_TASKS.add(_task)
-            _task.add_done_callback(_COMPENSATE_TASKS.discard)
+            if session.info.get(_SESSION_ENHANCED_COMMIT_KEY):
+                # Inside the enhanced AsyncSession.commit(): hand the pendings
+                # over; that commit invalidates them synchronously right after
+                # super().commit() returns. Scheduling a task here instead is
+                # what used to race it -- the task ran during the awaits that
+                # finish super().commit() (connection release), before the
+                # synchronous path, and logged a spurious fallback WARNING
+                # plus a second invalidation.
+                handed_over: dict[type, set[Any]] = session.info.setdefault(_SESSION_COMMITTED_PENDING_KEY, {})
+                for model_type, ids in pending.items():
+                    handed_over.setdefault(model_type, set()).update(ids)
+                return
+            CachedTableBaseMixin._schedule_fallback_compensation(
+                pending,
+                "this commit bypassed the enhanced AsyncSession.commit() "
+                "(e.g. a plain SQLAlchemy/SQLModel session or run_sync(lambda s: s.commit()))",
+            )
 
         def _after_rollback_handler(session: _SyncSession) -> None:
             # SAVEPOINT awareness: ROLLBACK TO SAVEPOINT also fires after_rollback.
@@ -705,8 +667,10 @@ class CachedTableBaseMixin(TableBaseMixin):
                 return
             # Outermost rollback: everything was rolled back, nothing to
             # invalidate; clear pendings.
+            # (_SESSION_COMMITTED_PENDING_KEY is not touched: it only holds
+            # pendings of an already committed transaction, owned by the
+            # enhanced commit() that is consuming them.)
             session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
-            session.info.pop(_SESSION_SYNCED_CACHE_KEY, None)
             session.info.pop(_SESSION_CASCADE_DELETED_KEY, None)
             # The "tables with uncommitted writes" set is cleared centrally in
             # _on_outermost_transaction_end.
@@ -742,10 +706,12 @@ class CachedTableBaseMixin(TableBaseMixin):
             Each of those ``DELETE``s fires this event.
 
             Double-write strategy:
-            1. ``_SESSION_PENDING_CACHE_KEY`` -- after_commit compensation
-               path (fire-and-forget).
-            2. ``_SESSION_CASCADE_DELETED_KEY`` -- ``delete()`` sync path
-               (awaits invalidation with no window).
+            1. ``_SESSION_PENDING_CACHE_KEY`` -- popped by ``after_commit``
+               (handed over to the enhanced ``commit()``, or to the
+               fire-and-forget fallback for other commits).
+            2. ``_SESSION_CASCADE_DELETED_KEY`` -- drained by
+               ``_flush_invalidations`` after an enhanced commit (a subset
+               of 1 there; also cleared defensively by ``delete()``).
             """
             if isinstance(instance, CachedTableBaseMixin):
                 _id = getattr(instance, 'id', None)
@@ -2445,46 +2411,19 @@ class CachedTableBaseMixin(TableBaseMixin):
     # ================================================================
 
     @classmethod
-    async def _do_sync_invalidation(
-            cls,
-            session: AsyncSession,
-            captured_ids: set[Any],
-    ) -> None:
-        """Internal implementation of post-commit sync invalidation.
+    async def _do_sync_invalidation(cls, captured_ids: set[Any]) -> None:
+        """Invalidate ``cls``'s caches for the pending IDs of a committed transaction.
 
-        Checks whether ``pending`` has already been consumed by ``after_commit``
-        and, if so, runs sync invalidation and marks the type as ``synced``.
+        Redis failures are logged, not raised (the database has already
+        committed); the affected entries converge when their TTL expires.
 
-        ``synced`` is marked BEFORE issuing Redis calls to eliminate the race
-        with the fire-and-forget ``_compensate`` task: ``after_commit``
-        schedules ``_compensate`` via ``create_task``, which may be picked up
-        by the event loop while this method awaits Redis. If ``synced`` were
-        marked after the Redis call, ``_compensate`` would misclassify this
-        type as "did not go through the sync path" and emit a fallback
-        WARNING. Marking first closes the window.
-
-        Redis-failure correctness: marking ``synced`` first means
-        ``_compensate`` will not fallback, but its fallback also calls Redis
-        and would fail anyway when Redis is down. TTL provides eventual
-        consistency in that case.
-
-        :param session: the async session
-        :param captured_ids: the set of pending IDs snapshotted before commit
-            (may contain sentinels).
+        :param captured_ids: the committed pending IDs of ``cls`` (may contain
+            the ``_QUERY_ONLY_INVALIDATION`` / ``_FULL_MODEL_INVALIDATION``
+            sentinels).
         """
-        current_pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
-        if current_pending and cls in current_pending:
-            return  # pending not yet consumed (commit hasn't happened) -- skip
-
         sentinels = {_QUERY_ONLY_INVALIDATION, _FULL_MODEL_INVALIDATION}
         real_ids = captured_ids - sentinels
         needs_full = _FULL_MODEL_INVALIDATION in captured_ids
-
-        # Mark synced before issuing Redis calls to prevent _compensate from
-        # racing us on the next await point.
-        synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-        if isinstance(synced, dict):
-            synced.setdefault(cls, set()).update(captured_ids)
 
         try:
             if needs_full:
@@ -2504,75 +2443,117 @@ class CachedTableBaseMixin(TableBaseMixin):
     # ================================================================
 
     @staticmethod
-    def _capture_session_pending(session: AsyncSession) -> dict[type, set[Any]]:
-        """Snapshot the pending invalidations accumulated in ``session.info`` before commit.
+    def _schedule_fallback_compensation(pending: dict[type, set[Any]], reason: str) -> None:
+        """Invalidate committed ``pending`` in a fire-and-forget task, logging a WARNING per cached type.
 
-        The ``after_commit`` event pops the whole pending dict during commit,
-        so it must be snapshotted beforehand for the post-commit sync
-        invalidation. Returns an empty dict when nothing is pending.
+        Used when the synchronous path of the enhanced ``commit()`` will not
+        run for these pendings: a commit that bypassed the enhanced
+        ``commit()`` (``after_commit`` without ``_SESSION_ENHANCED_COMMIT_KEY``),
+        or an enhanced commit that failed / was cancelled after the database
+        had committed. Must be called with a running event loop (both callers
+        run inside the async session's greenlet or coroutine). No-op for an
+        empty ``pending``.
+
+        :param pending: committed pending invalidations (``dict[type, set[id | sentinel]]``)
+        :param reason: why the synchronous path was skipped (goes into the WARNING)
         """
-        pending = session.info.get(_SESSION_PENDING_CACHE_KEY)
         if not pending:
-            return {}
-        return {k: set(v) for k, v in pending.items()}
+            return
+
+        async def _compensate() -> None:
+            for model_type, pending_ids in pending.items():
+                if not issubclass(model_type, CachedTableBaseMixin):
+                    continue
+                logger.warning(
+                    f"fallback compensation triggered: {model_type.__name__} "
+                    f"did not go through the sync invalidation path "
+                    f"(pending_ids={len(pending_ids)}; {reason})"
+                )
+                await model_type._do_sync_invalidation(pending_ids)
+
+        task = asyncio.get_running_loop().create_task(_compensate())
+        _COMPENSATE_TASKS.add(task)
+        task.add_done_callback(_COMPENSATE_TASKS.discard)
+
+    @staticmethod
+    def _begin_enhanced_commit(session: AsyncSession) -> None:
+        """Mark that ``session`` is inside the enhanced ``commit()`` (right before ``super().commit()``).
+
+        While the mark is set, the ``after_commit`` event hands the popped
+        pendings over via ``_SESSION_COMMITTED_PENDING_KEY`` instead of
+        scheduling the fallback compensation. Must be paired with
+        ``_end_enhanced_commit`` on every exit of ``super().commit()``.
+        """
+        session.info[_SESSION_ENHANCED_COMMIT_KEY] = True
+
+    @staticmethod
+    def _end_enhanced_commit(session: AsyncSession) -> dict[type, set[Any]]:
+        """Clear the mark set by ``_begin_enhanced_commit`` and take the hand-over.
+
+        :returns: the pendings ``after_commit`` popped during this
+            ``super().commit()`` -- empty when nothing was pending, or when
+            ``after_commit`` did not fire (the commit failed before the
+            database committed)
+        """
+        session.info.pop(_SESSION_ENHANCED_COMMIT_KEY, None)
+        committed: dict[type, set[Any]] | None = session.info.pop(_SESSION_COMMITTED_PENDING_KEY, None)
+        return committed if committed is not None else {}
 
     @staticmethod
     async def _flush_invalidations(
             session: AsyncSession,
-            captured: dict[type, set[Any]],
+            committed: dict[type, set[Any]],
     ) -> None:
-        """Post-commit sync invalidation: ``captured`` (pre-commit pendings) + cascade children.
+        """Post-commit sync invalidation of the pendings of the transaction the enhanced ``commit()`` just committed.
 
-        Covers two invalidation sources:
+        Sources:
 
-        1. ``captured`` -- entries registered by CRUD methods via
-           ``_register_pending_invalidation`` before commit (explicit IDs, the
-           ``_QUERY_ONLY_INVALIDATION`` sentinel for new rows, the
-           ``_FULL_MODEL_INVALIDATION`` sentinel for condition deletes, and
-           ``delete()``'s pre-queried ``passive_deletes=True`` targets).
-        2. ``_SESSION_CASCADE_DELETED_KEY`` -- ``passive_deletes=False``
-           cascade children, pushed by the ``persistent_to_deleted`` event
-           during ``super().commit()``'s flush (i.e. after the ``captured``
-           snapshot point). ``after_commit`` does not pop this key, so it is
-           drained here to keep cascades on the sync path (otherwise they
-           would fall back to fire-and-forget compensation, reopening the
-           stale window).
+        1. ``committed`` -- the pending dict ``after_commit`` popped during
+           ``super().commit()`` (``_end_enhanced_commit``). It is complete as
+           of the real commit: entries registered by CRUD methods before the
+           commit (explicit IDs, the ``_QUERY_ONLY_INVALIDATION`` sentinel for
+           new rows, the ``_FULL_MODEL_INVALIDATION`` sentinel for condition
+           deletes, ``delete()``'s pre-queried ``passive_deletes=True``
+           targets, autoregistered bare mutations) **and** entries registered
+           during that commit's own flush (``persistent_to_deleted`` cascade
+           children).
+        2. ``_SESSION_CASCADE_DELETED_KEY`` -- the same cascade children,
+           recorded a second time by ``persistent_to_deleted``; a subset of 1
+           here, drained so it does not leak into the next transaction (the
+           set union deduplicates).
 
-        Race with the fire-and-forget ``_compensate`` task: first mark ALL
-        types as synced in one awaitless pass, then await
-        ``_do_sync_invalidation`` per type -- otherwise an await point could
-        let ``_compensate`` misclassify a not-yet-marked type as "did not go
-        through the sync path" and emit a fallback WARNING (same rationale as
-        ``_do_sync_invalidation``).
+        No fire-and-forget task exists for these pendings, so each type is
+        invalidated exactly once. If this coroutine is interrupted (e.g.
+        cancelled) the types not yet invalidated are handed to the fallback
+        compensation before the exception propagates.
 
         Zero-cost return when nothing is pending and no cascade occurred
         (equivalent to a plain commit).
         """
         cascade: dict[type, set[Any]] | None = session.info.pop(_SESSION_CASCADE_DELETED_KEY, None)
-        if not captured and not cascade:
+        if not committed and not cascade:
             return
 
-        # Merge both sources. captured's passive=True targets and cascade's
-        # passive=False children never overlap by construction, but the set
-        # union deduplicates harmlessly anyway.
-        merged: dict[type, set[Any]] = {k: set(v) for k, v in captured.items()}
+        merged: dict[type, set[Any]] = {k: set(v) for k, v in committed.items()}
         if cascade:
             for mt, ids in cascade.items():
                 merged.setdefault(mt, set()).update(ids)
 
-        # Mark synced first in one awaitless pass to close the _compensate
-        # race. Pending dict keys are always model types, so issubclass is
-        # enough to decide whether a type is cached.
-        synced = session.info.get(_SESSION_SYNCED_CACHE_KEY)
-        if isinstance(synced, dict):
-            for mt, ids in merged.items():
-                if issubclass(mt, CachedTableBaseMixin):
-                    synced.setdefault(mt, set()).update(ids)
-
-        # Sync-invalidate every type that inherits CachedTableBaseMixin.
-        for mt, ids in merged.items():
-            if issubclass(mt, CachedTableBaseMixin):
-                await mt._do_sync_invalidation(session, ids)
+        # Pending dict keys are always model types, so issubclass is enough
+        # to decide whether a type is cached.
+        remaining: dict[type[CachedTableBaseMixin], set[Any]] = {
+            mt: ids for mt, ids in merged.items() if issubclass(mt, CachedTableBaseMixin)
+        }
+        try:
+            while remaining:
+                mt = next(iter(remaining))
+                await mt._do_sync_invalidation(remaining[mt])
+                del remaining[mt]
+        except BaseException:
+            CachedTableBaseMixin._schedule_fallback_compensation(
+                remaining, "the enhanced AsyncSession.commit() was interrupted after the database committed",
+            )
+            raise
 
     @staticmethod
     def _clear_session_cache_state(session: AsyncSession) -> None:
@@ -2583,15 +2564,17 @@ class CachedTableBaseMixin(TableBaseMixin):
         async ``invalidate()`` bypasses them entirely. Transaction-level state
         (such as ``_SESSION_FLUSHED_TABLES``) is therefore cleared in the
         always-on ``_on_outermost_transaction_end`` listener -- do not
-        add more keys here. The three invalidation-tracking keys cleared here
-        are normally consumed by ``after_commit`` / cleared by
-        ``after_rollback``; this is an idempotent fallback for a reset without
-        an active transaction and for the startup window before the event
-        hooks are installed.
+        add more keys here. The invalidation-tracking keys cleared here are
+        normally consumed by ``after_commit`` / cleared by ``after_rollback``
+        (and the enhanced-commit hand-over keys by ``_end_enhanced_commit``);
+        this is an idempotent fallback for a reset without an active
+        transaction and for the startup window before the event hooks are
+        installed.
         """
         session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
-        session.info.pop(_SESSION_SYNCED_CACHE_KEY, None)
         session.info.pop(_SESSION_CASCADE_DELETED_KEY, None)
+        session.info.pop(_SESSION_ENHANCED_COMMIT_KEY, None)
+        session.info.pop(_SESSION_COMMITTED_PENDING_KEY, None)
 
     # ================================================================
     #  Misuse hardening

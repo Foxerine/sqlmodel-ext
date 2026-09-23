@@ -343,7 +343,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import Field
 from sqlmodel_ext import (
     AsyncSession, SQLModelBase, UUIDTableBaseMixin, Str64, Text10K,
-    ListResponse, TableViewRequest, UUIDIdDatetimeInfoMixin,
+    ListResponse, TableViewRequest, UUIDIdDatetimeInfoMixin, query_dependency,
 )
 
 # ── Dependency-injection layer: declare once (e.g. in a shared
@@ -359,9 +359,10 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 """Request-scoped AsyncSession. The single way endpoints touch the DB."""
 
-# TableViewRequest is a Pydantic model → FastAPI binds its fields as
-# query params automatically. No hand-written offset/limit/order plumbing.
-TableViewRequestDep = Annotated[TableViewRequest, Depends()]
+# query_dependency() binds every TableViewRequest field as a query param
+# (no hand-written offset/limit/order plumbing) and turns cross-field errors
+# (e.g. after_id + offset) into a 422 instead of a 500.
+TableViewRequestDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 
 async def get_current_user(session: SessionDep) -> "User":
     ...  # decode the bearer token, load the user — your auth, unchanged

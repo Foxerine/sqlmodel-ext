@@ -190,7 +190,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI
-from sqlmodel_ext import ListResponse, TableViewRequest
+from sqlmodel_ext import ListResponse, TableViewRequest, query_dependency
 
 from db import SessionDep, lifespan
 from models import (
@@ -200,7 +200,7 @@ from models import (
 )
 
 app = FastAPI(lifespan=lifespan)
-TableViewDep = Annotated[TableViewRequest, Depends()]
+TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 
 
 # ============ Users ============
@@ -407,7 +407,7 @@ class Article(OptimisticLockMixin, ArticleBase, UUIDTableBaseMixin, table=True):
 | 双向 `Relationship` + `back_populates` | User ↔ Article ↔ Comment |
 | 外键 `index=True` | `author_id` / `article_id` |
 | FastAPI lifespan + `async_sessionmaker` | `db.py` |
-| `Annotated[..., Depends()]` 创建 SessionDep / TableViewDep | `db.py` / `main.py` |
+| `Annotated[..., Depends(...)]` 创建 SessionDep / TableViewDep（`query_dependency()`：跨字段错误是 422） | `db.py` / `main.py` |
 | `get_exist_one()` 自动 404 | 所有 GET/PATCH/DELETE 端点 |
 | `partial=True` + `Unset`：无需簿记的 PATCH 语义 | `ArticleUpdateRequest` / `update_article` |
 | `get_with_count()` + `ListResponse[T]`，offset 或 `after_id` keyset | `list_articles` |

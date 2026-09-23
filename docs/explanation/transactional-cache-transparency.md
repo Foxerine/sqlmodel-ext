@@ -95,14 +95,13 @@ await session.commit()                                  # 增强 commit 同步�
 CRUD 方法（`save` / `update` / `delete` / `add`）自己**不失效**，只把待失效项登记到 `session.info`。增强 `AsyncSession.commit()` 负责编排：
 
 1. 自动登记 session 里所有缓存模型的变更（覆盖绕过 CRUD 方法的裸 `add` / 改属性 / `delete`）
-2. 快照待失效项（`after_commit` 事件会在 commit 中把它们弹出）
-3. 真正 commit
-4. 同步失效快照项 + 本次 flush 中级联删除的子项
-5. 执行 post-commit 回调
+2. 真正 commit。`after_commit` 事件弹出完整的登记项——包括本次 commit 自身 flush 期间登记的（如级联删除的子项）——并移交给 `commit()`
+3. 同步失效移交来的登记项，每项恰好一次
+4. 执行 post-commit 回调
 
 `commit=False` 时什么都不失效（数据还没提交），登记项留到你最终的 `session.commit()`——"多个 `commit=False` 操作 + 一次 commit"天然正确。rollback 丢弃登记项。
 
-`after_commit` 事件上还挂着一个 fire-and-forget 补偿任务，覆盖没有经过增强 `commit()` 的提交路径（例如普通 sqlmodel session）；它按 ID 去重，只补同步路径没有覆盖的部分。
+没有经过增强 `commit()` 的提交（例如普通 sqlmodel session，或 `run_sync(lambda s: s.commit())`），`after_commit` 事件改为调度一个 fire-and-forget 补偿任务，失效弹出的登记项并记录 `WARNING` "fallback compensation triggered: ..."——存在短暂的 stale 窗口，TTL 提供最终一致性。增强 `commit()` 在数据库已提交之后失败或被取消时，同样由这个兜底接手。经过增强 session 的提交不会出现这条告警。
 
 ### savepoint
 

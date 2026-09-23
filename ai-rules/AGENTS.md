@@ -199,6 +199,10 @@ data = patch.model_dump(exclude_unset=True)
 - List endpoints take a `TableViewRequest` (`offset` / `limit` / `order` /
   `desc` / `after_id` + time bounds). `after_id` cannot be combined with
   `offset`, custom `order_by` or `join`.
+- Inject query-parameter DTOs with
+  `Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]`,
+  never a bare `Depends()` (a failed cross-field rule would be a 500 instead
+  of a 422).
 
 ## 7. Relationships: always preload
 

@@ -37,7 +37,7 @@ next_page = await Article.get(
 
 Repeat until the returned list is empty. `get_with_count()` accepts `after_id` as well; the `count` it returns is the size of the whole filtered set and is **not affected by the cursor**.
 
-In FastAPI the endpoint code doesn't change: with `TableViewRequest` as a dependency, the client simply passes `?after_id=<id of the last row of the previous page>&limit=20` (remember to register the handler that maps `ValidationError` to 422, see the constraints table below).
+In FastAPI the endpoint code doesn't change: with `TableViewRequest` as a dependency, the client simply passes `?after_id=<id of the last row of the previous page>&limit=20` (declare the dependency with `query_dependency(TableViewRequest)` so the rejected combinations below are a 422, see [Paginate a list endpoint](./paginate-a-list-endpoint#why-query-dependency)).
 
 ## How it guarantees no duplicates and no gaps
 
@@ -49,8 +49,8 @@ In FastAPI the endpoint code doesn't change: with `TableViewRequest` as a depend
 
 | Combination | When rejected | Error |
 |------|---------|------|
-| `after_id` + non-zero `offset` | When constructing `TableViewRequest` | `ValidationError` (in a FastAPI dependency it must be mapped to 422, see [Paginate a list endpoint](./paginate-a-list-endpoint#map-cross-field-validation-errors-to-422)) |
-| `after_id` + `order='updated_at'` (or any mutable domain sort column) | At construction | `ValidationError` |
+| `after_id` + non-zero `offset` | When constructing `TableViewRequest` | `ValidationError` at `after_id` (through `query_dependency()`: 422 at `["query", "after_id"]`) |
+| `after_id` + `order='updated_at'` (or any mutable domain sort column) | At construction | `ValidationError` at `after_id` (422 through `query_dependency()`) |
 | `after_id` + explicit `order_by=` | At `get()` | `KeysetCursorUnsupportedError` |
 | `after_id` + `join=` | At `get()` | `KeysetCursorUnsupportedError` |
 | Anchor does not exist, or is outside this query's visible scope (`condition` + `filter` + STI filter) | At `get()` | `KeysetCursorInvalidError` |
