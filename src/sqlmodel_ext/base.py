@@ -352,9 +352,13 @@ Excluded on purpose:
 """
 
 
-def _hoist_field_metadata(union_ann: typing.Any, original_ann: typing.Any) -> typing.Any:
+_DEFAULT_FIELD_INFO: typing.Final = FieldInfo()
+"""Reference ``FieldInfo`` for "attribute left at its default" (e.g. ``repr`` defaults to ``True``, not ``None``)."""
+
+
+def _hoist_field_metadata(union_ann: typing.Any, base_field: FieldInfo) -> typing.Any:
     """
-    Hoist field-level ``FieldInfo`` attributes from ``original_ann`` to outside the union.
+    Hoist the base field's field-level attributes to outside the union.
 
     In ``Unset | Annotated[T, *meta]`` the metadata is attached to one union
     member. ``annotated_types`` constraints (``Ge`` / ``MaxLen`` ...) still work
@@ -366,26 +370,23 @@ def _hoist_field_metadata(union_ann: typing.Any, original_ann: typing.Any) -> ty
     Pydantic picks the field-level attributes up from the outer layer, while
     the inner layer is untouched (constraints stay bound to the real value type).
 
-    Only attributes of ``FieldInfo`` metadata are hoisted. Other metadata such as
-    custom schema handlers must stay where they are: their
-    ``__get_pydantic_core_schema__`` expects ``source_type`` to be their own
-    alias, not a union.
+    The attributes are read from the base class's **resolved** ``FieldInfo``
+    (``model_fields[name]``), not from the annotation: the resolved field has
+    already merged every place the author could have written them --
+    ``Annotated[T, Field(alias=...)]``, ``x: T = Field(alias=...)`` and mixes of
+    the two -- so it is the single source of truth. Only attributes that differ
+    from a default ``FieldInfo()`` are carried.
 
-    :param union_ann: the already-built ``Unset | original_ann``
-    :param original_ann: the original annotation, to read metadata from
+    :param union_ann: the already-built ``Unset | <annotation>``
+    :param base_field: the base class's resolved ``FieldInfo`` for this field
     :returns: ``union_ann`` unchanged when there is nothing to hoist, otherwise
         ``union_ann`` wrapped in ``Annotated`` with a ``Field`` carrying the hoisted attributes
     """
-    if get_origin(original_ann) is not typing.Annotated:
-        return union_ann
     carried: dict[str, typing.Any] = {}
-    for meta in get_args(original_ann)[1:]:
-        if not isinstance(meta, FieldInfo):
-            continue
-        for attr in _UNION_INCOMPATIBLE_FIELD_ATTRS:
-            value = getattr(meta, attr, None)
-            if value is not None:
-                carried[attr] = value
+    for attr in _UNION_INCOMPATIBLE_FIELD_ATTRS:
+        value = getattr(base_field, attr, None)
+        if value is not None and value != getattr(_DEFAULT_FIELD_INFO, attr, None):
+            carried[attr] = value
     if not carried:
         return union_ann
     return typing.Annotated[tuple([union_ann, Field(**carried)])]
@@ -467,21 +468,25 @@ def _apply_partial(
         if original_ann is None:
             continue
 
+        # The base class's resolved field: the single source of truth for what
+        # the author declared, whichever syntax was used.
+        base_field_info: FieldInfo | None = None
+        for base in bases:
+            base_model_fields = getattr(base, 'model_fields', None)
+            if base_model_fields and field_name in base_model_fields:
+                base_field_info = base_model_fields[field_name]
+                break
+        if base_field_info is None:
+            continue
+
         # When a field is declared as ``field: T = Field(gt=..., le=...)`` (non-Annotated form),
         # MRO ``__annotations__`` only stores the bare ``T``; the constraints live on the
-        # right-hand-side assignment. Pull them from the base class's resolved
-        # ``model_fields[name].metadata`` (``[Gt(0), Le(600), ...]``) and re-wrap into
-        # ``Annotated[T, *metadata]`` so the derived field keeps them.
-        if get_origin(original_ann) is not typing.Annotated:
-            for base in bases:
-                base_model_fields = getattr(base, 'model_fields', None)
-                if not base_model_fields:
-                    continue
-                base_field_info = base_model_fields.get(field_name)
-                if base_field_info is None or not base_field_info.metadata:
-                    continue
-                original_ann = typing.Annotated[original_ann, *base_field_info.metadata]
-                break
+        # right-hand-side assignment. Pull them from the resolved ``metadata``
+        # (``[Gt(0), Le(600), ...]``) and re-wrap into ``Annotated[T, *metadata]``
+        # so the derived field keeps them. (Field-level attributes such as
+        # ``alias`` / ``exclude`` are not in ``metadata``; they are hoisted below.)
+        if get_origin(original_ann) is not typing.Annotated and base_field_info.metadata:
+            original_ann = typing.Annotated[original_ann, *base_field_info.metadata]
 
         # Skip Literal fields (e.g. discriminators): making them omissible breaks
         # Pydantic discriminated unions.
@@ -493,7 +498,7 @@ def _apply_partial(
 
         # Field-level attributes (exclude / alias / ...) do not work on a union
         # member and would be silently dropped -- hoist them outside the union.
-        annotations[field_name] = _hoist_field_metadata(Unset | original_ann, original_ann)
+        annotations[field_name] = _hoist_field_metadata(Unset | original_ann, base_field_info)
         if field_name not in attrs:
             attrs[field_name] = Unset
 

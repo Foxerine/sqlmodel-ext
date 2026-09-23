@@ -406,8 +406,10 @@ async def test_cache_roundtrip_preserves_datetime_and_uuid(
     engine: AsyncEngine,
     sql_log: list[str],
 ) -> None:
-    # sqlmodel >= 0.0.46 rejects naive datetimes on write; the library's own
-    # timestamps are UTC-aware, so the round-trip is asserted on an aware value.
+    # sqlmodel >= 0.0.46 rejects naive datetimes on write, so write an aware
+    # value. Whether SQLite hands it back aware depends on the sqlmodel version,
+    # so the cache round-trip is asserted against the DB-loaded value -- that
+    # is the property under test -- not against the literal written.
     moment = datetime(2024, 5, 17, 12, 30, 45, 123456, tzinfo=UTC)
     ref = uuid.uuid4()
     event_row = await CacheEvent(title="launch", happened_at=moment, ref_id=ref).save(cache_session)
@@ -429,7 +431,9 @@ async def test_cache_roundtrip_preserves_datetime_and_uuid(
     assert from_cache is not None
     assert isinstance(from_cache.id, uuid.UUID) and from_cache.id == eid
     assert isinstance(from_cache.ref_id, uuid.UUID) and from_cache.ref_id == ref
-    assert isinstance(from_cache.happened_at, datetime) and from_cache.happened_at == moment
+    assert isinstance(from_cache.happened_at, datetime)
+    assert from_cache.happened_at == from_db.happened_at
+    assert from_cache.happened_at.replace(tzinfo=None) == moment.replace(tzinfo=None)
     assert from_cache.title == "launch"
     assert from_cache.created_at == from_db.created_at
     assert from_cache.updated_at == from_db.updated_at
