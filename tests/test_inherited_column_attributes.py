@@ -19,6 +19,7 @@ Criteria:
 """
 from __future__ import annotations
 
+import sys
 from typing import Annotated, Any
 
 import pytest
@@ -223,15 +224,26 @@ _PLAIN_SQLMODEL_DROPS: dict[tuple[str, str], dict[str, Any]] = {
 }
 """Column facts plain SQLModel gets wrong for the same declaration (the library recovers them)."""
 
+_RECOVERED_FOR_PLAIN_SQLMODEL_ON_314: frozenset[tuple[str, str]] = frozenset({("InhColExt", "al_big")})
+"""Entries of ``_PLAIN_SQLMODEL_DROPS`` that plain SQLModel gets right on Python 3.14+.
+
+There ``sqlmodel_ext._compat`` replaces ``sqlmodel.main.get_sqlalchemy_type``
+process-wide, and the replacement reads ``sa_type`` from every metadata carrier,
+so a plain SQLModel class in the same process keeps the alias's ``sa_type`` too."""
+
 
 @pytest.mark.parametrize(("pure", "ext", "column"), _CASES)
 def test_column_matches_plain_sqlmodel(pure: type[SQLModel], ext: type[SQLModel], column: str) -> None:
     ext_facts = _column_facts(_table_column(ext, column))
     pure_facts = _column_facts(_table_column(pure, column))
     recovered = _PLAIN_SQLMODEL_DROPS.get((ext.__name__, column), {})
+    patched_on_314 = sys.version_info >= (3, 14) and (ext.__name__, column) in _RECOVERED_FOR_PLAIN_SQLMODEL_ON_314
     for key, value in recovered.items():
         assert ext_facts.pop(key) == value
-        assert pure_facts.pop(key) != value
+        if patched_on_314:
+            assert pure_facts.pop(key) == value
+        else:
+            assert pure_facts.pop(key) != value
     assert ext_facts == pure_facts
 
 
