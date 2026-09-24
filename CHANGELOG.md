@@ -7,6 +7,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > there is no stability or backward-compatibility guarantee between versions, and
 > you use it at your own risk. Pin the exact version you depend on.
 
+## [0.5.2]
+
+### Fixed
+
+- A table class field declared with a type alias and a plain right-hand value
+  (`x: NonNegativeDecimal38_18 = Decimal(0)`, `s: Str64 = 'a'`) had its default only in
+  `model_fields`: the JSON schema listed the field as `required` with no `default`, and
+  `model_validate({})` rejected the payload with "Field required". With an alias that
+  carries its own default (`opt: OptionalNonNegativeDecimal38_18 = Decimal(1)`),
+  `model_fields` even showed the alias's default (`None`) instead of the declared one.
+  The metaclass set the value on the field after constructing it, so Pydantic did not
+  count it as set when it built the core schema. A metaclass rebuild (an inherited field
+  description, a relationship) hid the defect in some classes. The same applied to a
+  field re-declared in the table class body without a right-hand side, which takes the
+  base's default. The table class now matches a non-table class with the same
+  declaration (schema, validation and `model_fields`). Non-table classes and fields the
+  table class inherits without re-declaring were not affected. Also present in 0.5.0
+  and 0.5.1.
+- **Behavior change.** A table class field declared with **several** `Field(...)` in one
+  `Annotated` and no right-hand side (`value: Legacy` with
+  `Legacy = Annotated[str, Field(alias='legacy', title='T'), Field(unique=True)]`, or a
+  nested alias such as `Annotated[Str64, Field(unique=True)]`) now gets its Pydantic
+  attributes as Pydantic merges them -- the same field a non-table class, plain
+  SQLModel and a table class inheriting the declaration already got. A later `Field`
+  overrides an earlier one, `None` included, and sqlmodel's `Field()` passes
+  `alias` / `validation_alias` / `serialization_alias` / `title` / `description` /
+  `default_factory` / `discriminator` / `exclude` explicitly as `None` and `repr` as
+  `True`. So when an earlier `Field` of the annotation sets any of these and a later
+  one does not, the table class no longer keeps the earlier value: the alias / title /
+  description are gone, and a `default_factory` is dropped, which makes the field
+  **required**. A `default` is not affected (sqlmodel's `Field()` does not pass it).
+  None of the bundled aliases combines several `Field`s or sets such an attribute. To keep the value, set it in the last `Field` or on a right-hand
+  `= Field(...)`. The same holds for a non-table class whose field needs an injected
+  `sa_type` (`Annotated[FilePathType, Field(alias='p'), Field(index=True)]`), which kept
+  the earlier `alias` too. The same path also applied the `Field` of an alias nested in a
+  union with no right-hand side, which Pydantic does not merge at field level:
+  `x: OptionalNonNegativeDecimal38_18 | None` declared in a table class had
+  `default=None`; it is now **required**, as it already was in a non-table class, when
+  inherited, and with a right-hand `Field` that sets no default (0.5.1). Drop the
+  redundant `| None` or write `= None`. The column attributes of all the declaration's `Field`s are
+  still folded into the column, now with the precedence Pydantic uses for the Pydantic
+  attributes: the right-hand `Field` first, then the annotation's `Field`s from the last
+  to the first; `False` still never switches off `True`. So a table class **inheriting**
+  such a declaration agrees with one declaring it directly:
+  `Annotated[NonNegativeDecimal38_18, Field(sa_type=Numeric(20, 2))]` gives
+  `NUMERIC(20, 2)` in both (inheriting it gave `NUMERIC(38, 18)`, the alias's
+  `sa_type`). Plain SQLModel, which reads only the first carrier, still gives
+  `NUMERIC(38, 18)`. Also present in 0.5.0 and 0.5.1.
+
 ## [0.5.1]
 
 ### Added

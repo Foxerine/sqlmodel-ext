@@ -142,7 +142,7 @@ _own_annotation_names = frozenset(annotations)
 
 ### 第 4.5 步：恢复 `Annotated[T, Field(...)]` 中的 SQLModel 属性
 
-Pydantic v2 处理 `Annotated` 元数据时会把 `sqlmodel.main.FieldInfo` 换成 `pydantic.fields.FieldInfo`，后者不认识 `foreign_key`、`sa_type` 等 SQLModel 属性。`_recover_annotated_sqlmodel_fields()` 对 **table 类**（包括从父类继承来的 `Annotated` 字段）把它们还原成 `= Field(...)` 形式；非 table 类保留原样，供子 table 类继承。合并多个 `FieldInfo` 时，显式的 `default=None` 被当作真实的值（而不是"未设置"）保留——否则字段会静默变成必填。带右侧 `Field` 的字段（`name: Alias = Field(...)`）以 Pydantic 对该声明的解析结果为准重建——table 类自己声明时用 `FieldInfo.from_annotated_attribute()`，table 类**继承**（未在类体里重新声明）时用基类已解析的字段 `Base.model_fields[name]`。两者得到同一个字段：Pydantic 层属性原样采用（显式的 `alias=None` 仍是 `None`，与纯 SQLModel 一致），只补全列属性——别名的 `Field` 与右侧 `Field` 各自的 `FieldInfoMetadata` 载体被折叠成一个，因为 SQLModel 只读第一个。仍留在类注解里的元数据（例如与别名 `Field` 并列的 `AfterValidator`）不会再复制进字段，因此只执行一次。
+Pydantic v2 处理 `Annotated` 元数据时会把 `sqlmodel.main.FieldInfo` 换成 `pydantic.fields.FieldInfo`，后者不认识 `foreign_key`、`sa_type` 等 SQLModel 属性。`_recover_annotated_sqlmodel_fields()` 对 **table 类**（包括从父类继承来的 `Annotated` 字段）把它们还原成 `= Field(...)` 形式；非 table 类保留原样，供子 table 类继承。每个这样的字段都以 **Pydantic 对该声明自己的解析结果**为准重建——也就是同一份声明写在非 table 类（或纯 SQLModel）里得到的字段：table 类自己声明且带右侧值（`= Field(...)` 或 `= 'a'` 这样的普通值）时用 `FieldInfo.from_annotated_attribute()`，自己声明但没有右侧值时用 `FieldInfo.from_annotation()`，table 类**继承**（未在类体里重新声明）时用基类已解析的字段 `Base.model_fields[name]`。Pydantic 层属性原样采用。同一个 `Annotated` 里的多个 `Field` 按 Pydantic 的规则合并：后一个 `Field` 覆盖前一个，`None` 也算——sqlmodel 的 `Field()` 会把 `alias` / `validation_alias` / `serialization_alias` / `title` / `description` / `default_factory` / `discriminator` / `exclude` 显式传成 `None`（`repr` 传成 `True`），所以 `Annotated[str, Field(alias='a', title='T'), Field(unique=True)]` 既没有 alias 也没有 title；右侧 `Field` 覆盖它们全部。嵌在联合类型里的别名（`OptionalNonNegativeDecimal38_18 | None`）的 `Field` 不在字段层合并，所以它的 `default=None` 不生效——只带过来它的约束与列属性。这些属性经构造函数传入，Pydantic 把它们记为"已设置"，于是能进入 core schema：`x: Str64 = 'a'` 的默认值会出现在 JSON schema 与校验里，而不只是在 `model_fields` 里。只补全列属性——声明中所有 `Field` 的 `FieldInfoMetadata` 载体被折叠成一个，因为 SQLModel 只读第一个：先右侧 `Field` 的，再按注解里从后往前的顺序（`Annotated[NonNegativeDecimal38_18, Field(sa_type=Numeric(20, 2))]` 得到 `NUMERIC(20, 2)`），且 `False` 不会关掉 `True`。有一条本库规则与 Pydantic 不同：在 table 类体里重新声明、但没有右侧值的字段，沿用基类的默认值（Pydantic 会让它变成必填）。仍留在类注解里的元数据（例如与别名 `Field` 并列的 `AfterValidator`）不会再复制进字段，因此只执行一次。
 
 ### 第 4.5.b 步：`oplock_version` 是保留名
 
@@ -182,8 +182,8 @@ for field_name, field_type in annotations.items():
     if sa_type is not None:
         field_value = attrs.get(field_name, Undefined)
         if field_value is Undefined:
-            # 没有 "= Field(...)"：优先从 Annotated 里取回用户的 FieldInfo，
-            # 保住 default_factory / max_length 等，只把 sa_type 加进去
+            # 没有 "= Field(...)"：造一个携带 Pydantic 对该 Annotated 自身解析结果的右侧 Field
+            # （default_factory 等原样保住，不改变任何东西），再把 sa_type 加进去
             annotated_fi = _find_field_info_in_annotated(field_type)
             attrs[field_name] = annotated_fi if annotated_fi is not None else Field(sa_type=sa_type)
         elif isinstance(field_value, FieldInfo):
@@ -218,7 +218,7 @@ result = super().__new__(cls, name, bases, attrs, **kwargs)                     
 #         用保存的 SQLModelFieldInfo 合并回去并重建 Column
 ```
 
-合并时，布尔标志不会被 `False` 覆盖（`unique=False` 不会关掉继承来的 `unique=True`），`FieldInfoMetadata` 载体会被折叠成一个（SQLModel 只读第一个；否则类型别名里全空的载体会遮住 `= Field(primary_key=True)`——这正是 sqlmodel ≥ 0.0.32 上 `id: NonNegativeInt = Field(primary_key=True)` 丢失主键的原因）。
+第 7 步只把 Pydantic 填上的值拷回来，此处 `None` 与 `False` 不会覆盖已保存的值。同一声明的 `FieldInfoMetadata` 载体在第 4.5 步已折叠成一个（SQLModel 只读第一个；否则类型别名里全空的载体会遮住 `= Field(primary_key=True)`——这正是 sqlmodel ≥ 0.0.32 上 `id: NonNegativeInt = Field(primary_key=True)` 丢失主键的原因）。
 
 ### 第 8–9 步：继承中的关系字段
 

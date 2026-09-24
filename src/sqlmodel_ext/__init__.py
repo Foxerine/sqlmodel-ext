@@ -20,7 +20,7 @@ Quick start::
     user = await user.save(session)
     users = await User.get(session, fetch_mode="all")
 """
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 # Every re-export below uses the redundant ``X as X`` form: the package ships
 # ``py.typed``, and type checkers treat a plain ``from m import X`` in a typed
