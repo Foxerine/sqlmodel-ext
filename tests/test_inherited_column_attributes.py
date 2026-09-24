@@ -335,3 +335,154 @@ def test_partial_derivation_is_unaffected() -> None:
     assert InhColPartial.model_fields["al_described"].description == "described"
     # The table class derived from the same base is unaffected by the partial.
     assert _table_column(InhColExt, "al_index").index is True
+
+
+# ---------------------------------------------------------------- Pydantic attributes of the base's resolved field
+
+FullAlias = Annotated[
+    str,
+    Field(
+        alias="al_legacy",
+        validation_alias="al_legacy_in",
+        serialization_alias="al_legacy_out",
+        title="Alias title",
+        description="alias description",
+        max_length=16,
+        index=True,
+    ),
+]
+"""An alias carrying every Pydantic naming / documentation attribute plus a column attribute."""
+
+_PYDANTIC_ATTRS = ("alias", "validation_alias", "serialization_alias", "title", "description")
+
+_RHS_CASES: dict[str, dict[str, Any] | None] = {
+    # ``None``: the base declares the alias alone, no right-hand ``Field``.
+    "alias_only": None,
+    "column_only": {"unique": True},
+    **{f"clear_{attr}": {attr: None} for attr in _PYDANTIC_ATTRS},
+    **{f"override_{attr}": {attr: f"over_{attr}"} for attr in _PYDANTIC_ATTRS},
+}
+"""Right-hand ``Field(...)`` of the base declaration, per case."""
+
+
+def _build_attr_case(case: str, rhs: dict[str, Any] | None) -> tuple[type[SQLModel], type[SQLModel], type[SQLModel]]:
+    namespace: dict[str, Any] = {"__annotations__": {"name": FullAlias}}
+    if rhs is not None:
+        namespace["name"] = Field(**rhs)
+    pure_base = type(f"InhAttrPureBase_{case}", (SQLModel,), dict(namespace))
+    pure = type(
+        f"InhAttrPure_{case}",
+        (pure_base,),
+        {"__annotations__": {"id": int | None}, "id": Field(default=None, primary_key=True)},
+        table=True,
+    )
+    ext_base = type(f"InhAttrExtBase_{case}", (SQLModelBase,), dict(namespace))
+    ext = type(f"InhAttrExt_{case}", (ext_base, TableBaseMixin), {}, table=True)
+    return pure, ext_base, ext
+
+
+_ATTR_MODELS = {case: _build_attr_case(case, rhs) for case, rhs in _RHS_CASES.items()}
+
+
+_TABLE_ONLY_PROPERTIES = frozenset({"id", "created_at", "updated_at"})
+
+
+def _field_schema(model: type[SQLModel], mode: Any) -> dict[str, Any]:
+    properties: dict[str, Any] = model.model_json_schema(mode=mode)["properties"]
+    return {key: value for key, value in properties.items() if key not in _TABLE_ONLY_PROPERTIES}
+
+
+@pytest.mark.parametrize("case", list(_RHS_CASES))
+def test_inherited_pydantic_attributes_follow_the_base_field(case: str) -> None:
+    pure, ext_base, ext = _ATTR_MODELS[case]
+    inherited = ext.model_fields["name"]
+    for attr in _PYDANTIC_ATTRS:
+        expected = getattr(ext_base.model_fields["name"], attr)
+        assert getattr(inherited, attr) == expected, attr
+        assert getattr(pure.model_fields["name"], attr) == expected, attr
+    for mode in ("validation", "serialization"):
+        assert _field_schema(ext, mode) == _field_schema(pure, mode) == _field_schema(ext_base, mode)
+    # The column attributes of both declarations survive.
+    column = _table_column(ext, "name")
+    assert column.index is True
+    assert column.unique is (case == "column_only")
+    assert repr(column.type) == "AutoString(length=16)"
+    # ...and are readable as attributes of the field (JTI detection reads ``primary_key`` / ``foreign_key`` so).
+    assert getattr(inherited, "index") is True
+    assert getattr(inherited, "unique") is (case == "column_only")
+
+
+@pytest.mark.parametrize("case", list(_RHS_CASES))
+def test_inherited_field_validates_and_dumps_like_the_base(case: str) -> None:
+    _, ext_base, ext = _ATTR_MODELS[case]
+    base_field = ext_base.model_fields["name"]
+    input_key = base_field.validation_alias or base_field.alias or "name"
+    assert isinstance(input_key, str)
+    row = ext.model_validate({input_key: "v"})
+    assert row.name == "v"  # pyright: ignore[reportAttributeAccessIssue]
+    dumped = row.model_dump(by_alias=True, exclude=set(_TABLE_ONLY_PROPERTIES))
+    assert dumped == ext_base.model_validate({input_key: "v"}).model_dump(by_alias=True)
+
+
+def test_explicit_alias_clear_in_base_is_kept() -> None:
+    """The reported case: ``Field(alias=None)`` in the base must not be undone by the alias's ``alias``."""
+    _, ext_base, ext = _ATTR_MODELS["clear_alias"]
+    assert ext_base.model_fields["name"].alias is None
+    assert ext.model_fields["name"].alias is None
+    assert "al_legacy" not in _field_schema(ext, "validation")
+
+
+Conflicting = Annotated[str, Field(nullable=False, sa_column_kwargs={"comment": "alias"})]
+
+
+def test_right_hand_column_attributes_win_over_the_alias() -> None:
+    """The base's right-hand ``Field`` takes precedence over the alias's column attributes, as in a direct declaration."""
+    class InhColConflictBase(SQLModelBase):
+        name: Conflicting = Field(nullable=True, sa_column_kwargs={"comment": "rhs"})
+
+    class InhColConflict(InhColConflictBase, TableBaseMixin, table=True):
+        pass
+
+    class InhColConflictDirect(SQLModelBase, TableBaseMixin, table=True):
+        name: Conflicting = Field(nullable=True, sa_column_kwargs={"comment": "rhs"})
+
+    inherited = _column_facts(_table_column(InhColConflict, "name"))
+    assert inherited == _column_facts(_table_column(InhColConflictDirect, "name"))
+    assert inherited["nullable"] is True
+    assert inherited["comment"] == "rhs"
+
+
+# ---------------------------------------------------------------- final-review regression (0.5.1)
+
+AliasWithLegacyName = Annotated[str, Field(alias="legacy_name", max_length=16)]
+
+
+class Review2PureBase(SQLModel):
+    """Plain SQLModel control: the right-hand Field explicitly clears the alias."""
+
+    name: AliasWithLegacyName = Field(alias=None, index=True)
+
+
+class Review2PureRow(Review2PureBase, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+
+
+class Review2ExtBase(SQLModelBase):
+    """sqlmodel-ext base with the same declaration as the plain control."""
+
+    name: AliasWithLegacyName = Field(alias=None, index=True)
+
+
+class Review2ExtRow(Review2ExtBase, TableBaseMixin, table=True):
+    pass
+
+
+def test_inherited_explicit_alias_clear_matches_plain_sqlmodel() -> None:
+    """The inherited resolved FieldInfo must preserve an explicit ``alias=None``."""
+    assert Review2PureBase.model_fields["name"].alias is None
+    assert Review2PureRow.model_fields["name"].alias is None
+    assert Review2ExtBase.model_fields["name"].alias is None
+    assert Review2ExtRow.model_fields["name"].alias is None
+    assert "name" in Review2ExtRow.model_json_schema()["properties"]
+    assert "legacy_name" not in Review2ExtRow.model_json_schema()["properties"]
+    assert _table_column(Review2ExtRow, "name").index is True

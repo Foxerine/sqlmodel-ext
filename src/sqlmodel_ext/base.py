@@ -234,6 +234,98 @@ def _merge_sqlmodel_metadata_carrier(
     return merged
 
 
+_PYDANTIC_FIELD_ATTRS: tuple[str, ...] = tuple(
+    slot for slot in FieldInfo.__slots__ if not slot.startswith('_') and slot not in ('annotation', 'metadata')
+)
+"""
+Public Pydantic ``FieldInfo`` attributes an inherited field takes verbatim from the base's resolved field.
+
+``annotation`` is excluded (the class annotation supplies it) and so is
+``metadata`` (merged separately by ``_inherit_resolved_field``).
+"""
+
+
+def _inherit_resolved_field(alias_fi: SQLModelFieldInfo, base_fi: FieldInfo) -> SQLModelFieldInfo:
+    """
+    Build the ``FieldInfo`` of a field a table class inherits from a base class.
+
+    ``base_fi`` is the base class's entry in ``model_fields``: Pydantic has
+    already merged the type alias's ``Field(...)`` and the base's right-hand
+    ``= Field(...)`` into it. It is the single source of truth for the field:
+
+    - **Pydantic attributes** (``default`` / ``default_factory`` / ``alias`` /
+      ``validation_alias`` / ``serialization_alias`` / ``title`` /
+      ``description`` / ``examples`` / ``exclude`` / ``frozen`` / ...) are
+      taken from ``base_fi`` verbatim, ``None`` included: ``Field(alias=None)``
+      in the base clears the alias's ``alias`` and the table class must see
+      the same field as the base does. They are passed to the constructor so
+      that Pydantic records every one of them as explicitly set -- the same
+      treatment Pydantic gives a resolved ``FieldInfo`` reused as a default.
+    - **Metadata** starts from ``base_fi.metadata``. Items of ``alias_fi.metadata``
+      whose type ``base_fi`` lacks are appended: an alias nested in a union
+      (``Alias | None = Field(...)``) is not merged by Pydantic at field level,
+      so its constraints (``MaxLen`` -> column length) and column carrier are
+      absent from ``base_fi``.
+    - **Column attributes**: SQLModel reads only the first ``FieldInfoMetadata``
+      carrier, while ``base_fi`` holds one per ``Field(...)`` -- the right-hand
+      one first. All carriers are folded into one (see
+      ``_fold_column_carriers``) and the folded values are also set as
+      instance attributes for readers using ``getattr(field, 'primary_key')``.
+
+    ``alias_fi`` is not mutated.
+    """
+    kwargs: dict[str, Any] = {name: getattr(base_fi, name) for name in _PYDANTIC_FIELD_ATTRS}
+    inherited = SQLModelFieldInfo(**kwargs)
+
+    base_meta = list(base_fi.metadata)
+    base_types = {type(item) for item in base_meta}
+    alias_extra = [
+        item for item in alias_fi.metadata
+        if isinstance(item, FieldInfoMetadata) or type(item) not in base_types
+    ]
+    metadata = _fold_column_carriers(base_meta + alias_extra)
+    inherited.metadata = metadata
+
+    carrier = next((m for m in metadata if isinstance(m, FieldInfoMetadata)), None)
+    if carrier is not None:
+        for fim_field in dataclasses.fields(carrier):
+            value = getattr(carrier, fim_field.name)
+            if value is not _FIM_UNSET_SA_TYPE:
+                setattr(inherited, fim_field.name, value)
+    return inherited
+
+
+def _fold_column_carriers(metadata: list[Any]) -> list[Any]:
+    """
+    Fold every ``FieldInfoMetadata`` carrier of ``metadata`` into the first one.
+
+    Carriers are ordered by precedence: an earlier carrier's set value wins; a
+    later carrier only fills attributes the earlier ones left unset -- except
+    that ``True`` replaces an earlier ``False`` (the rule
+    ``_merge_field_info_attrs`` applies to boolean flags, so ``unique=False`` on
+    the right-hand side never switches off ``unique=True`` from the alias).
+    The first carrier is replaced by a folded **copy** (carriers inside type
+    aliases are shared); the others are dropped. Non-carrier items are kept
+    unchanged and in order.
+    """
+    carrier_indexes = [i for i, m in enumerate(metadata) if isinstance(m, FieldInfoMetadata)]
+    if len(carrier_indexes) < 2:
+        return list(metadata)
+    first = carrier_indexes[0]
+    folded = copy.copy(metadata[first])
+    for index in carrier_indexes[1:]:
+        later = metadata[index]
+        for fim_field in dataclasses.fields(later):
+            value = getattr(later, fim_field.name)
+            if value is _FIM_UNSET_SA_TYPE:
+                continue
+            current = getattr(folded, fim_field.name)
+            if current is _FIM_UNSET_SA_TYPE or (current is False and value is True):
+                setattr(folded, fim_field.name, value)
+    dropped = frozenset(carrier_indexes[1:])
+    return [folded if i == first else m for i, m in enumerate(metadata) if i not in dropped]
+
+
 def _find_field_info_in_annotated(annotation: Any) -> SQLModelFieldInfo | None:
     """
     Extract SQLModel ``FieldInfo`` embedded in ``Annotated[T, Field(...)]`` metadata.
@@ -764,23 +856,11 @@ def _recover_annotated_sqlmodel_fields(
             if base_fi is not None and field_name not in own_names:
                 # An inherited field (the class body does not declare it). Its
                 # right-hand ``= Field(...)`` lives in the base class, not in
-                # ``attrs``; the base's resolved ``FieldInfo`` is the single
-                # source of truth for everything the author declared there --
-                # the SQLModel column attributes (``index`` / ``unique`` /
-                # ``primary_key`` / ``foreign_key`` / ``nullable`` / ``sa_type``
-                # / ``sa_column_kwargs`` / ``ondelete`` ...), the Pydantic
-                # attributes and the default. Merge all of it, exactly like the
-                # right-hand-side branch above; without it the injected
-                # ``attrs[field_name]`` replaces the inherited field and a
-                # column declared ``Field(index=True)`` in a base class is
-                # created without its index.
-                _merge_field_info_attrs(sqlmodel_fi, base_fi)
-                # The base field has either a default or a factory: the merge
-                # skips an unset one, so clear the alias's own counterpart.
-                if base_fi.default_factory is not None:
-                    sqlmodel_fi.default = Undefined
-                elif base_fi.default is not Undefined:
-                    sqlmodel_fi.default_factory = None
+                # ``attrs``; without this branch the injected
+                # ``attrs[field_name]`` replaces the inherited field with the
+                # alias's ``Field`` alone, and a column declared
+                # ``Field(index=True)`` in a base class loses its index.
+                sqlmodel_fi = _inherit_resolved_field(sqlmodel_fi, base_fi)
             elif (
                     base_fi is not None
                     and sqlmodel_fi.default is Undefined

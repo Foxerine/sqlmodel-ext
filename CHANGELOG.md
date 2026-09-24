@@ -38,9 +38,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Field`'s attributes: the column had no index / unique constraint / primary key /
   foreign key / `nullable` / `sa_type` / `sa_column_kwargs` / `ondelete`, and the
   Pydantic field could lose attributes set only there (e.g. `title`). The metaclass
-  rebuilt the inherited field from the alias's `Field` alone; it now merges the base
-  class's resolved field into it. Plain-typed inherited fields (`int = Field(index=True)`)
-  were not affected. Also present in 0.5.0.
+  rebuilt the inherited field from the alias's `Field` alone. The inherited field is now
+  the base class's resolved field (`Base.model_fields[name]`, in which Pydantic has
+  already merged the alias's `Field` and the right-hand one): its Pydantic attributes
+  (`default`, `alias`, `validation_alias`, `title`, `description`, ...) are taken as-is,
+  `None` included, so a base `Field(alias=None)` still clears the alias's `alias` in the
+  table class. Only the SQLModel column attributes are completed: the alias's and the
+  right-hand `Field`'s column settings are folded into one (the right-hand side wins on
+  conflicts; `False` never switches off `True`), and constraints of an alias nested in
+  a union (`Alias | None = Field(...)`), which Pydantic does not merge at field level,
+  are added. Plain-typed inherited fields (`int = Field(index=True)`) were not affected.
+  Also present in 0.5.0.
 - A cross-field validation failure of `TableViewRequest` (and the other query DTOs) used
   as a FastAPI dependency (`after_id` with a non-zero `offset`, `after_id` with a mutable
   `order`, an inverted time range) was a 500. Declared through `query_dependency()` it is

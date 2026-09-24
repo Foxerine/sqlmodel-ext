@@ -142,7 +142,7 @@ _own_annotation_names = frozenset(annotations)
 
 ### 第 4.5 步：恢复 `Annotated[T, Field(...)]` 中的 SQLModel 属性
 
-Pydantic v2 处理 `Annotated` 元数据时会把 `sqlmodel.main.FieldInfo` 换成 `pydantic.fields.FieldInfo`，后者不认识 `foreign_key`、`sa_type` 等 SQLModel 属性。`_recover_annotated_sqlmodel_fields()` 对 **table 类**（包括从父类继承来的 `Annotated` 字段）把它们还原成 `= Field(...)` 形式；非 table 类保留原样，供子 table 类继承。合并多个 `FieldInfo` 时，显式的 `default=None` 被当作真实的值（而不是"未设置"）保留——否则字段会静默变成必填。
+Pydantic v2 处理 `Annotated` 元数据时会把 `sqlmodel.main.FieldInfo` 换成 `pydantic.fields.FieldInfo`，后者不认识 `foreign_key`、`sa_type` 等 SQLModel 属性。`_recover_annotated_sqlmodel_fields()` 对 **table 类**（包括从父类继承来的 `Annotated` 字段）把它们还原成 `= Field(...)` 形式；非 table 类保留原样，供子 table 类继承。合并多个 `FieldInfo` 时，显式的 `default=None` 被当作真实的值（而不是"未设置"）保留——否则字段会静默变成必填。table 类**继承**（未在类体里重新声明）的 `Annotated` 字段以基类已解析的字段 `Base.model_fields[name]` 为准重建：Pydantic 层属性原样采用（那里显式的 `alias=None` 仍是 `None`），只补全列属性——别名的 `Field` 与右侧 `Field` 各自的 `FieldInfoMetadata` 载体被折叠成一个，因为 SQLModel 只读第一个。
 
 ### 第 4.5.b 步：`oplock_version` 是保留名
 
