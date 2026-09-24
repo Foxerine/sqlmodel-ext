@@ -54,7 +54,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Annotated[NonNegativeDecimal38_18, Field(sa_type=Numeric(20, 2))]` gives
   `NUMERIC(20, 2)` in both (inheriting it gave `NUMERIC(38, 18)`, the alias's
   `sa_type`). Plain SQLModel, which reads only the first carrier, still gives
-  `NUMERIC(38, 18)`. Also present in 0.5.0 and 0.5.1.
+  `NUMERIC(38, 18)`. Also present in 0.5.0 and 0.5.1. This only changes the metadata
+  the models build: existing databases are not altered. Tables created from now on
+  (`create_all`) get the new column type; to align an existing table, write a migration.
 
 ## [0.5.1]
 
