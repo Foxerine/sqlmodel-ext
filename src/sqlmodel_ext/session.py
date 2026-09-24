@@ -4,10 +4,12 @@ A subclass of sqlmodel's ``AsyncSession`` that upgrades cache correctness from
 "documented convention enforced by review" to "adapted automatically at
 runtime", and adds transaction-level helpers:
 
-- ``commit()``: auto-registers every ``CachedTableBaseMixin`` mutation in the
-  session before commit (new/dirty/deleted -- including bare ``session.add()``
-  / attribute mutation / ``session.delete()`` paths that never went through the
-  CRUD methods), then synchronously invalidates after commit, then runs the
+- ``commit()``: invalidates, synchronously after commit, every
+  ``CachedTableBaseMixin`` mutation the session flushed in this transaction
+  (registered per flush by the ``after_flush`` handler in ``cached_table`` --
+  including bare ``session.add()`` / attribute mutation / ``session.delete()``
+  paths that never went through the CRUD methods, and flushes inside
+  savepoints or before an explicit ``flush()``), then runs the
   registered post-commit callbacks (see ``add_post_commit_callback``).
   ``commit_count`` records how many commits actually succeeded.
 - ``rollback()``: discards pending post-commit callbacks; optional bounded
