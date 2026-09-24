@@ -10,7 +10,8 @@ nullable / sa_type / sa_column_kwargs / ondelete ...) was dropped.
 Criteria:
 
 1. an inherited field produces the same column and Pydantic field as the same
-   declaration made directly in the table class;
+   declaration made directly in the table class (for a right-hand ``Field``,
+   both resolve the Pydantic attributes as Pydantic does, ``None`` included);
 2. both match the identical declaration on plain ``SQLModel`` -- except where
    plain SQLModel itself drops an attribute the library recovers
    (``_PLAIN_SQLMODEL_DROPS``); there the library's value is asserted
@@ -21,11 +22,13 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 import pytest
+from pydantic import AfterValidator
 from sqlalchemy import BigInteger, Column
 from sqlmodel import Field, SQLModel
 
 from sqlmodel_ext import (
     AutoPolymorphicIdentityMixin,
+    OptionalNonNegativeDecimal38_18,
     PolymorphicBaseMixin,
     SQLModelBase,
     Str64,
@@ -486,3 +489,166 @@ def test_inherited_explicit_alias_clear_matches_plain_sqlmodel() -> None:
     assert "name" in Review2ExtRow.model_json_schema()["properties"]
     assert "legacy_name" not in Review2ExtRow.model_json_schema()["properties"]
     assert _table_column(Review2ExtRow, "name").index is True
+
+
+# ---------------------------------------------------------------- direct declaration with a right-hand Field (0.5.1)
+#
+# A table class declaring ``name: Alias = Field(...)`` itself must resolve the
+# Pydantic attributes exactly like plain SQLModel does for the same line, and
+# exactly like a table class inheriting that line from a base: the right-hand
+# ``Field`` overrides the alias's attributes, ``None`` included (sqlmodel's
+# ``Field()`` passes every Pydantic attribute explicitly).
+
+_RESOLVED_ATTRS = (*_PYDANTIC_ATTRS, "default")
+
+
+def _build_direct_case(
+        case: str,
+        annotation: Any,
+        rhs: dict[str, Any] | None,
+) -> tuple[type[SQLModel], type[SQLModel], type[SQLModel]]:
+    """Return (plain SQLModel table, sqlmodel-ext table, sqlmodel-ext table inheriting the same line)."""
+    namespace: dict[str, Any] = {"__annotations__": {"name": annotation}}
+    if rhs is not None:
+        namespace["name"] = Field(**rhs)
+    pure = type(
+        f"DirAttrPure_{case}",
+        (SQLModel,),
+        {
+            **namespace,
+            "__annotations__": {"name": annotation, "id": int | None},
+            "id": Field(default=None, primary_key=True),
+        },
+        table=True,
+    )
+    direct = type(f"DirAttrExt_{case}", (SQLModelBase, TableBaseMixin), dict(namespace), table=True)
+    base = type(f"DirAttrExtBase_{case}", (SQLModelBase,), dict(namespace))
+    inherited = type(f"DirAttrExtInh_{case}", (base, TableBaseMixin), {}, table=True)
+    return pure, direct, inherited
+
+
+_DIRECT_ATTR_MODELS = {
+    **{f"plain_{case}": _build_direct_case(f"plain_{case}", FullAlias, rhs) for case, rhs in _RHS_CASES.items()},
+    **{
+        f"union_{case}": _build_direct_case(f"union_{case}", FullAlias | None, rhs)
+        for case, rhs in _RHS_CASES.items()
+        if rhs is not None
+    },
+}
+
+
+@pytest.mark.parametrize("case", list(_DIRECT_ATTR_MODELS))
+def test_direct_pydantic_attributes_match_plain_sqlmodel_and_inheritance(case: str) -> None:
+    pure, direct, inherited = _DIRECT_ATTR_MODELS[case]
+    for attr in _RESOLVED_ATTRS:
+        expected = getattr(pure.model_fields["name"], attr)
+        assert getattr(direct.model_fields["name"], attr) == expected, attr
+        assert getattr(inherited.model_fields["name"], attr) == expected, attr
+    assert direct.model_fields["name"].is_required() == pure.model_fields["name"].is_required()
+    assert inherited.model_fields["name"].is_required() == pure.model_fields["name"].is_required()
+    for mode in ("validation", "serialization"):
+        assert _field_schema(direct, mode) == _field_schema(inherited, mode)
+        if case.startswith("plain_"):
+            # ``Alias | None``: plain SQLModel also documents the alias's
+            # ``title`` / ``description`` inside the union member's schema; the
+            # library moves the alias's ``Field`` out of the annotation, so only
+            # the field-level schema (identical Pydantic attributes) is compared.
+            assert _field_schema(direct, mode) == _field_schema(pure, mode)
+
+
+@pytest.mark.parametrize("case", list(_DIRECT_ATTR_MODELS))
+def test_direct_column_matches_inheritance(case: str) -> None:
+    pure, direct, inherited = _DIRECT_ATTR_MODELS[case]
+    direct_facts = _column_facts(_table_column(direct, "name"))
+    assert direct_facts == _column_facts(_table_column(inherited, "name"))
+    # The library keeps the alias's column attributes plain SQLModel drops
+    # (it reads only the right-hand ``FieldInfoMetadata`` carrier).
+    assert direct_facts["index"] is True
+    assert _table_column(pure, "name").index is (case == "plain_alias_only")
+    assert direct_facts["unique"] is case.endswith("column_only")
+    assert direct_facts["type"] == "AutoString(length=16)"
+
+
+def test_direct_explicit_alias_clear_matches_plain_sqlmodel() -> None:
+    """The reported case, declared in the table class itself."""
+    class Review3ExtRow(SQLModelBase, TableBaseMixin, table=True):
+        name: AliasWithLegacyName = Field(alias=None, index=True)
+
+    assert Review3ExtRow.model_fields["name"].alias is None
+    assert Review3ExtRow.model_fields["name"].alias == Review2PureRow.model_fields["name"].alias
+    assert "legacy_name" not in Review3ExtRow.model_json_schema()["properties"]
+    assert _table_column(Review3ExtRow, "name").index is True
+    assert Review3ExtRow.model_validate({"name": "v"}).name == "v"
+
+
+# ---------------------------------------------------------------- annotation validators run once
+
+_VALIDATOR_CALLS: list[str] = []
+
+
+def _record_call(value: str) -> str:
+    _VALIDATOR_CALLS.append(value)
+    return value + "!"
+
+
+Recorded = Annotated[str, AfterValidator(_record_call), Field(max_length=16)]
+
+
+class OnceBase(SQLModelBase):
+    rhs: Recorded = Field(index=True)
+
+
+class OnceInherited(OnceBase, TableBaseMixin, table=True):
+    pass
+
+
+class OnceDirect(SQLModelBase, TableBaseMixin, table=True):
+    rhs: Recorded = Field(index=True)
+
+
+class OncePure(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    rhs: Recorded = Field(index=True)
+
+
+@pytest.mark.parametrize("model", [OncePure, OnceBase, OnceDirect, OnceInherited], ids=lambda m: m.__name__)
+def test_annotation_validator_runs_once(model: type[SQLModel]) -> None:
+    """An ``AfterValidator`` next to the alias's ``Field`` must not be applied twice by the recovered field."""
+    _VALIDATOR_CALLS.clear()
+    row = model.model_validate({"rhs": "v"})
+    assert row.rhs == "v!"  # pyright: ignore[reportAttributeAccessIssue]
+    assert _VALIDATOR_CALLS == ["v"]
+
+
+# ---------------------------------------------------------------- alias default under a union wrapper
+
+class UnionDefaultBase(SQLModelBase):
+    wrapped: OptionalNonNegativeDecimal38_18 | None = Field(index=True)
+    bare: OptionalNonNegativeDecimal38_18 = Field(index=True)
+
+
+class UnionDefaultInherited(UnionDefaultBase, TableBaseMixin, table=True):
+    pass
+
+
+class UnionDefaultDirect(SQLModelBase, TableBaseMixin, table=True):
+    wrapped: OptionalNonNegativeDecimal38_18 | None = Field(index=True)
+    bare: OptionalNonNegativeDecimal38_18 = Field(index=True)
+
+
+@pytest.mark.parametrize("model", [UnionDefaultDirect, UnionDefaultInherited], ids=lambda m: m.__name__)
+def test_alias_default_follows_pydantic_under_union(model: type[SQLModel]) -> None:
+    """
+    Pydantic does not merge a ``Field`` nested in a union member, so the alias's
+    ``default=None`` does not apply to ``Alias | None = Field(...)`` -- the
+    field is required, as in the non-table base. Without the union the
+    alias's default applies.
+    """
+    for name in ("wrapped", "bare"):
+        expected = UnionDefaultBase.model_fields[name]
+        field = model.model_fields[name]
+        assert field.is_required() == expected.is_required(), name
+        assert field.default == expected.default, name
+        assert _table_column(model, name).index is True
+    assert model.model_fields["wrapped"].is_required() is True
+    assert model.model_fields["bare"].default is None

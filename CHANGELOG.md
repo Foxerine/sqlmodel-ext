@@ -64,6 +64,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A table class field declared with a type alias **and** a right-hand `Field(...)`
+  (`name: Alias = Field(...)`) now gets its Pydantic attributes exactly as Pydantic
+  resolves that declaration -- the same field plain SQLModel builds, and the same field
+  a table class gets when it inherits the declaration from a base. The right-hand
+  `Field` overrides the alias's Pydantic attributes, `None` included; sqlmodel's
+  `Field()` passes every one of them explicitly, so with a right-hand `Field` the
+  alias's `alias` / `validation_alias` / `serialization_alias` / `title` /
+  `description` no longer apply (`Field(alias=None)` clears the alias's `alias`;
+  previously the metaclass skipped `None` and kept the alias's values). The alias's
+  `default` still applies unless the right-hand `Field` sets one -- except for an alias
+  nested in a union (`Alias | None = Field(...)`), whose `Field` Pydantic does not
+  merge: such a field is required unless the right-hand `Field` sets a default. Of the
+  bundled aliases only the `Optional*Decimal*` ones carry a Pydantic attribute
+  (`default=None`), so `OptionalNonNegativeDecimal38_18 | None = Field(index=True)` is
+  now required; drop the redundant `| None` or add `default=None`. Column attributes are
+  unchanged: the alias's and the right-hand `Field`'s column settings are still folded
+  together.
 - The cross-field rules of `PaginationRequest` and `TimeFilterRequest` are field validators:
   a violation is still a `ValidationError` with the same message, but located at the
   field the rule constrains (`after_id`, `created_before_datetime`,

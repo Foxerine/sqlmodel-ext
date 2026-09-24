@@ -130,8 +130,10 @@ def _merge_field_info_attrs(target: SQLModelFieldInfo, source: FieldInfo) -> Non
     Merge explicitly-set attributes from ``source`` into ``target``.
 
     Used when ``Annotated[Str64, Field(unique=True)]`` expands to multiple FieldInfo:
-    ``Annotated[str, Field(max_length=64), Field(unique=True)]``, and when a
-    right-hand-side ``= Field(...)`` coexists with a FieldInfo inside the annotation.
+    ``Annotated[str, Field(max_length=64), Field(unique=True)]``, and to restore the
+    SQLModel attributes Pydantic drops when it rebuilds ``model_fields``. A
+    right-hand-side ``= Field(...)`` is not merged here: it follows Pydantic's
+    resolution, ``None`` included (see ``_inherit_resolved_field``).
     Merges attributes dynamically (via ``__slots__`` / ``__annotations__`` / ``__dict__``),
     no hardcoded attribute names — upstream additions are handled automatically.
 
@@ -245,13 +247,20 @@ Public Pydantic ``FieldInfo`` attributes an inherited field takes verbatim from 
 """
 
 
-def _inherit_resolved_field(alias_fi: SQLModelFieldInfo, base_fi: FieldInfo) -> SQLModelFieldInfo:
+def _inherit_resolved_field(
+        alias_fi: SQLModelFieldInfo,
+        base_fi: FieldInfo,
+        annotation_metadata: list[Any],
+) -> SQLModelFieldInfo:
     """
-    Build the ``FieldInfo`` of a field a table class inherits from a base class.
+    Build the ``FieldInfo`` of a table-class field from Pydantic's resolution of its declaration.
 
-    ``base_fi`` is the base class's entry in ``model_fields``: Pydantic has
-    already merged the type alias's ``Field(...)`` and the base's right-hand
-    ``= Field(...)`` into it. It is the single source of truth for the field:
+    ``base_fi`` is the field as Pydantic resolves the declaration
+    ``name: Alias = Field(...)``: the base class's entry in ``model_fields``
+    for an inherited field, ``FieldInfo.from_annotated_attribute`` for a
+    declaration in the table class itself. Pydantic has merged the type
+    alias's ``Field(...)`` and the right-hand ``= Field(...)`` into it. It is
+    the single source of truth for the field:
 
     - **Pydantic attributes** (``default`` / ``default_factory`` / ``alias`` /
       ``validation_alias`` / ``serialization_alias`` / ``title`` /
@@ -261,7 +270,12 @@ def _inherit_resolved_field(alias_fi: SQLModelFieldInfo, base_fi: FieldInfo) -> 
       the same field as the base does. They are passed to the constructor so
       that Pydantic records every one of them as explicitly set -- the same
       treatment Pydantic gives a resolved ``FieldInfo`` reused as a default.
-    - **Metadata** starts from ``base_fi.metadata``. Items of ``alias_fi.metadata``
+    - **Metadata** starts from ``base_fi.metadata`` minus ``annotation_metadata``:
+      the metadata Pydantic collects from the rebuilt class annotation (the
+      ``Annotated`` arguments other than the SQLModel ``Field``, e.g. an
+      ``AfterValidator``). Pydantic adds those again when it builds the
+      field, so keeping them here would run such a validator twice. Each
+      annotation item removes one equal item. Items of ``alias_fi.metadata``
       whose type ``base_fi`` lacks are appended: an alias nested in a union
       (``Alias | None = Field(...)``) is not merged by Pydantic at field level,
       so its constraints (``MaxLen`` -> column length) and column carrier are
@@ -278,6 +292,8 @@ def _inherit_resolved_field(alias_fi: SQLModelFieldInfo, base_fi: FieldInfo) -> 
     inherited = SQLModelFieldInfo(**kwargs)
 
     base_meta = list(base_fi.metadata)
+    for item in annotation_metadata:
+        base_meta.remove(item)
     base_types = {type(item) for item in base_meta}
     alias_extra = [
         item for item in alias_fi.metadata
@@ -825,58 +841,8 @@ def _recover_annotated_sqlmodel_fields(
         for extra_fi in sqlmodel_fis[1:]:
             _merge_field_info_attrs(sqlmodel_fi, extra_fi)
 
-        # Transfer plain defaults from attrs (e.g. = 0, = None) to FieldInfo
-        existing_default = attrs.get(field_name, Undefined)
-        if existing_default is not Undefined and not isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
-            sqlmodel_fi.default = existing_default
-        elif isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
-            # A right-hand-side ``= Field(...)`` coexists with the FieldInfo inside
-            # the annotation, e.g.
-            # ``value: NonNegativeBigInt | None = Field(default=None, sa_type=BigInteger)``.
-            # Without this branch the right-hand FieldInfo would be discarded
-            # (overwritten by ``attrs[field_name] = sqlmodel_fi`` below) and an
-            # explicit ``default=None`` would vanish, silently making the field
-            # required.
-            #
-            # The right-hand side is more specific than the type alias, so it is
-            # merged in as ``source``. Caveat: ``_merge_field_info_attrs`` never
-            # lets ``False`` overwrite ``True`` on boolean flags, so
-            # ``Annotated[int, Field(unique=True)] = Field(unique=False)`` stays
-            # ``unique=True``.
-            _merge_field_info_attrs(sqlmodel_fi, existing_default)
-        elif existing_default is Undefined:
-            base_fi = next(
-                (
-                    base_fields[field_name]
-                    for base in bases
-                    if (base_fields := getattr(base, 'model_fields', None)) and field_name in base_fields
-                ),
-                None,
-            )
-            if base_fi is not None and field_name not in own_names:
-                # An inherited field (the class body does not declare it). Its
-                # right-hand ``= Field(...)`` lives in the base class, not in
-                # ``attrs``; without this branch the injected
-                # ``attrs[field_name]`` replaces the inherited field with the
-                # alias's ``Field`` alone, and a column declared
-                # ``Field(index=True)`` in a base class loses its index.
-                sqlmodel_fi = _inherit_resolved_field(sqlmodel_fi, base_fi)
-            elif (
-                    base_fi is not None
-                    and sqlmodel_fi.default is Undefined
-                    and sqlmodel_fi.default_factory is None
-            ):
-                # Re-declared in the class body without a right-hand side:
-                # only the default is inherited.
-                if base_fi.default is not Undefined:
-                    sqlmodel_fi.default = base_fi.default
-                elif base_fi.default_factory is not None:
-                    sqlmodel_fi.default_factory = base_fi.default_factory
-
-        # Inject SQLModel FieldInfo as field default (equivalent to = Field(...) style)
-        attrs[field_name] = sqlmodel_fi
-
-        # Update annotations: remove SQLModel FieldInfo from Annotated
+        # The class annotation without the SQLModel FieldInfo; any other
+        # ``Annotated`` metadata (validators, serializers, ...) stays in it.
         base_type = args[0]
         remaining_metadata = [a for a in args[1:] if not isinstance(a, SQLModelFieldInfo)]
         if remaining_metadata:
@@ -895,9 +861,69 @@ def _recover_annotated_sqlmodel_fields(
             rebuilt: typing.Any = new_union_args[0]
             for extra in new_union_args[1:]:
                 rebuilt = rebuilt | extra
-            annotations[field_name] = rebuilt
         else:
-            annotations[field_name] = new_inner
+            rebuilt = new_inner
+
+        # Transfer plain defaults from attrs (e.g. = 0, = None) to FieldInfo
+        existing_default = attrs.get(field_name, Undefined)
+        if existing_default is not Undefined and not isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
+            sqlmodel_fi.default = existing_default
+        elif isinstance(existing_default, (FieldInfo, SQLModelFieldInfo)):
+            # A right-hand-side ``= Field(...)`` coexists with the FieldInfo inside
+            # the annotation, e.g.
+            # ``value: NonNegativeBigInt | None = Field(default=None, sa_type=BigInteger)``.
+            # Without this branch the right-hand FieldInfo would be discarded
+            # (overwritten by ``attrs[field_name] = sqlmodel_fi`` below) and an
+            # explicit ``default=None`` would vanish, silently making the field
+            # required.
+            #
+            # Pydantic resolves the declaration exactly as it does for a
+            # non-table class (``from_annotated_attribute`` is the step that
+            # builds ``model_fields`` entries), so the field is then treated like
+            # an inherited one: its Pydantic attributes follow that resolution,
+            # ``None`` included (``Field(alias=None)`` clears the alias's
+            # ``alias``, as in plain SQLModel and in a table class inheriting
+            # the same declaration); only the column attributes of the alias
+            # and the right-hand ``Field`` are folded together (see
+            # ``_inherit_resolved_field``).
+            resolved = FieldInfo.from_annotated_attribute(field_type, existing_default)
+            sqlmodel_fi = _inherit_resolved_field(
+                sqlmodel_fi, resolved, FieldInfo.from_annotation(rebuilt).metadata,
+            )
+        elif existing_default is Undefined:
+            base_fi = next(
+                (
+                    base_fields[field_name]
+                    for base in bases
+                    if (base_fields := getattr(base, 'model_fields', None)) and field_name in base_fields
+                ),
+                None,
+            )
+            if base_fi is not None and field_name not in own_names:
+                # An inherited field (the class body does not declare it). Its
+                # right-hand ``= Field(...)`` lives in the base class, not in
+                # ``attrs``; without this branch the injected
+                # ``attrs[field_name]`` replaces the inherited field with the
+                # alias's ``Field`` alone, and a column declared
+                # ``Field(index=True)`` in a base class loses its index.
+                sqlmodel_fi = _inherit_resolved_field(
+                    sqlmodel_fi, base_fi, FieldInfo.from_annotation(rebuilt).metadata,
+                )
+            elif (
+                    base_fi is not None
+                    and sqlmodel_fi.default is Undefined
+                    and sqlmodel_fi.default_factory is None
+            ):
+                # Re-declared in the class body without a right-hand side:
+                # only the default is inherited.
+                if base_fi.default is not Undefined:
+                    sqlmodel_fi.default = base_fi.default
+                elif base_fi.default_factory is not None:
+                    sqlmodel_fi.default_factory = base_fi.default_factory
+
+        # Inject SQLModel FieldInfo as field default (equivalent to = Field(...) style)
+        attrs[field_name] = sqlmodel_fi
+        annotations[field_name] = rebuilt
 
 
 def _is_none_node(node: ast.expr) -> bool:
