@@ -118,7 +118,7 @@ With `commit=False` nothing is invalidated (the data is not committed yet); the 
 | `delete(instances)` | per-instance `DEL id:...` + `INCR ver:{cls}` |
 | `delete(condition)` | model-level `SCAN+DEL id:{cls}:*` + `INCR ver:{cls}` |
 | `add()` | `INCR ver:{cls}`; instances with an explicitly specified id also have their ID cache invalidated (guards against id reuse) |
-| bare `session.add()` / attribute mutation / `session.delete()` + `commit()` | auto-registered before commit: new → query cache only; modified / deleted → row level + query cache |
+| bare `session.add()` / attribute mutation / `session.delete()` + `commit()` | registered by the flush that sends them (a savepoint flush, a manual `flush()`, an autoflush or the commit's own flush): row level (the flushed `id`) + query cache |
 
 ### Cascade deletes
 

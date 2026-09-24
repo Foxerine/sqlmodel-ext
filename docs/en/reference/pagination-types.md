@@ -101,12 +101,12 @@ Turns a query-parameter DTO (`TableViewRequest`, `PaginationRequest`, `PageWindo
 
 | Behavior | Detail |
 |------|------|
-| Query parameters | One per model field, named after the field's alias (the field name when it has none), with the field's type, constraints, default and docstring description — the OpenAPI schema matches the model |
+| Query parameters | One per model field, named after the field's alias (the field name when it has none), with the field's type, constraints, default, `title`, description, `examples`, `deprecated`, `json_schema_extra` and `discriminator` — each parameter's OpenAPI schema is the field's JSON schema (a bare `Depends()` loses the documentation attributes). Attributes that describe the model rather than a request parameter (`serialization_alias`, `exclude`, `exclude_if`, `frozen`, `repr`, `init`, `init_var`, `kw_only`) have no `Query` counterpart; `validate_default` is enforced when the dependency constructs the model |
 | Validation | The dependency constructs the model, so every validator runs, cross-field ones included |
 | Errors | A `ValidationError` is re-raised as `fastapi.exceptions.RequestValidationError` with every location prefixed by `'query'` (`["query", "after_id"]`; a model-level error without a field becomes `["query"]`). FastAPI's default handler answers 422 |
 | Other query parameters | Ignored; the endpoint can declare its own next to the dependency |
 | Caching | One callable per model class, so FastAPI's per-request dependency cache treats repeated uses as one dependency |
-| Rejected models (`TypeError`) | `table=True` models (they skip validation), fields with a `default_factory`, fields whose `validation_alias` is not a single string |
+| Rejected models (`TypeError`) | `table=True` models (they skip validation), fields with a `default_factory`, fields whose `validation_alias` is not a single string, a callable `json_schema_extra` or a `Discriminator` object (`Query` takes a dict / a field name) |
 
 Why not `Depends()` on the class: FastAPI validates each parameter, then calls the class; a `ValidationError` from that call is not a `RequestValidationError`, so cross-field errors become 500s. See [Paginate a list endpoint](/en/how-to/paginate-a-list-endpoint#why-query-dependency).
 

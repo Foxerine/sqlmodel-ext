@@ -18,7 +18,7 @@ from sqlmodel_ext import TableViewRequest, query_dependency
 TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 ```
 
-`TableViewRequest` carries pagination (`offset` / `limit` / `desc` / `order`), a keyset cursor (`after_id`) and time filtering (`created_after_datetime` / `created_before_datetime` / `updated_after_datetime` / `updated_before_datetime`). `query_dependency()` declares one query parameter per model field (same type, constraints, default and description as the model, so the OpenAPI schema is generated as usual) and constructs the `TableViewRequest` itself.
+`TableViewRequest` carries pagination (`offset` / `limit` / `desc` / `order`), a keyset cursor (`after_id`) and time filtering (`created_after_datetime` / `created_before_datetime` / `updated_after_datetime` / `updated_before_datetime`). `query_dependency()` declares one query parameter per model field (same type, constraints, default, title, description, examples, deprecation and `json_schema_extra` as the model field, so each parameter's OpenAPI schema is the field's JSON schema) and constructs the `TableViewRequest` itself.
 
 ### Why `query_dependency()`
 

@@ -118,7 +118,7 @@ async def save(self, session, ...):
 | `delete(instances)` | 每个实例 `DEL id:...` + `INCR ver:{cls}` |
 | `delete(condition)` | 模型级 `SCAN+DEL id:{cls}:*` + `INCR ver:{cls}` |
 | `add()` | `INCR ver:{cls}`；显式指定了 id 的实例额外失效其 ID 缓存（防 id 复用） |
-| 裸 `session.add()` / 改属性 / `session.delete()` + `commit()` | commit 前自动登记：新建 → 只失效查询缓存；修改 / 删除 → 行级 + 查询缓存 |
+| 裸 `session.add()` / 改属性 / `session.delete()` + `commit()` | 由把它们发出去的那次 flush 登记（savepoint 内的 flush、手动 `flush()`、autoflush 或 commit 自身的 flush）：行级（flush 后的 `id`）+ 查询缓存 |
 
 ### 级联删除
 

@@ -79,7 +79,7 @@ char = await char.save(session)
 | `delete(instance)` | same |
 | `delete(condition=...)` | model-wide ID cleanup + version `+1` |
 | `add()` | version `+1` (instances with an explicitly specified id also clear their ID cache) |
-| Bare `session.add()` / attribute changes / `session.delete()` followed by `session.commit()` | Also invalidated automatically (the enhanced `commit()` registers them before committing) |
+| Bare `session.add()` / attribute changes / `session.delete()` followed by `session.commit()` | Also invalidated automatically (the flush that writes them registers them, including a savepoint flush, a manual `flush()` or an autoflush earlier in the transaction) |
 
 ## 4. Correct inside transactions too
 

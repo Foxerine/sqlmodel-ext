@@ -19,8 +19,8 @@ a non-zero ``offset``, an inverted time range) only run in that call, and the
 FastAPI does not catch it and the request fails with a 500.
 
 The dependency returned here declares one query parameter per model field
-(same type, constraints, default and docstring description, so the OpenAPI
-schema is unchanged), builds the model itself and re-raises a failed
+(same type, constraints, default, title, description, examples, deprecation
+and ``json_schema_extra``, so the OpenAPI schema describes the model's fields), builds the model itself and re-raises a failed
 construction as ``fastapi.exceptions.RequestValidationError`` with every
 error location prefixed by ``'query'``. FastAPI's default handler then answers
 422, in the same shape as any other query-parameter error.
@@ -76,7 +76,18 @@ def query_dependency(model: type[ModelT]) -> Callable[..., Coroutine[Any, Any, M
     :raises ImportError: FastAPI is not installed
     :raises TypeError: ``model`` is a ``table=True`` model (table models skip
         validation), or a field has a ``default_factory`` (a query parameter
-        default must be a value)
+        default must be a value), a callable ``json_schema_extra`` or a
+        ``Discriminator`` object (``Query`` takes a dict / a field name)
+
+    Field attributes carried over to each query parameter: the type and its
+    constraints (``field.metadata``), the default, ``title``, ``description``,
+    ``examples``, ``deprecated``, ``json_schema_extra`` and ``discriminator``;
+    the aliases decide the parameter name. The remaining ``FieldInfo``
+    attributes describe the model rather than a request parameter
+    (``serialization_alias``, ``exclude``, ``exclude_if``, ``frozen``,
+    ``repr``, ``init``, ``init_var``, ``kw_only``) or are enforced when the
+    dependency constructs the model (``validate_default``), so they have no
+    ``Query`` counterpart.
     """
     cached = _dependency_by_model.get(model)
     if cached is not None:
@@ -108,12 +119,34 @@ def query_dependency(model: type[ModelT]) -> Callable[..., Coroutine[Any, Any, M
                 f"query_dependency({model.__name__}): field {field_name!r} needs a single-string validation alias"
             )
         query_name_by_field[field_name] = query_name
-        # ``field.metadata`` carries the constraints (``ge`` / ``le`` / length / ...):
-        # FastAPI merges them into the parameter, so single-field errors are
-        # rejected per parameter and published in the OpenAPI schema.
-        annotation = Annotated[
-            (field.annotation, *field.metadata, query_cls(alias=query_name, description=field.description))
-        ]
+        # A callable ``json_schema_extra`` / a ``Discriminator`` object has no
+        # ``Query`` counterpart (``Query`` takes a dict / a field name).
+        if field.json_schema_extra is not None and not isinstance(field.json_schema_extra, dict):
+            raise TypeError(
+                f"query_dependency({model.__name__}): field {field_name!r} has a callable json_schema_extra; "
+                + "a query parameter takes a dict"
+            )
+        if field.discriminator is not None and not isinstance(field.discriminator, str):
+            raise TypeError(
+                f"query_dependency({model.__name__}): field {field_name!r} has a Discriminator object; "
+                + "a query parameter takes a field name"
+            )
+        # ``field.metadata`` carries the constraints (``ge`` / ``le`` / length /
+        # ``strict`` / ...): FastAPI merges them into the parameter, so
+        # single-field errors are rejected per parameter and published in the
+        # OpenAPI schema. The documentation attributes go to ``Query`` itself.
+        # ``title`` already holds a ``field_title_generator`` result (Pydantic
+        # applies it when the model is built).
+        query = query_cls(
+            alias=query_name,
+            title=field.title,
+            description=field.description,
+            examples=field.examples,
+            deprecated=field.deprecated,
+            json_schema_extra=field.json_schema_extra,
+            discriminator=field.discriminator,
+        )
+        annotation = Annotated[(field.annotation, *field.metadata, query)]
         parameters.append(inspect.Parameter(
             field_name,
             inspect.Parameter.KEYWORD_ONLY,

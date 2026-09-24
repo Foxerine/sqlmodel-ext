@@ -18,7 +18,7 @@ from sqlmodel_ext import TableViewRequest, query_dependency
 TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]
 ```
 
-`TableViewRequest` 同时包含分页（`offset` / `limit` / `desc` / `order`）、keyset 游标（`after_id`）和时间过滤（`created_after_datetime` / `created_before_datetime` / `updated_after_datetime` / `updated_before_datetime`）。`query_dependency()` 为模型的每个字段声明一个查询参数（类型、约束、默认值、说明与模型一致，OpenAPI 照常生成），并由它自己构造 `TableViewRequest`。
+`TableViewRequest` 同时包含分页（`offset` / `limit` / `desc` / `order`）、keyset 游标（`after_id`）和时间过滤（`created_after_datetime` / `created_before_datetime` / `updated_after_datetime` / `updated_before_datetime`）。`query_dependency()` 为模型的每个字段声明一个查询参数（类型、约束、默认值、标题、说明、示例、弃用标记与 `json_schema_extra` 都与模型字段一致，每个参数的 OpenAPI schema 就是该字段的 JSON schema），并由它自己构造 `TableViewRequest`。
 
 ### 为什么要用 `query_dependency()`
 

@@ -190,7 +190,7 @@ from sqlmodel_ext.session import SessionFactory
 
 | 成员 | 说明 |
 |------|------|
-| `commit(*, fail_soft_when_observed=False)` | commit 前自动登记所有缓存模型的变更（包括裸 `session.add()` / 改属性 / `session.delete()`），commit 后**同步**失效，再按顺序执行 post-commit 回调。`fail_soft_when_observed=True`：commit 本身失败照常抛出；commit **之后**的每一步（失效、每个回调）都单独容错（捕获包括取消在内的 `BaseException`，记日志，继续）。默认：失效步骤本身抛出的错误与取消会传播；回调的 `Exception` 记日志后跳过。**两种模式下，失效过程中的 Redis 故障都只记日志、不抛出**——数据库已经提交，受影响的缓存条目在 TTL 到期前会返回提交前的数据；不能依赖缓存的读取请用 `no_cache=True` |
+| `commit(*, fail_soft_when_observed=False)` | 缓存模型的变更（包括裸 `session.add()` / 改属性 / `session.delete()`）由写出它们的那次 flush 登记——事务中更早的 flush 或本次 commit 的 flush，commit 后**同步**失效，再按顺序执行 post-commit 回调。`fail_soft_when_observed=True`：commit 本身失败照常抛出；commit **之后**的每一步（失效、每个回调）都单独容错（捕获包括取消在内的 `BaseException`，记日志，继续）。默认：失效步骤本身抛出的错误与取消会传播；回调的 `Exception` 记日志后跳过。**两种模式下，失效过程中的 Redis 故障都只记日志、不抛出**——数据库已经提交，受影响的缓存条目在 TTL 到期前会返回提交前的数据；不能依赖缓存的读取请用 `no_cache=True` |
 | `commit_count`（属性） | 本 session 成功 commit 的次数。"是否提交了"的唯一真相源：关键写之前记下基线，之后 `commit_count > baseline` 即数据库已提交（充分非必要信号） |
 | `add_post_commit_callback(callback)` | 注册一个 `async` 无参回调，**只在下一次真正 commit 之后**执行；`rollback()` / `reset()` / `close()` 丢弃；在 savepoint 内注册 → `RuntimeError`；回调失败不阻塞后续回调，也不改变 commit 结果 |
 | `rollback(*, best_effort_budget_seconds=None)` | 回滚 + 丢弃待执行回调。传入预算时进入**有界放弃**模式：在 `asyncio.timeout` 下回滚，失败或超时就尽力 `invalidate()` 连接，**不抛异常**（`CancelledError` 仍传播）。不是硬上限（`invalidate` 可能仍在驱动里等待） |

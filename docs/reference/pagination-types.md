@@ -101,12 +101,12 @@ TableViewDep = Annotated[TableViewRequest, Depends(query_dependency(TableViewReq
 
 | 行为 | 说明 |
 |------|------|
-| 查询参数 | 每个模型字段一个，名字取字段别名（没有别名就是字段名），类型、约束、默认值、docstring 说明都来自字段——OpenAPI 与模型一致 |
+| 查询参数 | 每个模型字段一个，名字取字段别名（没有别名就是字段名），类型、约束、默认值、`title`、说明、`examples`、`deprecated`、`json_schema_extra`、`discriminator` 都来自字段——每个参数的 OpenAPI schema 就是该字段的 JSON schema（裸 `Depends()` 会丢掉这些文档属性）。描述模型而非请求参数的属性（`serialization_alias`、`exclude`、`exclude_if`、`frozen`、`repr`、`init`、`init_var`、`kw_only`）没有 `Query` 对应物；`validate_default` 在依赖构造模型时生效 |
 | 校验 | 由依赖自己构造模型，所有校验器（包括跨字段的）都会运行 |
 | 错误 | `ValidationError` 被转成 `fastapi.exceptions.RequestValidationError`，每个位置前加 `'query'`（`["query", "after_id"]`；没有字段位置的模型级错误变成 `["query"]`），由 FastAPI 默认处理器返回 422 |
 | 其它查询参数 | 忽略；端点可以在依赖旁边声明自己的查询参数 |
 | 缓存 | 每个模型类只生成一个可调用对象，FastAPI 的请求级依赖缓存把重复使用视为同一个依赖 |
-| 拒绝的模型（`TypeError`） | `table=True` 模型（它们跳过校验）、带 `default_factory` 的字段、`validation_alias` 不是单个字符串的字段 |
+| 拒绝的模型（`TypeError`） | `table=True` 模型（它们跳过校验）、带 `default_factory` 的字段、`validation_alias` 不是单个字符串的字段、可调用的 `json_schema_extra` 或 `Discriminator` 对象（`Query` 只接受 dict / 字段名） |
 
 为什么不在类上直接用 `Depends()`：FastAPI 逐个校验参数后调用这个类，那次调用抛出的 `ValidationError` 不是 `RequestValidationError`，跨字段错误就成了 500。见 [给列表端点加分页](/how-to/paginate-a-list-endpoint#为什么要用-query-dependency)。
 

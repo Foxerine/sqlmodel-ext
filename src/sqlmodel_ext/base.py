@@ -666,6 +666,10 @@ def _recover_annotated_sqlmodel_fields(
     if not is_table:
         return
 
+    # Names the class body declares itself -- taken before the loop below
+    # writes inherited fields into ``annotations``.
+    own_names = frozenset(annotations)
+
     # Collect all Annotated fields: current class + inherited from parents
     all_annotated: dict[str, typing.Any] = {}
 
@@ -749,17 +753,45 @@ def _recover_annotated_sqlmodel_fields(
             # ``unique=True``.
             _merge_field_info_attrs(sqlmodel_fi, existing_default)
         elif existing_default is Undefined:
-            # Inherit default from parent model_fields, but only when FieldInfo has no default/factory
-            if sqlmodel_fi.default is Undefined and sqlmodel_fi.default_factory is None:
-                for base in bases:
-                    base_fields = getattr(base, 'model_fields', None)
-                    if base_fields and field_name in base_fields:
-                        base_fi = base_fields[field_name]
-                        if base_fi.default is not Undefined:
-                            sqlmodel_fi.default = base_fi.default
-                        elif base_fi.default_factory is not None:
-                            sqlmodel_fi.default_factory = base_fi.default_factory
-                        break
+            base_fi = next(
+                (
+                    base_fields[field_name]
+                    for base in bases
+                    if (base_fields := getattr(base, 'model_fields', None)) and field_name in base_fields
+                ),
+                None,
+            )
+            if base_fi is not None and field_name not in own_names:
+                # An inherited field (the class body does not declare it). Its
+                # right-hand ``= Field(...)`` lives in the base class, not in
+                # ``attrs``; the base's resolved ``FieldInfo`` is the single
+                # source of truth for everything the author declared there --
+                # the SQLModel column attributes (``index`` / ``unique`` /
+                # ``primary_key`` / ``foreign_key`` / ``nullable`` / ``sa_type``
+                # / ``sa_column_kwargs`` / ``ondelete`` ...), the Pydantic
+                # attributes and the default. Merge all of it, exactly like the
+                # right-hand-side branch above; without it the injected
+                # ``attrs[field_name]`` replaces the inherited field and a
+                # column declared ``Field(index=True)`` in a base class is
+                # created without its index.
+                _merge_field_info_attrs(sqlmodel_fi, base_fi)
+                # The base field has either a default or a factory: the merge
+                # skips an unset one, so clear the alias's own counterpart.
+                if base_fi.default_factory is not None:
+                    sqlmodel_fi.default = Undefined
+                elif base_fi.default is not Undefined:
+                    sqlmodel_fi.default_factory = None
+            elif (
+                    base_fi is not None
+                    and sqlmodel_fi.default is Undefined
+                    and sqlmodel_fi.default_factory is None
+            ):
+                # Re-declared in the class body without a right-hand side:
+                # only the default is inherited.
+                if base_fi.default is not Undefined:
+                    sqlmodel_fi.default = base_fi.default
+                elif base_fi.default_factory is not None:
+                    sqlmodel_fi.default_factory = base_fi.default_factory
 
         # Inject SQLModel FieldInfo as field default (equivalent to = Field(...) style)
         attrs[field_name] = sqlmodel_fi

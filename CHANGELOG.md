@@ -15,13 +15,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`TableViewRequest`, `PaginationRequest`, `PageWindowRequest`, `TimeFilterRequest`,
   `TrgmSearchRequest`, your subclasses):
   `Annotated[TableViewRequest, Depends(query_dependency(TableViewRequest))]`. It declares
-  one query parameter per field (same OpenAPI schema), builds the model itself and
+  one query parameter per field carrying the field's type, constraints, default, `title`,
+  description, `examples`, `deprecated`, `json_schema_extra` and `discriminator` (each
+  parameter's OpenAPI schema is the field's JSON schema; a callable `json_schema_extra`
+  or a `Discriminator` object is a `TypeError`), builds the model itself and
   re-raises a failed construction as `RequestValidationError` with locations prefixed by
   `'query'`, so FastAPI answers 422. Requires the `fastapi` extra when called. See
   [Paginate a list endpoint](docs/en/how-to/paginate-a-list-endpoint.md).
 
 ### Fixed
 
+- A bare mutation of a cached model that was flushed before the enhanced `commit()` -- inside
+  a savepoint (`begin_nested()` + `flush()`), by a manual `session.flush()`, or by an
+  autoflush -- was never invalidated: the cache kept serving the pre-commit row after the
+  commit. Pending invalidations were collected by scanning `new` / `dirty` / `deleted`
+  right before the commit, and a flushed object is no longer in those sets. Every flush
+  now registers the cached instances it writes (`after_flush`); an outermost rollback
+  drops them, a savepoint rollback keeps them (at most one extra invalidation). Also
+  present in 0.5.0.
+- A table class inheriting a field declared with a type alias and a right-hand
+  `Field(...)` (`language: Str64 = Field(index=True)` in a non-table base) lost that
+  `Field`'s attributes: the column had no index / unique constraint / primary key /
+  foreign key / `nullable` / `sa_type` / `sa_column_kwargs` / `ondelete`, and the
+  Pydantic field could lose attributes set only there (e.g. `title`). The metaclass
+  rebuilt the inherited field from the alias's `Field` alone; it now merges the base
+  class's resolved field into it. Plain-typed inherited fields (`int = Field(index=True)`)
+  were not affected. Also present in 0.5.0.
 - A cross-field validation failure of `TableViewRequest` (and the other query DTOs) used
   as a FastAPI dependency (`after_id` with a non-zero `offset`, `after_id` with a mutable
   `order`, an inverted time range) was a 500. Declared through `query_dependency()` it is

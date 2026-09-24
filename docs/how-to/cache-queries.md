@@ -79,7 +79,7 @@ char = await char.save(session)
 | `delete(instance)` | 同上 |
 | `delete(condition=...)` | 全模型 ID 清理 + 版本号 `+1` |
 | `add()` | 版本号 `+1`（显式指定 id 的实例额外清 ID 缓存） |
-| 裸 `session.add()` / 改属性 / `session.delete()` 后 `session.commit()` | 同样自动失效（增强 `commit()` 在提交前自动登记） |
+| 裸 `session.add()` / 改属性 / `session.delete()` 后 `session.commit()` | 同样自动失效（由写出它们的那次 flush 登记，包括事务中更早的 savepoint flush、手动 `flush()` 或 autoflush） |
 
 ## 4. 事务里也是对的
 

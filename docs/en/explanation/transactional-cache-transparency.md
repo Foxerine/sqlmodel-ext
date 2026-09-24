@@ -94,7 +94,7 @@ Register first, then execute, and the warning won't fire (the table already has 
 
 CRUD methods (`save` / `update` / `delete` / `add`) **don't invalidate** themselves; they only register pending invalidations into `session.info`. The enhanced `AsyncSession.commit()` orchestrates:
 
-1. Auto-register every change of cached models in the session (covering bare `add` / attribute mutation / `delete` that bypass the CRUD methods)
+1. Every flush registers the cached models it writes (the `after_flush` event), covering bare `add` / attribute mutation / `delete` that bypass the CRUD methods -- whether they were flushed earlier (inside a savepoint, by a manual `flush()`, by an autoflush) or by this commit
 2. Actually commit. The `after_commit` event pops the complete set of registered items — including those registered by this commit's own flush, such as cascade-deleted children — and hands it over to `commit()`
 3. Synchronously invalidate the handed-over items, each exactly once
 4. Run post-commit callbacks

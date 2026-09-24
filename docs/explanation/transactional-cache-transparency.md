@@ -94,7 +94,7 @@ await session.commit()                                  # 增强 commit 同步�
 
 CRUD 方法（`save` / `update` / `delete` / `add`）自己**不失效**，只把待失效项登记到 `session.info`。增强 `AsyncSession.commit()` 负责编排：
 
-1. 自动登记 session 里所有缓存模型的变更（覆盖绕过 CRUD 方法的裸 `add` / 改属性 / `delete`）
+1. 每次 flush 都登记它写出的缓存模型（`after_flush` 事件），覆盖绕过 CRUD 方法的裸 `add` / 改属性 / `delete`——无论它们是更早被 flush 的（savepoint 内、手动 `flush()`、autoflush），还是由本次 commit flush 的
 2. 真正 commit。`after_commit` 事件弹出完整的登记项——包括本次 commit 自身 flush 期间登记的（如级联删除的子项）——并移交给 `commit()`
 3. 同步失效移交来的登记项，每项恰好一次
 4. 执行 post-commit 回调

@@ -229,11 +229,13 @@ class AsyncSession(_AsyncSessionBase):
     async def commit(self, *, fail_soft_when_observed: bool = False) -> None:
         """Commit + synchronously invalidate every involved ``CachedTableBaseMixin`` model + run post-commit callbacks.
 
-        Ordering: auto-register new/dirty/deleted cached models (covers bare
-        add/mutate/delete + commit paths) -> pop the callback queue -> mark
-        the session as inside the enhanced commit -> ``super().commit()``
-        actually commits (its flush may register more pendings, e.g. cascade
-        children via the ``persistent_to_deleted`` event); the ``after_commit``
+        Ordering: pop the callback queue -> mark the session as inside the
+        enhanced commit -> ``super().commit()`` actually commits. Bare ORM
+        mutations (add / attribute assignment / delete without a CRUD method)
+        are registered by the ``after_flush`` event of whichever flush sent
+        them -- an earlier savepoint flush, manual ``flush()`` or autoflush,
+        or this commit's own flush (which also registers cascade children via
+        the ``persistent_to_deleted`` event); the ``after_commit``
         event pops the complete pending set and, because of the mark, hands
         it over to this method instead of scheduling the fire-and-forget
         fallback -> clear the mark, take the hand-over -> bump
@@ -263,7 +265,6 @@ class AsyncSession(_AsyncSessionBase):
         a hard guarantee must not rely on the cache for that read
         (``no_cache=True``).
         """
-        CachedTableBaseMixin._autoregister_session_mutations(self)  # pyright: ignore[reportPrivateUsage]
         callbacks: list[Callable[[], Awaitable[None]]] = self.info.pop(POST_COMMIT_CALLBACKS_KEY, [])
         # While marked, the after_commit event hands its popped pendings to
         # this method instead of scheduling the fire-and-forget fallback.

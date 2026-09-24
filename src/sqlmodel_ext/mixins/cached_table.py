@@ -690,11 +690,38 @@ class CachedTableBaseMixin(TableBaseMixin):
             the outer transaction); after a savepoint *rollback* the entry is
             kept (over-strict: queries on those tables keep skipping the cache
             for the rest of the transaction -- the safe direction).
+
+            The same pass registers the pending invalidation of every cached
+            instance written by this flush. This is the **only** place a bare
+            ORM mutation (``session.add()`` / attribute assignment /
+            ``session.delete()`` without a CRUD method) is registered: once
+            flushed, the object leaves ``new/dirty/deleted``, so a scan at
+            commit time misses every mutation flushed earlier in the
+            transaction -- a savepoint flush, a manual ``session.flush()``,
+            an autoflush. The commit's own flush fires this event before
+            ``after_commit`` pops the pendings, so it is covered too.
+            Rollback semantics are those of every pending: an outermost
+            rollback drops them; a savepoint rollback keeps them (one extra
+            invalidation at the outer commit -- the safe direction).
+
+            - new -> the flushed primary key (just assigned by the INSERT) --
+              row-level + query cache; ``_QUERY_ONLY_INVALIDATION`` if the
+              model has no ``id`` value
+            - dirty / deleted -> row-level ``id`` + query cache
+
+            The id is read from the instance ``__dict__`` (no attribute
+            access, so no lazy load can be triggered inside the event).
             """
             flushed: set[TableClause] = session.info.setdefault(_SESSION_FLUSHED_TABLES, set())
             for collection in (session.new, session.dirty, session.deleted):
                 for obj in collection:
-                    flushed.update(instance_state(obj).mapper.tables)
+                    state = instance_state(obj)
+                    flushed.update(state.mapper.tables)
+                    if isinstance(obj, CachedTableBaseMixin):
+                        _id: Any = state.dict.get('id')
+                        CachedTableBaseMixin._register_pending_invalidation(
+                            session, type(obj), _id if _id is not None else _QUERY_ONLY_INVALIDATION,
+                        )
 
         def _on_persistent_to_deleted(session: _SyncSession, instance: object) -> None:
             """Cascade delete cache invalidation -- listen for the
@@ -717,9 +744,7 @@ class CachedTableBaseMixin(TableBaseMixin):
                 _id = getattr(instance, 'id', None)
                 if _id is not None:
                     _cls = type(instance)
-                    CachedTableBaseMixin._register_pending_invalidation(
-                        session, _cls, _id,  # pyright: ignore[reportArgumentType]  # SA event delivers _SyncSession, .info is compatible
-                    )
+                    CachedTableBaseMixin._register_pending_invalidation(session, _cls, _id)
                     cascade_info: dict[type, set[Any]] = session.info.setdefault(
                         _SESSION_CASCADE_DELETED_KEY, {}
                     )
@@ -1998,7 +2023,7 @@ class CachedTableBaseMixin(TableBaseMixin):
 
     @staticmethod
     def _register_pending_invalidation(
-            session: AsyncSession,
+            session: AsyncSession | _SyncSession,
             model_type: type,
             instance_id: Any | None = None,
     ) -> None:
@@ -2584,45 +2609,6 @@ class CachedTableBaseMixin(TableBaseMixin):
     #  Misuse hardening
     #  (invoked by sqlmodel_ext.session.AsyncSession commit/refresh/execute)
     # ================================================================
-
-    @staticmethod
-    def _autoregister_session_mutations(session: AsyncSession) -> None:
-        """Auto-register pending invalidations for every ``CachedTableBaseMixin`` instance in the session before commit.
-
-        Covers the bare paths that bypass CRUD methods -- ``session.add(x)`` /
-        direct attribute mutation / ``session.delete(x)`` followed by a plain
-        ``session.commit()`` (without ``Model.save()/delete()``). Forms a set
-        union with the CRUD methods' explicit registrations, so there is no
-        double invalidation; deletes are additionally registered by the
-        ``persistent_to_deleted`` event -- this is belt-and-suspenders.
-
-        - new (pending INSERT; int PKs may still have id=None) -> query-cache
-          invalidation only (``_QUERY_ONLY_INVALIDATION``)
-        - dirty (pending UPDATE) / deleted -> row-level ID + query cache
-        """
-        # Iterate directly (no list() copy): _register_pending_invalidation
-        # only writes session.info and never mutates the new/dirty/deleted
-        # sets, so there is no mutation-during-iteration risk. dirty is
-        # computed from SA's incrementally-maintained _modified set
-        # (O(modified objects), not a full-table scan), so the cost scales
-        # with the commit workload.
-        sync = session.sync_session
-        for inst in sync.new:
-            if isinstance(inst, CachedTableBaseMixin):
-                CachedTableBaseMixin._register_pending_invalidation(
-                    session, type(inst), _QUERY_ONLY_INVALIDATION,
-                )
-        for inst in sync.dirty:
-            if isinstance(inst, CachedTableBaseMixin):
-                _id = getattr(inst, 'id', None)
-                CachedTableBaseMixin._register_pending_invalidation(
-                    session, type(inst), _id if _id is not None else _QUERY_ONLY_INVALIDATION,
-                )
-        for inst in sync.deleted:
-            if isinstance(inst, CachedTableBaseMixin):
-                _id = getattr(inst, 'id', None)
-                if _id is not None:
-                    CachedTableBaseMixin._register_pending_invalidation(session, type(inst), _id)
 
     _cached_tablename_index: ClassVar[dict[str, list[type['CachedTableBaseMixin']]] | None] = None
 
