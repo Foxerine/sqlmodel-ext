@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlmodel.ext.asyncio.session import AsyncSession as PlainAsyncSession
 
 from sqlmodel_ext import AsyncSession, CachedTableBaseMixin, SQLModelBase, UUIDTableBaseMixin
+from sqlmodel_ext.mixins.cached_table import _SESSION_COMMITTED_PENDING_KEY
 
 FALLBACK_MESSAGE = "fallback compensation triggered"
 
@@ -97,6 +98,40 @@ async def test_enhanced_commit_invalidates_once_without_fallback_warning(
         await s.commit()
         await _drain()
 
+    assert _fallback_records(caplog) == []
+    assert await fake_redis.exists(f"id:CommitPathGadget:{gid}") == 0
+    assert await _version(fake_redis) == before + 1, "one commit must invalidate the query cache exactly once"
+
+
+@pytest.mark.asyncio
+async def test_enhanced_commit_preserves_handoff_until_transaction_end_listener_returns(
+    engine: AsyncEngine,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The outermost transaction-end listener must not erase the pending hand-off."""
+    gid = await _seed(engine, fake_redis)
+    caplog.set_level(logging.WARNING)
+    before = await _version(fake_redis)
+
+    async with AsyncSession(engine) as s:
+        observed_handoff: list[set[Any]] = []
+
+        def _capture_handoff_after_transaction_end(sync_session: Any, transaction: Any) -> None:
+            if transaction.parent is not None:
+                return
+            handed_over = sync_session.info.get(_SESSION_COMMITTED_PENDING_KEY)
+            observed_handoff.append(
+                set(handed_over.get(CommitPathGadget, set())) if isinstance(handed_over, dict) else set()
+            )
+
+        sa_event.listen(s.sync_session, 'after_transaction_end', _capture_handoff_after_transaction_end)
+        gadget = await _load(s, gid)
+        gadget.quantity = 2
+        await s.commit()
+        await _drain()
+
+    assert observed_handoff == [{gid}]
     assert _fallback_records(caplog) == []
     assert await fake_redis.exists(f"id:CommitPathGadget:{gid}") == 0
     assert await _version(fake_redis) == before + 1, "one commit must invalidate the query cache exactly once"

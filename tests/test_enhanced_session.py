@@ -34,6 +34,7 @@ from sqlmodel_ext.mixins.cached_table import (
     _SESSION_ENHANCED_COMMIT_KEY,
     _SESSION_FLUSHED_TABLES,
     _SESSION_PENDING_CACHE_KEY,
+    CachedTableBaseMixin,
 )
 from sqlmodel_ext.mixins.table import SESSION_REPEATABLE_READ_KEY
 from sqlmodel_ext.session import (
@@ -71,6 +72,26 @@ async def test_commit_plain_model_degrades_to_plain_commit(
     rows = result.scalars().all()
     assert len(rows) == 1
     assert rows[0].name == "plain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('boundary', ['commit', 'rollback', 'close', 'reset', 'invalidate'])
+async def test_transaction_boundary_clears_pending_write_tracking(
+    enhanced_session: AsyncSession,
+    boundary: str,
+) -> None:
+    """Every outermost transaction boundary must make pending writes invisible to the reused session."""
+    CachedTableBaseMixin._register_session_commit_hook()
+    enhanced_session.add(SessEntry(name='pending'))
+    await enhanced_session.flush()
+    enhanced_session.info[_SESSION_PENDING_CACHE_KEY] = {SessEntry: {1}}
+    assert CachedTableBaseMixin._tables_with_uncommitted_writes(enhanced_session)
+
+    boundary_method = getattr(enhanced_session, boundary)
+    await boundary_method()
+
+    assert _SESSION_PENDING_CACHE_KEY not in enhanced_session.info
+    assert CachedTableBaseMixin._tables_with_uncommitted_writes(enhanced_session) == set()
 
 
 @pytest.mark.asyncio
