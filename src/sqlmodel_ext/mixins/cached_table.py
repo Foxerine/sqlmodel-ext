@@ -265,7 +265,7 @@ _FORBIDDEN_DIRECT_CALLS: frozenset[str] = frozenset({
 
 
 def _on_outermost_transaction_end(session: _SyncSession, transaction: SessionTransaction) -> None:
-    """Clear the "tables with uncommitted writes" set when the outermost transaction ends.
+    """Clear the state that feeds the "uncommitted writes" check when the outermost transaction ends.
 
     ``transaction.parent is None`` is the *common exit* of commit / rollback /
     ``close()`` / ``reset()`` / ``invalidate()`` -- all of them dispatch this
@@ -276,12 +276,26 @@ def _on_outermost_transaction_end(session: _SyncSession, transaction: SessionTra
     cleanup always misses an entry point. Nested savepoints and the
     SUBTRANSACTION of a flush (``parent`` set) are ignored.
 
+    ``_SESSION_PENDING_CACHE_KEY`` is cleared here as well. Besides being the
+    list of pending invalidations, it is one of the three sources of
+    ``_tables_with_uncommitted_writes``: if it survives an ``invalidate()``,
+    every later ``get()`` on those tables skips the cache for as long as the
+    session is reused. On commit and on the outermost rollback,
+    ``after_commit`` / ``after_rollback`` have already popped it, so this is a
+    no-op there; ``invalidate()`` fires only this event.
+
+    Do **not** clear ``_SESSION_COMMITTED_PENDING_KEY`` here: the enhanced
+    ``commit()`` reads it after ``super().commit()`` returns, and this event
+    fires inside ``super().commit()``, right after ``after_commit``. Clearing
+    it here would drop the synchronous invalidation of every enhanced commit.
+
     Registered at import time (not by ``_register_session_commit_hook``):
     ``register_raw_dml_write`` fills the set for every session, cached models
     or not, so its lifetime must not depend on cache configuration.
     """
     if transaction.parent is None:
         session.info.pop(_SESSION_FLUSHED_TABLES, None)
+        session.info.pop(_SESSION_PENDING_CACHE_KEY, None)
 
 
 event.listen(_SyncSession, "after_transaction_end", _on_outermost_transaction_end)
@@ -2590,8 +2604,9 @@ class CachedTableBaseMixin(TableBaseMixin):
 
         This is **not** the common exit of transaction termination:
         ``close()`` / ``reset()`` do not dispatch ``after_rollback``, and the
-        async ``invalidate()`` bypasses them entirely. Transaction-level state
-        (such as ``_SESSION_FLUSHED_TABLES``) is therefore cleared in the
+        async ``invalidate()`` bypasses them entirely. State that feeds the
+        uncommitted-writes check (``_SESSION_FLUSHED_TABLES`` and
+        ``_SESSION_PENDING_CACHE_KEY``) is therefore cleared in the
         always-on ``_on_outermost_transaction_end`` listener -- do not
         add more keys here. The invalidation-tracking keys cleared here are
         normally consumed by ``after_commit`` / cleared by ``after_rollback``

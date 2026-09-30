@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > there is no stability or backward-compatibility guarantee between versions, and
 > you use it at your own risk. Pin the exact version you depend on.
 
+## [Unreleased]
+
+### Fixed
+
+- After `session.invalidate()`, a session that kept being used skipped the Redis cache
+  for every read and write on the tables it had written in the invalidated transaction.
+  `invalidate()` ends the transaction without dispatching `after_rollback`, so the
+  pending-invalidation dict was never cleared, and that dict is also one of the sources
+  of the "uncommitted writes" check that makes `get()` bypass the cache. The dict is now
+  cleared when the outermost transaction ends, the same place that already cleared the
+  flushed-tables set. Commit, rollback, `close()` and `reset()` were not affected. The
+  cache contents were always correct; the effect was lost cache hits, not stale data.
+
 ## [0.5.2]
 
 ### Fixed
