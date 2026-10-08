@@ -1,0 +1,90 @@
+name: Release
+
+# Publishes to PyPI when a version tag (v1.2.3) is pushed.
+#
+# Authentication is PyPI Trusted Publishing (OIDC): no API token is stored in this
+# repository. The PyPI project must list this workflow as a trusted publisher
+# (owner Foxerine, repository sqlmodel-ext, workflow release.yml, environment pypi).
+#
+# Release steps:
+#   1. Bump `version` in pyproject.toml and `__version__` in src/sqlmodel_ext/__init__.py,
+#      and turn the CHANGELOG "[Unreleased]" heading into the new version.
+#   2. Commit to master, then: git tag -a vX.Y.Z -m "sqlmodel-ext X.Y.Z" && git push origin vX.Y.Z
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # The full CI suite (tests on all supported Pythons, basedpyright, consumer
+  # integration) must pass on the tagged commit before anything is published.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # The tag, pyproject.toml and __version__ must name the same version; a mismatch
+  # would publish a package whose metadata disagrees with the tag.
+  verify-version:
+    name: verify tag matches package version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compare tag, pyproject.toml and __version__
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, tomllib
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          with open("pyproject.toml", "rb") as f:
+              project = tomllib.load(f)["project"]["version"]
+          init = open("src/sqlmodel_ext/__init__.py", encoding="utf-8").read()
+          match = re.search(r'^__version__ = "([^"]+)"', init, re.M)
+          module = match.group(1) if match else None
+          print(f"tag={tag} pyproject={project} __version__={module}")
+          if not (tag == project == module):
+              print("::error::tag, pyproject.toml version and __version__ differ")
+              sys.exit(1)
+          PY
+
+  build:
+    name: build sdist and wheel
+    runs-on: ubuntu-latest
+    needs: [ci, verify-version]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build
+        run: uv build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sqlmodel-ext/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
