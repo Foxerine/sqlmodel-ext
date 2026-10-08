@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > there is no stability or backward-compatibility guarantee between versions, and
 > you use it at your own risk. Pin the exact version you depend on.
 
-## [Unreleased]
+## [0.5.3]
 
 ### Fixed
 
@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cleared when the outermost transaction ends, the same place that already cleared the
   flushed-tables set. Commit, rollback, `close()` and `reset()` were not affected. The
   cache contents were always correct; the effect was lost cache hits, not stale data.
+- A fresh `pip install sqlmodel-ext` could not be imported: SQLAlchemy 2.1 no longer
+  installs `greenlet` by default, and `sqlmodel_ext` imports `sqlalchemy.ext.asyncio` when
+  the package is imported, which raised `ImportError` without it. The dependency is now
+  `sqlalchemy[asyncio]`, which installs `greenlet`. Environments that already had
+  `greenlet` (or SQLAlchemy 2.0) were not affected. Also present in 0.5.2 and earlier.
 
 ## [0.5.2]
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-ext"
-version = "0.5.2"
+version = "0.5.3"
 description = "Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphic inheritance, optimistic locking, relation preloading, and reusable field types."
 readme = "README.md"
 license = "MIT"
@@ -32,7 +32,9 @@ dependencies = [
     # 2.12 is the first release shipping ``pydantic.experimental.missing_sentinel.MISSING``
     # (the object ``Unset`` is) and ``Field(exclude_if=...)`` (behind ``EXCLUDE_IF_NONE``).
     "pydantic>=2.12",
-    "sqlalchemy>=2.0",
+    # The ``asyncio`` extra pulls in ``greenlet``: ``sqlmodel_ext.session`` imports
+    # ``sqlalchemy.ext.asyncio`` at module level, and SQLAlchemy 2.1 made greenlet optional.
+    "sqlalchemy[asyncio]>=2.0",
     # ``sqlmodel_ext.unset`` imports ``typing_extensions.Sentinel`` directly (to register
     # its deepcopy reducer); pydantic 2.12 already requires this floor transitively.
     "typing-extensions>=4.14.1",
