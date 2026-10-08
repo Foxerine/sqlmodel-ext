@@ -693,7 +693,9 @@ class RelationPreloadMixin:
         if relationship_property.secondary is not None:
             return f"many-to-many relationship '{spec}'"
         pairs = relationship_property.local_remote_pairs
-        if pairs is None or len(pairs) != 1:
+        # Truthiness rather than ``is None``: SQLAlchemy 2.0 types the attribute
+        # Optional, 2.1 does not (where ``is None`` is flagged as unreachable).
+        if not pairs or len(pairs) != 1:
             return f"composite-FK or unresolved relationship '{spec}'"
         local_col, remote_col = pairs[0]
         if remote_col.key != 'id':

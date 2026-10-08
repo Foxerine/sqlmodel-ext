@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > there is no stability or backward-compatibility guarantee between versions, and
 > you use it at your own risk. Pin the exact version you depend on.
 
+## [0.5.4]
+
+### Changed
+
+- **Requires `sqlmodel>=0.0.48`** (was `>=0.0.32`). SQLModel 0.0.48 made `Select` generic
+  over a TypeVarTuple, so a two-column projection is now `Select[UUID, str]` instead of
+  `Select[tuple[UUID, str]]`. The overloads of `sqlmodel_ext.select` follow the new
+  spelling, which type checkers reject on older SQLModel releases. Annotations written
+  as `Select[tuple[...]]` in your own code need the same change. Runtime behavior is
+  unchanged: `sqlmodel_ext.select` is still `sqlmodel.select` itself.
+
+### Fixed
+
+- Type checking against SQLAlchemy 2.1 (now allowed by SQLModel 0.0.48) reported errors
+  inside the library: 2.1 types the module-level `asc()`/`desc()` as returning
+  `OrderByList | UnaryExpression` for an ORM attribute, and no longer types
+  `RelationshipProperty.local_remote_pairs` as optional. Both call sites now use forms
+  typed the same way on SQLAlchemy 2.0 and 2.1. No runtime change; the test suite passes
+  on both.
+
 ## [0.5.3]
 
 ### Fixed

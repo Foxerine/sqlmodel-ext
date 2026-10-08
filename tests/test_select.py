@@ -151,6 +151,6 @@ def test_static_wide_projections(tmp_path: Path) -> None:
     errors = [d['message'] for d in report['generalDiagnostics'] if d['severity'] == 'error']
     assert errors == []
     assert _revealed_types(report) == [
-        'Select[tuple[UUID, str, int, datetime, datetime]]',
-        'Select[tuple[UUID, str, int, datetime, int]]',
+        'Select[UUID, str, int, datetime, datetime]',
+        'Select[UUID, str, int, datetime, int]',
     ]

@@ -1858,7 +1858,7 @@ sqlmodel_ext/
 ## 依赖要求
 
 - **Python** >= 3.12（在 3.12、3.13、3.14 上测试）
-- **sqlmodel** >= 0.0.32
+- **sqlmodel** >= 0.0.48
 - **pydantic** >= 2.12
 - **sqlalchemy** >= 2.0
 - **typing-extensions** >= 4.14.1

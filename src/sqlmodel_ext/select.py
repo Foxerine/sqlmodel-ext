@@ -34,6 +34,11 @@ call with no matching overload. This module fixes the annotations only.
    attributes in ``col(...)`` to stay on the precise overload. (Generating all
    2**n shape combinations for n up to 9 would mean ~1000 overloads.)
 
+Return types use SQLModel's variadic form ``Select[_T0, _T1, ...]``, which
+SQLModel adopted in 0.0.48 (``Select`` became generic over a TypeVarTuple;
+before it was ``Select[tuple[...]]``). The two spellings are mutually
+incompatible, hence the ``sqlmodel>=0.0.48`` floor.
+
 Overloads stop at 9 columns on purpose: beyond that the type checker reports
 an error instead of silently degrading to ``Any``.
 
@@ -45,7 +50,7 @@ Usage::
     from sqlmodel import col
     from sqlmodel_ext import select
 
-    stmt = select(User.id, User.name)                    # Select[tuple[UUID, str]]
+    stmt = select(User.id, User.name)                    # Select[UUID, str]
     stmt = select(
         col(User.id), col(User.name), col(User.email),
         col(User.created_at), col(User.role),
@@ -109,28 +114,28 @@ if TYPE_CHECKING:
         ent0: _TCCA[_T0],
         ent1: _TCCA[_T1],
         /,
-    ) -> Select[tuple[_T0, _T1]]: ...
+    ) -> Select[_T0, _T1]: ...
 
     @overload
     def select(
         ent0: _TCCA[_T0],
         entity_1: _TScalar_1,
         /,
-    ) -> Select[tuple[_T0, _TScalar_1]]: ...
+    ) -> Select[_T0, _TScalar_1]: ...
 
     @overload
     def select(
         entity_0: _TScalar_0,
         ent1: _TCCA[_T1],
         /,
-    ) -> Select[tuple[_TScalar_0, _T1]]: ...
+    ) -> Select[_TScalar_0, _T1]: ...
 
     @overload
     def select(
         entity_0: _TScalar_0,
         entity_1: _TScalar_1,
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1]: ...
 
     @overload
     def select(
@@ -138,7 +143,7 @@ if TYPE_CHECKING:
         ent1: _TCCA[_T1],
         ent2: _TCCA[_T2],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2]]: ...
+    ) -> Select[_T0, _T1, _T2]: ...
 
     @overload
     def select(
@@ -146,7 +151,7 @@ if TYPE_CHECKING:
         ent1: _TCCA[_T1],
         entity_2: _TScalar_2,
         /,
-    ) -> Select[tuple[_T0, _T1, _TScalar_2]]: ...
+    ) -> Select[_T0, _T1, _TScalar_2]: ...
 
     @overload
     def select(
@@ -154,7 +159,7 @@ if TYPE_CHECKING:
         entity_1: _TScalar_1,
         ent2: _TCCA[_T2],
         /,
-    ) -> Select[tuple[_T0, _TScalar_1, _T2]]: ...
+    ) -> Select[_T0, _TScalar_1, _T2]: ...
 
     @overload
     def select(
@@ -162,7 +167,7 @@ if TYPE_CHECKING:
         entity_1: _TScalar_1,
         entity_2: _TScalar_2,
         /,
-    ) -> Select[tuple[_T0, _TScalar_1, _TScalar_2]]: ...
+    ) -> Select[_T0, _TScalar_1, _TScalar_2]: ...
 
     @overload
     def select(
@@ -170,7 +175,7 @@ if TYPE_CHECKING:
         ent1: _TCCA[_T1],
         ent2: _TCCA[_T2],
         /,
-    ) -> Select[tuple[_TScalar_0, _T1, _T2]]: ...
+    ) -> Select[_TScalar_0, _T1, _T2]: ...
 
     @overload
     def select(
@@ -178,7 +183,7 @@ if TYPE_CHECKING:
         ent1: _TCCA[_T1],
         entity_2: _TScalar_2,
         /,
-    ) -> Select[tuple[_TScalar_0, _T1, _TScalar_2]]: ...
+    ) -> Select[_TScalar_0, _T1, _TScalar_2]: ...
 
     @overload
     def select(
@@ -186,7 +191,7 @@ if TYPE_CHECKING:
         entity_1: _TScalar_1,
         ent2: _TCCA[_T2],
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1, _T2]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1, _T2]: ...
 
     @overload
     def select(
@@ -194,7 +199,7 @@ if TYPE_CHECKING:
         entity_1: _TScalar_1,
         entity_2: _TScalar_2,
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1, _TScalar_2]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1, _TScalar_2]: ...
 
     @overload
     def select(
@@ -203,7 +208,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3]: ...
 
     @overload
     def select(
@@ -212,7 +217,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _TScalar_3]]: ...
+    ) -> Select[_T0, _T1, _T2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -221,7 +226,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_T0, _T1, _TScalar_2, _T3]]: ...
+    ) -> Select[_T0, _T1, _TScalar_2, _T3]: ...
 
     @overload
     def select(
@@ -230,7 +235,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_T0, _T1, _TScalar_2, _TScalar_3]]: ...
+    ) -> Select[_T0, _T1, _TScalar_2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -239,7 +244,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_T0, _TScalar_1, _T2, _T3]]: ...
+    ) -> Select[_T0, _TScalar_1, _T2, _T3]: ...
 
     @overload
     def select(
@@ -248,7 +253,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_T0, _TScalar_1, _T2, _TScalar_3]]: ...
+    ) -> Select[_T0, _TScalar_1, _T2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -257,7 +262,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_T0, _TScalar_1, _TScalar_2, _T3]]: ...
+    ) -> Select[_T0, _TScalar_1, _TScalar_2, _T3]: ...
 
     @overload
     def select(
@@ -266,7 +271,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_T0, _TScalar_1, _TScalar_2, _TScalar_3]]: ...
+    ) -> Select[_T0, _TScalar_1, _TScalar_2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -275,7 +280,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_TScalar_0, _T1, _T2, _T3]]: ...
+    ) -> Select[_TScalar_0, _T1, _T2, _T3]: ...
 
     @overload
     def select(
@@ -284,7 +289,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_TScalar_0, _T1, _T2, _TScalar_3]]: ...
+    ) -> Select[_TScalar_0, _T1, _T2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -293,7 +298,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_TScalar_0, _T1, _TScalar_2, _T3]]: ...
+    ) -> Select[_TScalar_0, _T1, _TScalar_2, _T3]: ...
 
     @overload
     def select(
@@ -302,7 +307,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_TScalar_0, _T1, _TScalar_2, _TScalar_3]]: ...
+    ) -> Select[_TScalar_0, _T1, _TScalar_2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -311,7 +316,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1, _T2, _T3]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1, _T2, _T3]: ...
 
     @overload
     def select(
@@ -320,7 +325,7 @@ if TYPE_CHECKING:
         ent2: _TCCA[_T2],
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1, _T2, _TScalar_3]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1, _T2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -329,7 +334,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         ent3: _TCCA[_T3],
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1, _TScalar_2, _T3]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1, _TScalar_2, _T3]: ...
 
     @overload
     def select(
@@ -338,7 +343,7 @@ if TYPE_CHECKING:
         entity_2: _TScalar_2,
         entity_3: _TScalar_3,
         /,
-    ) -> Select[tuple[_TScalar_0, _TScalar_1, _TScalar_2, _TScalar_3]]: ...
+    ) -> Select[_TScalar_0, _TScalar_1, _TScalar_2, _TScalar_3]: ...
 
     @overload
     def select(
@@ -348,7 +353,7 @@ if TYPE_CHECKING:
         ent3: _TCCA[_T3],
         ent4: _TCCA[_T4],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4]: ...
 
     @overload
     def select(
@@ -358,7 +363,7 @@ if TYPE_CHECKING:
         ent3: _TCCA[_T3] | _T3,
         ent4: _TCCA[_T4] | _T4,
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4]: ...
 
     @overload
     def select(
@@ -369,7 +374,7 @@ if TYPE_CHECKING:
         ent4: _TCCA[_T4],
         ent5: _TCCA[_T5],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5]: ...
 
     @overload
     def select(
@@ -380,7 +385,7 @@ if TYPE_CHECKING:
         ent4: _TCCA[_T4] | _T4,
         ent5: _TCCA[_T5] | _T5,
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5]: ...
 
     @overload
     def select(
@@ -392,7 +397,7 @@ if TYPE_CHECKING:
         ent5: _TCCA[_T5],
         ent6: _TCCA[_T6],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6]: ...
 
     @overload
     def select(
@@ -404,7 +409,7 @@ if TYPE_CHECKING:
         ent5: _TCCA[_T5] | _T5,
         ent6: _TCCA[_T6] | _T6,
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6]: ...
 
     @overload
     def select(
@@ -417,7 +422,7 @@ if TYPE_CHECKING:
         ent6: _TCCA[_T6],
         ent7: _TCCA[_T7],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]: ...
 
     @overload
     def select(
@@ -430,7 +435,7 @@ if TYPE_CHECKING:
         ent6: _TCCA[_T6] | _T6,
         ent7: _TCCA[_T7] | _T7,
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]: ...
 
     @overload
     def select(
@@ -444,7 +449,7 @@ if TYPE_CHECKING:
         ent7: _TCCA[_T7],
         ent8: _TCCA[_T8],
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8]: ...
 
     @overload
     def select(
@@ -458,7 +463,7 @@ if TYPE_CHECKING:
         ent7: _TCCA[_T7] | _T7,
         ent8: _TCCA[_T8] | _T8,
         /,
-    ) -> Select[tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8]]: ...
+    ) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8]: ...
 
     def select(*_entities: object) -> object: ...
 else:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-ext"
-version = "0.5.3"
+version = "0.5.4"
 description = "Extended SQLModel infrastructure: smart metaclass, async CRUD mixins, polymorphic inheritance, optimistic locking, relation preloading, and reusable field types."
 readme = "README.md"
 license = "MIT"
@@ -28,7 +28,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "sqlmodel>=0.0.32",
+    # 0.0.48 made ``Select`` variadic (``Select[A, B]``); ``sqlmodel_ext.select``'s
+    # overloads mirror that spelling, which earlier releases reject.
+    "sqlmodel>=0.0.48",
     # 2.12 is the first release shipping ``pydantic.experimental.missing_sentinel.MISSING``
     # (the object ``Unset`` is) and ``Field(exclude_if=...)`` (behind ``EXCLUDE_IF_NONE``).
     "pydantic>=2.12",

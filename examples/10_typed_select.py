@@ -7,9 +7,9 @@ Run::
 
 * ``sqlmodel_ext.select`` **is** ``sqlmodel.select`` at runtime; only the type
   overloads are extended from 4 to 9 columns, so a 5-column projection is typed
-  ``Select[tuple[...]]`` instead of "no matching overload". For 1 to 4 columns
+  ``Select[...]`` instead of "no matching overload". For 1 to 4 columns
   the overloads are exactly upstream's (``select(User.id, User.name)`` is
-  ``Select[tuple[UUID, str]]``); bare attributes also work for 5 to 9 columns.
+  ``Select[UUID, str]``); bare attributes also work for 5 to 9 columns.
   Only when a 5+ column projection mixes in a SQL function expression (such as
   ``func.count()``) should every column go through ``col()`` to keep the precise
   type. Beyond 9 columns the checker reports an error rather than degrading to
@@ -69,7 +69,7 @@ async def main() -> None:
             )
 
         # --- 6-column projection, fully typed ----------------------------------
-        stmt: Select[tuple[UUID, str, str, int, UUID | None, datetime]] = select(
+        stmt: Select[UUID, str, str, int, UUID | None, datetime] = select(
             col(Employee.id), col(Employee.name), col(Employee.team), col(Employee.level),
             col(Employee.manager_id), col(Employee.created_at),
         ).order_by(col(Employee.name).asc())

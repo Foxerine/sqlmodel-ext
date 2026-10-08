@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TypeAlias, TypeVar, Literal, override, overload, Any, ClassVar, Generic, cast
 
-from sqlalchemy import DateTime, ColumnElement, desc, asc, event, func, distinct, delete as sql_delete, inspect
+from sqlalchemy import DateTime, ColumnElement, event, func, distinct, delete as sql_delete, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
     InstanceState,
@@ -1337,16 +1337,21 @@ class TableBaseMixin(AsyncAttrs):
                     # by the request class's Literal (subclasses may add domain
                     # sort columns), so it is always a real column.
                     order_field = table_view.order if table_view.order is not None else 'created_at'
+                    # The column methods ``.asc()``/``.desc()`` are typed as
+                    # ``UnaryExpression`` on SQLAlchemy 2.0 and 2.1 alike; the
+                    # module-level ``asc()``/``desc()`` return
+                    # ``OrderByList | UnaryExpression`` on 2.1 for a ``Mapped``
+                    # argument, which is not a ``ColumnElement``.
                     order_col = col(getattr(cls, order_field))
-                    direction = desc if table_view.desc else asc
-                    order_by = [direction(order_col)]
+                    order_by = [order_col.desc() if table_view.desc else order_col.asc()]
                     # id tie-break: non-unique sort columns (e.g. rows created
                     # in one batch share created_at) have no defined order
                     # among ties, so offset and keyset pages would skip or
                     # repeat rows at page boundaries. Composite-PK tables
                     # without an id column are skipped.
                     if order_field != 'id' and hasattr(cls, 'id'):
-                        order_by.append(direction(col(getattr(cls, 'id'))))
+                        id_col = col(getattr(cls, 'id'))
+                        order_by.append(id_col.desc() if table_view.desc else id_col.asc())
                 if table_view.after_id is not None:
                     keyset_condition = await cls._build_keyset_condition(session, table_view, condition, filter)
 

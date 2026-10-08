@@ -201,7 +201,7 @@ error: Cannot access attribute "in_" for class "Str64"
 
 在类型层面，模型类属性是它的 Python 值类型（`User.name: Str64`），没有 `.in_()` / `.is_()` / `.asc()` 这些列方法。写成 `col(User.name).in_([...])` 即可。
 
-`select()` 的投影则不需要 `col()`：1–4 列的重载与上游 `sqlmodel.select` 完全一致，`select(User.id, User.name)` 直接推断为 `Select[tuple[UUID, str]]`；5–9 列的裸属性同样可用。唯一的例外是 5 列以上且**混用** SQL 函数表达式（如 `func.count()`）时——此时该表达式的元素类型会被放宽成联合类型，把所有列都包进 `col()` 就能拿到精确类型（见下一节）。
+`select()` 的投影则不需要 `col()`：1–4 列的重载与上游 `sqlmodel.select` 完全一致，`select(User.id, User.name)` 直接推断为 `Select[UUID, str]`；5–9 列的裸属性同样可用。唯一的例外是 5 列以上且**混用** SQL 函数表达式（如 `func.count()`）时——此时该表达式的元素类型会被放宽成联合类型，把所有列都包进 `col()` 就能拿到精确类型（见下一节）。
 
 ## 4. 正确写法得到的类型
 
@@ -233,7 +233,7 @@ async def totals(session: AsyncSession) -> None:
 ```
 
 ```text
-information: Type of "stmt" is "Select[tuple[UUID, str, str | None, int, datetime]]"
+information: Type of "stmt" is "Select[UUID, str, str | None, int, datetime]"
 information: Type of "rows" is "list[GroupSumRow[str | None]]"
 ```
 

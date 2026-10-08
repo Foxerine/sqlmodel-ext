@@ -193,7 +193,7 @@ data = patch.model_dump(exclude_unset=True)
   several positional ones.
 - Pass relationships as `load=rel(Model.relation)` (a list for chains).
 - `from sqlmodel_ext import select` types projections up to 9 columns. Bare
-  attributes are fine (`select(User.id, User.name)` -> `Select[tuple[UUID, str]]`);
+  attributes are fine (`select(User.id, User.name)` -> `Select[UUID, str]`);
   only in a 5+ column projection that mixes in a SQL function expression
   (e.g. `func.count()`) wrap every column in `col()` to keep the precise type.
 - List endpoints take a `TableViewRequest` (`offset` / `limit` / `order` /

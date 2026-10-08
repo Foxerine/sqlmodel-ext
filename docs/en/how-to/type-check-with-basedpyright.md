@@ -201,7 +201,7 @@ error: Cannot access attribute "in_" for class "Str64"
 
 At the type level a model class attribute is its Python value type (`User.name: Str64`), which has no column methods such as `.in_()` / `.is_()` / `.asc()`. Write `col(User.name).in_([...])`.
 
-`select()` projections do not need `col()`: for 1–4 columns the overloads are exactly upstream `sqlmodel.select`'s, so `select(User.id, User.name)` is inferred as `Select[tuple[UUID, str]]`; bare attributes work for 5–9 columns as well. The one exception is a projection of 5+ columns that **mixes** in a SQL function expression (such as `func.count()`) — that expression's element type is widened to a union; wrap every column in `col()` to get the precise type (next section).
+`select()` projections do not need `col()`: for 1–4 columns the overloads are exactly upstream `sqlmodel.select`'s, so `select(User.id, User.name)` is inferred as `Select[UUID, str]`; bare attributes work for 5–9 columns as well. The one exception is a projection of 5+ columns that **mixes** in a SQL function expression (such as `func.count()`) — that expression's element type is widened to a union; wrap every column in `col()` to get the precise type (next section).
 
 ## 4. Types you get from the correct forms
 
@@ -233,7 +233,7 @@ async def totals(session: AsyncSession) -> None:
 ```
 
 ```text
-information: Type of "stmt" is "Select[tuple[UUID, str, str | None, int, datetime]]"
+information: Type of "stmt" is "Select[UUID, str, str | None, int, datetime]"
 information: Type of "rows" is "list[GroupSumRow[str | None]]"
 ```
 
