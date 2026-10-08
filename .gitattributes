@@ -1,0 +1,5 @@
+# Store every text file with LF line endings, whatever the contributor's
+# core.autocrlf setting. Without this, files committed from Windows with CRLF
+# stayed CRLF in the repository (git only converts on add when it already
+# considers the file text-normalized).
+* text=auto eol=lf
