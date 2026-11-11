@@ -122,6 +122,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel_ext.base import SQLModelBase
 from sqlmodel_ext.mixins.polymorphic import PolymorphicBaseMixin
 from sqlmodel_ext.mixins.table import OnClauseArgument, TableBaseMixin, TableViewArgument
+from sqlmodel_ext.pagination import TableViewRequest
 
 
 
@@ -1282,6 +1283,11 @@ class CachedTableBaseMixin(TableBaseMixin):
         # are different pages; omitting it would let two cursors share an entry.
         if table_view is not None and table_view.after_id is not None:
             parts.append(f"aid={table_view.after_id}")
+
+        # The ID prefix narrows the result like a condition does; omitting it would let
+        # queries for different prefixes share one entry.
+        if isinstance(table_view, TableViewRequest) and table_view.id_prefix is not None:
+            parts.append(f"idp={table_view.id_prefix.lower()}")
 
         # condition → SQL string
         if condition is None:

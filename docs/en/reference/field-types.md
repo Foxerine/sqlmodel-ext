@@ -37,7 +37,7 @@ from sqlmodel_ext import Str1, Str16, Str24, Str32, Str36, Str48, Str64, Str100,
 from sqlmodel_ext import (
     NonEmptyStr64, NonEmptyStr128, NonEmptyStr256,
     NonEmptyStrippedStr32, NonEmptyStrippedStr64, NonEmptyStrippedStr128, NonEmptyStrippedStr256,
-    SingleLineStr64, SearchQueryStr64, HttpHeaderName,
+    SingleLineStr64, SearchQueryStr64, UUIDPrefix, HttpHeaderName,
     Sha256Hex, BCP47LanguageCode,
 )
 ```
@@ -48,6 +48,7 @@ from sqlmodel_ext import (
 | `NonEmptyStrippedStr32/64/128/256` | Same as above + `strip_whitespace`, rejects whitespace-only input (`"   "` / `"\t"`) |
 | `SingleLineStr64` | `NonEmptyStrippedStr64` + **single line**: rejects NUL and every line-break character (`\n \v \f \r \x1c \x1d \x1e \x85    `, derived from `str.splitlines()`); tabs are allowed. For names rendered line by line, so a line break cannot forge an extra listing entry |
 | `SearchQueryStr64` | `2 <= len <= 64` after stripping: a one-character trigram query has no selective trigrams and degrades into a near-full table scan |
+| `UUIDPrefix` | The beginning of a UUID in canonical text form, `4 <= len <= 36` after stripping: hex digits in either case, `-` only right after a complete `8-4-4-4-12` group (`"0192f4"`, `"0192f4a1-7c"`; `"zzzz"` and `"0192-f4"` are rejected). Used by [`TableViewRequest.id_prefix`](/en/reference/pagination-types) |
 | `HttpHeaderName` | RFC 9110 `token` (letters, digits and ``!#$%&'*+-.^_`|~``), `1 <= len <= 64` |
 | `Sha256Hex` | Exactly 64 lowercase hex characters (a SHA-256 digest) |
 | `BCP47LanguageCode` | BCP-47 language tag syntax (e.g. `zh-Hans-CN`), `max_length=16` |

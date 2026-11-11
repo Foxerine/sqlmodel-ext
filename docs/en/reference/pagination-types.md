@@ -10,7 +10,7 @@ Class hierarchy:
 PageWindowRequest            offset / limit / desc
   └── PaginationRequest      + order / after_id (keyset cursor)
 TimeFilterRequest            created_* / updated_* time bounds
-TableViewRequest             TimeFilterRequest + PaginationRequest
+TableViewRequest             TimeFilterRequest + PaginationRequest + id_prefix
 ```
 
 They are all pure data classes that only carry parameters; the SQL clauses are built by `TableBaseMixin.get()`.
@@ -84,10 +84,16 @@ from sqlmodel_ext import TableViewRequest
 
 ```python
 class TableViewRequest(TimeFilterRequest, PaginationRequest):
-    pass
+    id_prefix: UUIDPrefix | None = None
 ```
 
-Carries pagination + ordering + keyset cursor + time filter parameters together. `get()` / `get_with_count()` accept a `table_view` parameter; explicitly passed `offset` / `limit` / `order_by` / time parameters take precedence, falling back to `table_view` when not provided.
+Carries pagination + ordering + keyset cursor + time filter + ID prefix parameters together. `get()` / `get_with_count()` accept a `table_view` parameter; explicitly passed `offset` / `limit` / `order_by` / time parameters take precedence, falling back to `table_view` when not provided.
+
+| Field | Type | Default | Semantics |
+|------|------|--------|------|
+| `id_prefix` | [`UUIDPrefix`](/en/reference/field-types) `\| None` | `None` | Only rows whose UUID primary key, in canonical text form, starts with this prefix; case-insensitive, surrounding whitespace removed |
+
+`get()` / `get_with_count()` apply it as a primary-key range (`id BETWEEN lower AND upper`), so it can use the primary-key index instead of scanning the table; the count of `get_with_count()` follows the same filter. To filter a plain `count()`, pass `count(id_prefix=...)` — `time_filter` does not carry it. Like the time filters, it narrows the page but is not part of the keyset cursor's anchor visibility. A model whose primary key is not a UUID raises `ValueError` when it is given.
 
 ## `query_dependency()`
 

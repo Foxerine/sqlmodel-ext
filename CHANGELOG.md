@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > there is no stability or backward-compatibility guarantee between versions, and
 > you use it at your own risk. Pin the exact version you depend on.
 
+## [Unreleased]
+
+### Added
+
+- `TableViewRequest.id_prefix`: list only the rows whose UUID primary key, in canonical text
+  form, starts with the given prefix (case-insensitive, surrounding whitespace removed).
+  `get()` and `get_with_count()` apply it whenever the `table_view` carries it, and the count
+  of `get_with_count()` follows the same filter; a plain `count()` takes it as
+  `count(id_prefix=...)`. It is applied as a primary-key range (`id BETWEEN lower AND upper`),
+  which uses the primary-key index, rather than `CAST(id AS TEXT) LIKE 'prefix%'`, which scans
+  the table. With `query_dependency(TableViewRequest)` every list endpoint gets an `id_prefix`
+  query parameter. A model whose primary key is not a UUID raises `ValueError` when it is
+  given. Like the time filters, it is not part of the keyset cursor's anchor visibility. The
+  query cache key of `CachedTableBaseMixin` includes it.
+- `UUIDPrefix` field type: the beginning of a UUID in canonical text form, 4-36 characters
+  after stripping, hex digits in either case, `-` only right after a complete `8-4-4-4-12`
+  group. Input that cannot start a UUID (`"zzzz"`, `"0192-f4"`) is rejected instead of
+  silently matching nothing.
+
 ## [0.5.4]
 
 ### Changed

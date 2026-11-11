@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncAttrs
 
 from sqlmodel_ext._utils import now
 from sqlmodel_ext._exceptions import RecordNotFoundError
-from sqlmodel_ext.field_types import NonNegativeBigInt
+from sqlmodel_ext.field_types import NonNegativeBigInt, UUIDPrefix
 from sqlmodel_ext.mixins._uuid import uuid7
 from sqlmodel_ext.mixins.exceptions import (
     FK_DELETE_RESTRICT_FALLBACK_MESSAGE,
@@ -83,8 +83,9 @@ TableViewArgument: TypeAlias = TimeFilterRequest | PageWindowRequest
 
 Each capability is applied when the object provides it: time filtering
 (``TimeFilterRequest``), the offset/limit window (``PageWindowRequest``),
-ordering and the keyset cursor (``PaginationRequest``). ``TableViewRequest``
-provides all of them; a bare ``PageWindowRequest`` only applies the window.
+ordering and the keyset cursor (``PaginationRequest``), the ID prefix filter
+(``TableViewRequest``). ``TableViewRequest`` provides all of them; a bare
+``PageWindowRequest`` only applies the window.
 """
 
 # FOR UPDATE tracking: get(with_for_update=True) records id(instance) to session.info,
@@ -1024,6 +1025,34 @@ class TableBaseMixin(AsyncAttrs):
         return filters
 
     @classmethod
+    def _build_id_prefix_filter(cls: type[T], id_prefix: str) -> ColumnElement[bool]:
+        """The condition "``id`` in canonical text form starts with ``id_prefix``", as a primary-key range.
+
+        ``UUIDPrefix`` admits a ``-`` only right after a complete group, so dropping the dashes
+        and padding the hex digits with ``0`` / ``f`` gives the smallest and the largest UUID
+        that carry the prefix. UUIDs sort like their lowercase hex text -- PostgreSQL compares
+        ``uuid`` values byte by byte, and backends without a native type store ``Uuid`` as
+        32-character lowercase hex -- so ``BETWEEN`` selects exactly the matching rows. Unlike
+        ``CAST(id AS TEXT) LIKE 'prefix%'`` it can use the primary-key index.
+
+        Like the time filters, the prefix narrows the rows a query returns but is not part of
+        the keyset cursor's anchor visibility (see ``_build_keyset_condition``).
+
+        :raises ValueError: the model's primary key is not a UUID (programming error).
+        """
+        id_column_type = cast(Mapper[Any], inspect(cls)).columns['id'].type.python_type
+        if id_column_type is not uuid.UUID:
+            raise ValueError(
+                f"the id_prefix filter only supports UUID primary keys; {cls.__name__}'s "
+                + f"primary key is {id_column_type.__name__}"
+            )
+        hex_digits = id_prefix.replace('-', '').lower()
+        return col(cls.id).between(
+            uuid.UUID(hex_digits.ljust(32, '0')),
+            uuid.UUID(hex_digits.ljust(32, 'f')),
+        )
+
+    @classmethod
     def _sti_descendants_condition(cls: type[T]) -> ColumnElement[Any] | None:
         """The "this class and its subclasses" discriminator filter under STI; ``None`` for non-STI models.
 
@@ -1070,8 +1099,9 @@ class TableBaseMixin(AsyncAttrs):
         WHERE as the main query). Otherwise anyone holding the UUID of a row
         outside their scope could probe its existence and creation time
         through the difference between a page and an error (a UUID is an
-        identifier, not a capability). Time filters are not applied to the
-        anchor (a time window is a page boundary, not a visibility boundary).
+        identifier, not a capability). Time filters and the ``id_prefix``
+        filter are not applied to the anchor (they narrow the page, they are
+        not a visibility boundary).
         Trade-off: once the anchor is deleted or leaves the filter, the
         cursor is invalid and the client restarts from the first page.
 
@@ -1300,9 +1330,12 @@ class TableBaseMixin(AsyncAttrs):
 
         # keyset cursor condition (after_id), appended after condition
         keyset_condition: ColumnElement[bool] | None = None
+        id_prefix_condition: ColumnElement[bool] | None = None
 
         # Apply table_view defaults
         if table_view:
+            if isinstance(table_view, TableViewRequest) and table_view.id_prefix is not None:
+                id_prefix_condition = cls._build_id_prefix_filter(table_view.id_prefix)
             if isinstance(table_view, TimeFilterRequest):
                 if created_after_datetime is None and table_view.created_after_datetime is not None:
                     created_after_datetime = table_view.created_after_datetime
@@ -1386,6 +1419,9 @@ class TableBaseMixin(AsyncAttrs):
             updated_before_datetime, updated_after_datetime
         ):
             statement = statement.where(time_filter)
+
+        if id_prefix_condition is not None:
+            statement = statement.where(id_prefix_condition)
 
         if join is not None:
             if isinstance(join, tuple):
@@ -1749,9 +1785,10 @@ class TableBaseMixin(AsyncAttrs):
             created_after_datetime: datetime | None = None,
             updated_before_datetime: datetime | None = None,
             updated_after_datetime: datetime | None = None,
+            id_prefix: UUIDPrefix | None = None,
     ) -> int:
         """
-        Count records matching conditions (supports time filtering and distinct counting).
+        Count records matching conditions (supports time filtering, the ID prefix filter and distinct counting).
 
         Uses database-level COUNT() for efficiency.
 
@@ -1765,7 +1802,11 @@ class TableBaseMixin(AsyncAttrs):
         :param created_after_datetime: Filter created_at >= datetime
         :param updated_before_datetime: Filter updated_at < datetime
         :param updated_after_datetime: Filter updated_at >= datetime
+        :param id_prefix: Only rows whose UUID primary key starts with this prefix -- a value
+            already validated as ``UUIDPrefix``, such as ``TableViewRequest.id_prefix``.
+            ``time_filter`` does not carry it, even when a ``TableViewRequest`` is passed there.
         :returns: Number of matching records
+        :raises ValueError: ``id_prefix`` is given and the primary key is not a UUID
 
         Example::
 
@@ -1802,6 +1843,9 @@ class TableBaseMixin(AsyncAttrs):
         ):
             statement = statement.where(time_condition)
 
+        if id_prefix is not None:
+            statement = statement.where(cls._build_id_prefix_filter(id_prefix))
+
         result = await session.scalar(statement)
         # COUNT without GROUP BY always returns one row (0, not NULL); this
         # only narrows scalar()'s ``int | None`` declaration.
@@ -1834,11 +1878,12 @@ class TableBaseMixin(AsyncAttrs):
         :param load: Relationships to eagerly load
         :param order_by: Sort expressions
         :param filter: Additional filter
-        :param table_view: Pagination + sorting + time filtering
+        :param table_view: Pagination + sorting + time filtering + ID prefix
         :param jti_subclasses: Polymorphic subclass loading
         :returns: ListResponse with count and items
         """
         time_filter: TimeFilterRequest | None = None
+        id_prefix: str | None = None
         if table_view is not None:
             time_filter = TimeFilterRequest(
                 created_after_datetime=table_view.created_after_datetime,
@@ -1846,6 +1891,7 @@ class TableBaseMixin(AsyncAttrs):
                 updated_after_datetime=table_view.updated_after_datetime,
                 updated_before_datetime=table_view.updated_before_datetime,
             )
+            id_prefix = table_view.id_prefix
 
         # Items first, then count: get() performs the keyset cursor checks
         # (after_id + order_by/join, anchor validity); counting first would
@@ -1863,7 +1909,7 @@ class TableBaseMixin(AsyncAttrs):
             jti_subclasses=jti_subclasses,
         )
 
-        total_count = await cls.count(session, condition, time_filter=time_filter)
+        total_count = await cls.count(session, condition, time_filter=time_filter, id_prefix=id_prefix)
 
         return ListResponse(count=total_count, items=items)
 

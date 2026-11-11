@@ -280,10 +280,11 @@ async def count(
     created_after_datetime: datetime | None = None,
     updated_before_datetime: datetime | None = None,
     updated_after_datetime: datetime | None = None,
+    id_prefix: UUIDPrefix | None = None,
 ) -> int
 ```
 
-返回符合条件的记录数，底层 `SELECT COUNT(*)`。传 `distinct_column` 时改为 `COUNT(DISTINCT col)`（如"活跃用户去重数"）。`time_filter` 中的非空字段优先于单独传入的时间参数。
+返回符合条件的记录数，底层 `SELECT COUNT(*)`。传 `distinct_column` 时改为 `COUNT(DISTINCT col)`（如"活跃用户去重数"）。`time_filter` 中的非空字段优先于单独传入的时间参数。`id_prefix` 只统计 UUID 主键以该前缀开头的行（与 [`TableViewRequest.id_prefix`](/reference/pagination-types) 同一个过滤）；`time_filter` 不携带它，即使传进去的是 `TableViewRequest`。
 
 ## `distinct_column()`
 

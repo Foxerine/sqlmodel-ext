@@ -277,11 +277,12 @@ class TestTableViewRequest:
         assert tv.created_after_datetime is None
         assert tv.updated_before_datetime is None
 
-    def test_field_set_is_union_of_parents(self) -> None:
+    def test_field_set_is_union_of_parents_plus_id_prefix(self) -> None:
         assert set(TableViewRequest.model_fields) == {
             "offset", "limit", "desc", "order", "after_id",
             "created_after_datetime", "created_before_datetime",
             "updated_after_datetime", "updated_before_datetime",
+            "id_prefix",
         }
 
     def test_inherits_pagination_validation(self) -> None:

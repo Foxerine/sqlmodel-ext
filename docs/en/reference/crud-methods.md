@@ -280,10 +280,11 @@ async def count(
     created_after_datetime: datetime | None = None,
     updated_before_datetime: datetime | None = None,
     updated_after_datetime: datetime | None = None,
+    id_prefix: UUIDPrefix | None = None,
 ) -> int
 ```
 
-Returns the number of matching records via `SELECT COUNT(*)`. Passing `distinct_column` switches to `COUNT(DISTINCT col)` (e.g. "distinct active users"). Non-null fields in `time_filter` take precedence over the individually passed time parameters.
+Returns the number of matching records via `SELECT COUNT(*)`. Passing `distinct_column` switches to `COUNT(DISTINCT col)` (e.g. "distinct active users"). Non-null fields in `time_filter` take precedence over the individually passed time parameters. `id_prefix` counts only rows whose UUID primary key starts with the prefix (the same filter as [`TableViewRequest.id_prefix`](/en/reference/pagination-types)); `time_filter` does not carry it, even when a `TableViewRequest` is passed there.
 
 ## `distinct_column()`
 

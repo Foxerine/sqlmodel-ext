@@ -10,7 +10,7 @@
 PageWindowRequest            offset / limit / desc
   └── PaginationRequest      + order / after_id（keyset 游标）
 TimeFilterRequest            created_* / updated_* 时间边界
-TableViewRequest             TimeFilterRequest + PaginationRequest
+TableViewRequest             TimeFilterRequest + PaginationRequest + id_prefix
 ```
 
 它们都是纯数据类，只承载参数；SQL 子句由 `TableBaseMixin.get()` 构造。
@@ -84,10 +84,16 @@ from sqlmodel_ext import TableViewRequest
 
 ```python
 class TableViewRequest(TimeFilterRequest, PaginationRequest):
-    pass
+    id_prefix: UUIDPrefix | None = None
 ```
 
-同时承载分页 + 排序 + keyset 游标 + 时间过滤参数。`get()` / `get_with_count()` 接受 `table_view` 参数；显式传入的 `offset` / `limit` / `order_by` / 时间参数优先，未提供时回退到 `table_view`。
+同时承载分页 + 排序 + keyset 游标 + 时间过滤 + ID 前缀参数。`get()` / `get_with_count()` 接受 `table_view` 参数；显式传入的 `offset` / `limit` / `order_by` / 时间参数优先，未提供时回退到 `table_view`。
+
+| 字段 | 类型 | 默认值 | 语义 |
+|------|------|--------|------|
+| `id_prefix` | [`UUIDPrefix`](/reference/field-types) `\| None` | `None` | 只返回 UUID 主键（标准文本形式）以该前缀开头的行；不区分大小写，首尾空白会去除 |
+
+`get()` / `get_with_count()` 把它转成主键范围（`id BETWEEN 下界 AND 上界`），可以走主键索引而不是全表扫描；`get_with_count()` 的总数按同一条件统计。单独调用 `count()` 时传 `count(id_prefix=...)`——`time_filter` 不携带它。和时间过滤一样，它只收窄结果，不参与 keyset 游标的锚点可见性判断。主键不是 UUID 的模型传了它会抛 `ValueError`。
 
 ## `query_dependency()`
 

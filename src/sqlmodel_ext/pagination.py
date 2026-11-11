@@ -9,7 +9,7 @@ Class hierarchy::
     PageWindowRequest            offset / limit / desc
       └── PaginationRequest      + order / after_id (keyset cursor)
     TimeFilterRequest            created_* / updated_* time bounds
-    TableViewRequest             TimeFilterRequest + PaginationRequest
+    TableViewRequest             TimeFilterRequest + PaginationRequest + id_prefix
 """
 import uuid
 from datetime import datetime
@@ -28,7 +28,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationInfo, field
 from sqlmodel import Field
 
 from sqlmodel_ext.base import SQLModelBase
-from sqlmodel_ext.field_types import JS_MAX_SAFE_INTEGER
+from sqlmodel_ext.field_types import JS_MAX_SAFE_INTEGER, UUIDPrefix
 
 ItemT = TypeVar("ItemT")
 
@@ -271,10 +271,14 @@ class PaginationRequest(PageWindowRequest):
 
 class TableViewRequest(TimeFilterRequest, PaginationRequest):
     """
-    Table view request parameters (pagination + sorting + time filtering).
+    Table view request parameters (pagination + sorting + time filtering + ID prefix).
 
     Combines TimeFilterRequest and PaginationRequest for endpoints needing
-    full query parameters. Pure data class.
+    full query parameters, and adds ``id_prefix``. Pure data class.
+
+    ``get()`` / ``get_with_count()`` / ``count(id_prefix=...)`` apply ``id_prefix`` to
+    UUID primary keys only; passing it for a model whose primary key is not a UUID
+    raises ``ValueError``.
 
     Example::
 
@@ -288,4 +292,6 @@ class TableViewRequest(TimeFilterRequest, PaginationRequest):
             items = await Item.get(session, fetch_mode="all", table_view=table_view)
             return items
     """
-    pass
+    id_prefix: UUIDPrefix | None = None
+    """Only rows whose ID starts with this prefix (case-insensitive; surrounding whitespace is
+    removed). None means no limit."""

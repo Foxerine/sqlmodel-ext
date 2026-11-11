@@ -180,6 +180,7 @@ from sqlmodel_ext.field_types import (
     BCP47LanguageCode as BCP47LanguageCode,
     SingleLineStr64 as SingleLineStr64,
     SearchQueryStr64 as SearchQueryStr64,
+    UUIDPrefix as UUIDPrefix,
     HttpHeaderName as HttpHeaderName,
     # Numeric constraints
     INT32_MIN as INT32_MIN,

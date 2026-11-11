@@ -37,7 +37,7 @@ from sqlmodel_ext import Str1, Str16, Str24, Str32, Str36, Str48, Str64, Str100,
 from sqlmodel_ext import (
     NonEmptyStr64, NonEmptyStr128, NonEmptyStr256,
     NonEmptyStrippedStr32, NonEmptyStrippedStr64, NonEmptyStrippedStr128, NonEmptyStrippedStr256,
-    SingleLineStr64, SearchQueryStr64, HttpHeaderName,
+    SingleLineStr64, SearchQueryStr64, UUIDPrefix, HttpHeaderName,
     Sha256Hex, BCP47LanguageCode,
 )
 ```
@@ -48,6 +48,7 @@ from sqlmodel_ext import (
 | `NonEmptyStrippedStr32/64/128/256` | 同上 + `strip_whitespace`，拒绝纯空白（`"   "` / `"\t"`） |
 | `SingleLineStr64` | 等于 `NonEmptyStrippedStr64` + **单行**：拒绝 NUL 与所有换行字符（`\n \v \f \r \x1c \x1d \x1e \x85    `，由 `str.splitlines()` 推导）；制表符允许。用于逐行渲染的名称，防止用换行伪造列表条目 |
 | `SearchQueryStr64` | 去空白后 `2 <= len <= 64`：单字符 trigram 查询没有选择性，会退化成近乎全表扫描 |
+| `UUIDPrefix` | UUID 标准文本形式的开头部分，去空白后 `4 <= len <= 36`：十六进制字符不区分大小写，`-` 只能紧跟在完整的 `8-4-4-4-12` 分组之后（`"0192f4"`、`"0192f4a1-7c"`；`"zzzz"`、`"0192-f4"` 会被拒绝）。供 [`TableViewRequest.id_prefix`](/reference/pagination-types) 使用 |
 | `HttpHeaderName` | RFC 9110 `token`（字母、数字与 ``!#$%&'*+-.^_`|~``），`1 <= len <= 64` |
 | `Sha256Hex` | 精确 64 位小写 hex（SHA-256 摘要） |
 | `BCP47LanguageCode` | BCP-47 语言代码语法（如 `zh-Hans-CN`），`max_length=16` |

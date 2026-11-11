@@ -290,6 +290,30 @@ Schema, so generated clients know the real accepted input set.
 it, and the post-strip ``min_length=2`` rejects ``" a "`` and whitespace of any
 length -- a caller that does not want to filter simply omits the parameter."""
 
+_UUID_TEXT_PREFIX_PATTERN = (
+    r'^(?:[0-9a-fA-F]{1,8}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{0,4}|[0-9a-fA-F]{4}-(?:[0-9a-fA-F]{0,4}'
+    + r'|[0-9a-fA-F]{4}-(?:[0-9a-fA-F]{0,4}|[0-9a-fA-F]{4}-[0-9a-fA-F]{0,12}))))$'
+)
+"""The first characters of a UUID in canonical text form (``8-4-4-4-12`` hex groups).
+
+A ``-`` is accepted only where the canonical form has one, i.e. right after a complete group."""
+
+UUIDPrefix: TypeAlias = Annotated[
+    str,
+    Field(min_length=4, max_length=36),
+    StringConstraints(strip_whitespace=True, min_length=4, pattern=_UUID_TEXT_PREFIX_PATTERN),
+]
+"""The beginning of a UUID in canonical text form, for "ID starts with ..." filters
+(``TableViewRequest.id_prefix``): 4-36 characters after stripping, hex digits in either case,
+and ``-`` only where the canonical form has one (``"0192f4"``, ``"0192f4a1-7c"``).
+
+Surrounding whitespace is removed rather than rejected; whitespace-only input and prefixes
+shorter than 4 characters are rejected, so a caller that does not want to filter omits the
+parameter. Because a ``-`` can only follow a complete group, every accepted prefix corresponds
+to one contiguous range of UUIDs, which lets the filter use the primary-key index. A prefix that
+cannot be part of a UUID (``"zzzz"``, ``"0192-f4"``) is rejected instead of silently matching
+nothing. The pattern only admits hex digits and ``-``, so no separate null-byte check is needed."""
+
 NonEmptyStrippedStr128: TypeAlias = Annotated[
     str,
     Field(min_length=1, max_length=128),
