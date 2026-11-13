@@ -812,7 +812,9 @@ class RelationPreloadMixin:
             if needed_keys and needed_keys & set(state.unloaded):
                 stale_ids.append(state.key[1][0])
         if stale_ids:
-            root_cls: Any = typing_cast(Any, sa_inspect(cls)).mapper.base_mapper.class_
+            # ``raiseerr=True`` is the default, spelled out for the type checker: SQLAlchemy
+            # before 2.1.7 types the bare call as ``Optional[Any]``.
+            root_cls: Any = sa_inspect(cls, raiseerr=True).mapper.base_mapper.class_
             _ = await root_cls.get(
                 session,
                 col(root_cls.id).in_(stale_ids),

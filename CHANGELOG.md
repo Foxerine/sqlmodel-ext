@@ -26,6 +26,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   group. Input that cannot start a UUID (`"zzzz"`, `"0192-f4"`) is rejected instead of
   silently matching nothing.
 
+### Fixed
+
+- Importing `sqlmodel_ext` with Pydantic 2.14 emitted `PydanticDeprecatedSince214`:
+  `Unset` was imported from `pydantic.experimental.missing_sentinel`, which 2.14 deprecates
+  in favor of `pydantic.MISSING`. It is now imported from `pydantic_core`, where every
+  supported Pydantic release (2.12 on) defines it; it is the same object, so `Unset is
+  pydantic.MISSING` still holds.
+- Type checking against SQLAlchemy 2.1.7+ reported two unnecessary suppressions inside the
+  library: 2.1.7 changed the overloads of `sqlalchemy.inspect()` so that a call without
+  `raiseerr` returns `Any` instead of `Optional[Any]`. Both call sites now pass
+  `raiseerr=True`, which is typed the same way before and after 2.1.7. No runtime change.
+
+### Changed
+
+- With Pydantic 2.14, an explicit `null` for an `Unset | T` field that does not accept `None`
+  is reported as a single error for the `T` branch (e.g. `string_type`, `loc` ending at the
+  field name); 2.12 and 2.13 also report a `missing_sentinel_error` with branch tags in
+  `loc`. This is Pydantic's change; the input is rejected either way. The documentation and
+  the tests now describe both shapes.
+- Pydantic 2.14.1 checks the integer digits of a `Decimal` regardless of where a
+  `BeforeValidator` sits in the `Annotated` metadata. The decimal aliases keep their
+  metadata order, which earlier Pydantic releases still need.
+
 ## [0.5.4]
 
 ### Changed

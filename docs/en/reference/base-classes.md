@@ -121,7 +121,7 @@ class ToolArguments(SQLModelBase):
 from sqlmodel_ext import Unset, OMITTED_SENTINEL
 ```
 
-- `Unset`: Pydantic's official `pydantic.experimental.missing_sentinel.MISSING`, meaning "this field was not provided". Check with `x is Unset`. Fields whose value is `Unset` never appear in `model_dump()` / `model_dump_json()` output. `copy.deepcopy(Unset) is Unset`.
+- `Unset`: Pydantic's official `MISSING` sentinel (`pydantic.MISSING` since Pydantic 2.14, `pydantic.experimental.missing_sentinel.MISSING` before), meaning "this field was not provided". Check with `x is Unset`. Fields whose value is `Unset` never appear in `model_dump()` / `model_dump_json()` output. `copy.deepcopy(Unset) is Unset`.
 - `OMITTED_SENTINEL`: `'__omitted__'`, the wire sentinel value; it only exists in the JSON Schema and inbound payloads of models with `omitted_sentinel` enabled and is normalized to `Unset` on entry. Application code should never compare against it.
 
 Full semantics in [Unset](/en/explanation/unset-three-state).

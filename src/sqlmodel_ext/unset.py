@@ -1,8 +1,7 @@
 """
 Tri-state field semantics: separating "not provided" from ``null``.
 
-This module exports Pydantic's official
-:data:`~pydantic.experimental.missing_sentinel.MISSING` under the name
+This module exports Pydantic's official ``MISSING`` sentinel under the name
 :data:`Unset`, plus the *shape constants* of the optional wire protocol
 (:data:`OMITTED_SENTINEL`, :data:`SENTINEL_SCHEMA_BRANCH`,
 :data:`SCHEMA_ANNOTATION_KEYS`). Behavior and serialization semantics follow
@@ -104,9 +103,11 @@ model, and a sentinel-aware schema when inherited by a strict-mode model.
   so for missing query parameters), so a bare ``Unset`` default would fail at
   request time. This module registers a ``copyreg`` reducer that makes
   ``deepcopy(Unset)`` return ``Unset`` itself; see :func:`_reduce_unset`.
-- Pydantic still marks the feature experimental (module
-  ``pydantic.experimental.missing_sentinel``, available since Pydantic 2.12).
-  It builds on PEP 661.
+- The sentinel is defined in ``pydantic_core`` and re-exported by Pydantic:
+  as ``pydantic.experimental.missing_sentinel.MISSING`` since 2.12, and as
+  ``pydantic.MISSING`` since 2.14, which deprecates the experimental path.
+  This module imports it from ``pydantic_core``, the one path present in every
+  supported release without a deprecation warning. It builds on PEP 661.
 - Static narrowing of ``Unset | T`` requires a type checker with PEP 661
   support (e.g. pyright >= 1.1.414 / basedpyright >= 1.40.1).
 - In models with the wire value enabled, string fields can no longer hold the
@@ -115,7 +116,7 @@ model, and a sentinel-aware schema when inherited by a strict-mode model.
 import copyreg
 import typing
 
-from pydantic.experimental.missing_sentinel import MISSING
+from pydantic_core import MISSING
 from typing_extensions import Sentinel
 
 Unset: typing.Final = MISSING

@@ -38,7 +38,7 @@ Conventions live in people's heads. The one time someone forgets, nothing raises
 from sqlmodel_ext import Unset
 ```
 
-`Unset` **is** Pydantic's official `pydantic.experimental.missing_sentinel.MISSING` (a PEP 661-style sentinel); sqlmodel-ext only exports it under another name. Once "not provided" is carried by `Unset`, `None` goes back to being an **ordinary value**.
+`Unset` **is** Pydantic's official `MISSING` sentinel (a PEP 661-style sentinel; `pydantic.MISSING` since Pydantic 2.14, `pydantic.experimental.missing_sentinel.MISSING` in 2.12–2.13); sqlmodel-ext only exports it under another name. Once "not provided" is carried by `Unset`, `None` goes back to being an **ordinary value**.
 
 | Annotation | Meaning |
 |---|---|
@@ -94,7 +94,7 @@ else:
 - **A value** → validated as usual (length, range and every other constraint is kept).
 
 ::: warning Do not rely on the order of errors
-`Unset | T` is a union, so a failed validation lists one error per branch in `ValidationError.errors()` (for `title=null` above you get both `missing_sentinel_error` and `string_type`, with branch tags such as `'missing-sentinel'` / `'constrained-str'` in `loc`). The order of union members does not change **which** inputs are accepted or rejected, but it does change the **order** of error entries; do not depend on that order downstream.
+`Unset | T` is a union. With Pydantic 2.12–2.13 a failed validation lists one error per branch in `ValidationError.errors()` (for `title=null` above you get both `missing_sentinel_error` and `string_type`, with branch tags such as `'missing-sentinel'` / `'constrained-str'` in `loc`); from Pydantic 2.14 on the `MISSING` branch is no longer reported, so you get only the `T` branch's error (`string_type`, with `loc` ending at the field name). The order of union members does not change **which** inputs are accepted or rejected, but it does change the **order** of error entries; do not depend on that order downstream.
 :::
 
 ## `partial=True`: derive a PATCH DTO from the base
@@ -312,6 +312,6 @@ In one sentence: **`EXCLUDE_IF_NONE` is an output-format convention; `Unset` is 
 
 ## Known limitations
 
-- Pydantic still marks the feature experimental (module `pydantic.experimental.missing_sentinel`, available since Pydantic 2.12), hence sqlmodel-ext 0.5 requires `pydantic>=2.12`.
+- The sentinel first shipped in Pydantic 2.12 as experimental (`pydantic.experimental.missing_sentinel.MISSING`), hence sqlmodel-ext 0.5 requires `pydantic>=2.12`. Pydantic 2.14 made it stable as `pydantic.MISSING` and deprecated the experimental path; sqlmodel-ext imports it from `pydantic_core`, which works without a deprecation warning on every supported release.
 - Static narrowing requires PEP 661 support (versions above); with basedpyright alone, partial-derived fields do not take part in static narrowing — declare them explicitly or use [`check_derived`](/en/how-to/check-partial-dtos) (see above).
 - In models with `omitted_sentinel` enabled, string fields cannot hold the literal `'__omitted__'`.

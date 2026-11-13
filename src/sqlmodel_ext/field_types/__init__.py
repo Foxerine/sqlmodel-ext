@@ -733,7 +733,10 @@ _OPTIONAL_DECIMAL_20_10_STR_SCHEMA = _optional_str_schema(_DECIMAL_20_10_STR_PAT
 #  digits and the decimal places -- **not the integer digits**. For example
 #  ``Annotated[Decimal, BeforeValidator(...), Field(max_digits=20,
 #  decimal_places=10)]`` accepts a 15-digit integer, leaving the database
-#  column as the only guard.
+#  column as the only guard. Pydantic 2.14.1 (pydantic#13972) added the
+#  integer digit check to those Python validators, so from that release on the
+#  order no longer matters for it; the rule stays while earlier releases are
+#  supported.
 #
 #  With ``Field`` first, the constraints are inlined as
 #  ``function-before(decimal{max_digits, decimal_places})`` and pydantic-core

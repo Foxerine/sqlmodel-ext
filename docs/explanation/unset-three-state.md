@@ -38,7 +38,7 @@ class ArticleUpdate(SQLModelBase):
 from sqlmodel_ext import Unset
 ```
 
-`Unset` 就是 Pydantic 官方的 `pydantic.experimental.missing_sentinel.MISSING`（PEP 661 风格的哨兵），sqlmodel-ext 只是给它换了个名字导出。「没传」由 `Unset` 承载之后，`None` 重新变回一个**普通的值**。
+`Unset` 就是 Pydantic 官方的 `MISSING` 哨兵（PEP 661 风格；Pydantic 2.14 起为 `pydantic.MISSING`，2.12–2.13 为 `pydantic.experimental.missing_sentinel.MISSING`），sqlmodel-ext 只是给它换了个名字导出。「没传」由 `Unset` 承载之后，`None` 重新变回一个**普通的值**。
 
 | 注解 | 含义 |
 |---|---|
@@ -94,7 +94,7 @@ else:
 - **传了值** → 照常校验（长度、范围等约束全部保留）。
 
 ::: warning 错误列表的顺序不要依赖
-`Unset | T` 是一个联合类型，校验失败时 `ValidationError.errors()` 里会有每个分支各自的错误（例如上面 `title=null` 会同时出现 `missing_sentinel_error` 与 `string_type`，`loc` 里带有分支标签如 `'missing-sentinel'` / `'constrained-str'`）。成员的顺序不影响**接受/拒绝哪些输入**，但会影响错误条目的**顺序**；下游不要依赖这个顺序。
+`Unset | T` 是一个联合类型。Pydantic 2.12–2.13 下校验失败时，`ValidationError.errors()` 里会有每个分支各自的错误（例如上面 `title=null` 会同时出现 `missing_sentinel_error` 与 `string_type`，`loc` 里带有分支标签如 `'missing-sentinel'` / `'constrained-str'`）；Pydantic 2.14 起不再报告 `MISSING` 分支，只剩 `T` 分支的那条错误（`string_type`，`loc` 到字段名为止）。成员的顺序不影响**接受/拒绝哪些输入**，但会影响错误条目的**顺序**；下游不要依赖这个顺序。
 :::
 
 ## `partial=True`：从基类派生 PATCH DTO
@@ -312,6 +312,6 @@ assert Event(marker=True).model_dump() == {'marker': True}
 
 ## 已知限制
 
-- Pydantic 仍把该特性标为 experimental（模块路径 `pydantic.experimental.missing_sentinel`，自 Pydantic 2.12 起提供），因此 sqlmodel-ext 0.5 要求 `pydantic>=2.12`。
+- 该哨兵自 Pydantic 2.12 起以 experimental 形式提供（`pydantic.experimental.missing_sentinel.MISSING`），因此 sqlmodel-ext 0.5 要求 `pydantic>=2.12`。Pydantic 2.14 将其转正为 `pydantic.MISSING`，并弃用 experimental 路径；sqlmodel-ext 从 `pydantic_core` 导入它，在所有支持的版本上都不会触发弃用警告。
 - 静态收窄需要 PEP 661 支持（见上文版本要求）；partial 派生字段在单独运行 basedpyright 时不参与静态收窄，需显式声明或用 [`check_derived`](/how-to/check-partial-dtos)（见上文）。
 - 开启 `omitted_sentinel` 的模型，字符串字段不能持有字面量 `'__omitted__'`。

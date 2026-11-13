@@ -150,7 +150,7 @@ That is the basic building block of sqlmodel-ext's "declare once" approach: the 
 
 ## Sentinel values: when `None` is a real value
 
-A **sentinel** is a unique object whose only job is to mean "a special situation", compared with `is`. Python has used them for a long time (`dataclasses.MISSING`, private `_NOTSET = object()` constants), and [PEP 661](https://peps.python.org/pep-0661/) standardizes the pattern. Pydantic 2.12 ships one as `pydantic.experimental.missing_sentinel.MISSING`, which sqlmodel-ext exports as `Unset`.
+A **sentinel** is a unique object whose only job is to mean "a special situation", compared with `is`. Python has used them for a long time (`dataclasses.MISSING`, private `_NOTSET = object()` constants), and [PEP 661](https://peps.python.org/pep-0661/) standardizes the pattern. Pydantic ships one as `MISSING` (`pydantic.experimental.missing_sentinel.MISSING` since 2.12, `pydantic.MISSING` since 2.14), which sqlmodel-ext exports as `Unset`.
 
 Why it matters: in a PATCH body, `None` has to be able to mean "clear this column", so "the field was not sent" needs a different carrier. With `Unset`, the three states — not sent / `null` / a value — become distinguishable:
 

@@ -150,7 +150,7 @@ class User(SQLModel, table=True):
 
 ## 哨兵值：当 `None` 本身是一个有意义的值
 
-**哨兵值（sentinel）**是一个独一无二的对象，唯一的作用是表示"某种特殊情况"，用 `is` 比较。Python 里早就有这种用法（`dataclasses.MISSING`、私有的 `_NOTSET = object()` 常量），[PEP 661](https://peps.python.org/pep-0661/) 把它标准化了。Pydantic 2.12 提供了一个：`pydantic.experimental.missing_sentinel.MISSING`，sqlmodel-ext 以 `Unset` 的名字导出它。
+**哨兵值（sentinel）**是一个独一无二的对象，唯一的作用是表示"某种特殊情况"，用 `is` 比较。Python 里早就有这种用法（`dataclasses.MISSING`、私有的 `_NOTSET = object()` 常量），[PEP 661](https://peps.python.org/pep-0661/) 把它标准化了。Pydantic 提供了一个：`MISSING`（2.12 起为 `pydantic.experimental.missing_sentinel.MISSING`，2.14 起为 `pydantic.MISSING`），sqlmodel-ext 以 `Unset` 的名字导出它。
 
 为什么需要它：在 PATCH 请求体里，`None` 必须能表示"清空这一列"，于是"这个字段没传"就需要另一个载体。有了 `Unset`，三种状态——没传 / `null` / 有值——就能区分开：
 

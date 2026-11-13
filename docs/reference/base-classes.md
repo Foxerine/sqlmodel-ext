@@ -120,7 +120,7 @@ class ToolArguments(SQLModelBase):
 from sqlmodel_ext import Unset, OMITTED_SENTINEL
 ```
 
-- `Unset`：Pydantic 官方的 `pydantic.experimental.missing_sentinel.MISSING`，表示"这个字段没有提供"。用 `x is Unset` 判断。值为 `Unset` 的字段不出现在 `model_dump()` / `model_dump_json()` 输出中。`copy.deepcopy(Unset) is Unset`。
+- `Unset`：Pydantic 官方的 `MISSING` 哨兵（Pydantic 2.14 起为 `pydantic.MISSING`，此前为 `pydantic.experimental.missing_sentinel.MISSING`），表示"这个字段没有提供"。用 `x is Unset` 判断。值为 `Unset` 的字段不出现在 `model_dump()` / `model_dump_json()` 输出中。`copy.deepcopy(Unset) is Unset`。
 - `OMITTED_SENTINEL`：`'__omitted__'`，线上哨兵值，只存在于开启 `omitted_sentinel` 的模型的 JSON Schema 与入站负载中，进门即被归一为 `Unset`。业务代码不应与它比较。
 
 完整语义见 [Unset 三态](/explanation/unset-three-state)。

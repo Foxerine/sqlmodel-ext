@@ -948,8 +948,10 @@ class CachedTableBaseMixin(TableBaseMixin):
                  or ``None`` if the optimization is not applicable.
         """
         load_list = load if isinstance(load, list) else [load]
-        mapper = sa_inspect(cls)
-        relationships = mapper.relationships  # pyright: ignore[reportOptionalMemberAccess]
+        # ``raiseerr=True`` is the default, spelled out for the type checker: SQLAlchemy
+        # before 2.1.7 types the bare call as ``Optional[Any]``.
+        mapper = sa_inspect(cls, raiseerr=True)
+        relationships = mapper.relationships
         result: list[tuple[str, type[CachedTableBaseMixin], str]] = []
 
         for attr in load_list:

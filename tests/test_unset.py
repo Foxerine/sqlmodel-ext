@@ -8,6 +8,8 @@ drift silently.
 import copy
 import json
 import pickle
+import subprocess
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -20,9 +22,23 @@ from sqlmodel_ext import OMITTED_SENTINEL, SQLModelBase, SQLModelExtConfig, Unse
 
 class TestUnsetSentinel:
     def test_unset_is_pydantic_missing(self) -> None:
-        from pydantic.experimental.missing_sentinel import MISSING
+        import pydantic
+        from pydantic_core import MISSING
 
         assert Unset is MISSING
+        # ``pydantic.MISSING`` exists from Pydantic 2.14 on.
+        assert getattr(pydantic, 'MISSING', MISSING) is Unset
+
+    def test_import_emits_no_pydantic_deprecation_warning(self) -> None:
+        """Pydantic 2.14 deprecates ``pydantic.experimental.missing_sentinel``; importing the package must not touch it."""
+        code = (
+            'import warnings\n'
+            'from pydantic.warnings import PydanticDeprecationWarning\n'
+            "warnings.simplefilter('error', PydanticDeprecationWarning)\n"
+            'import sqlmodel_ext\n'
+        )
+        result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
 
     def test_deepcopy_keeps_identity(self) -> None:
         assert copy.deepcopy(Unset) is Unset

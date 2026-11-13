@@ -175,12 +175,15 @@ class TestPartialThreeStates:
         assert u.model_dump()['note'] is None
 
     def test_explicit_null_on_required_origin_field_rejected_at_field_level(self) -> None:
+        """Pydantic 2.12 - 2.13 report one error per union branch (``missing_sentinel_error``
+        and ``int_type``); 2.14 no longer mentions ``MISSING`` and reports ``int_type`` alone.
+        Either way every error sits on the field itself.
+        """
         with pytest.raises(ValidationError) as exc_info:
             PartialWithFactory.model_validate({'count': None})
-        assert any(
-            err.get('type') == 'missing_sentinel_error' and tuple(err['loc'])[:1] == ('count',)
-            for err in exc_info.value.errors()
-        ), exc_info.value.errors()
+        errors = exc_info.value.errors()
+        assert all(tuple(err['loc'])[:1] == ('count',) for err in errors), errors
+        assert any(err['type'] == 'int_type' for err in errors), errors
 
     def test_real_value_passes_through(self) -> None:
         u = PartialWithFactory(name='hello', items=['a', 'b'])

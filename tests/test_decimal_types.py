@@ -30,7 +30,9 @@ import json
 from decimal import Decimal
 from typing import Annotated, Any
 
+import pydantic
 import pytest
+from packaging.version import Version
 from pydantic import BeforeValidator, TypeAdapter, ValidationError
 from sqlalchemy import Numeric
 from sqlmodel import Field
@@ -316,18 +318,34 @@ def test_every_alias_still_rejects_float_and_bool(name: str, whole_digits: int) 
     assert adapter.validate_python(1) == Decimal(1)
 
 
-def test_before_validator_first_would_skip_integer_digit_check() -> None:
-    """Pins the Pydantic behaviour the ordering rule exists for.
+_BEFORE_VALIDATOR_FIRST: Any = Annotated[
+    Decimal,
+    BeforeValidator(lambda value: value),
+    Field(max_digits=20, decimal_places=10),
+]
+_PYDANTIC_CHECKS_INTEGER_DIGITS_IN_ANY_ORDER = Version(pydantic.VERSION) >= Version('2.14.1')
 
-    If Pydantic ever enforces integer digits regardless of order, this test
-    fails and the ordering comment in ``field_types`` can be relaxed.
+
+@pytest.mark.skipif(
+    _PYDANTIC_CHECKS_INTEGER_DIGITS_IN_ANY_ORDER,
+    reason="Pydantic 2.14.1 checks integer digits regardless of metadata order",
+)
+def test_before_validator_first_skips_integer_digit_check_before_pydantic_2_14_1() -> None:
+    """Pins the Pydantic behaviour the ordering rule exists for (Pydantic 2.12 - 2.14.0)."""
+    assert TypeAdapter(_BEFORE_VALIDATOR_FIRST).validate_python(Decimal('9' * 15)) == Decimal('9' * 15)
+
+
+@pytest.mark.skipif(
+    not _PYDANTIC_CHECKS_INTEGER_DIGITS_IN_ANY_ORDER,
+    reason="Pydantic before 2.14.1 skips the integer digit check in this order",
+)
+def test_before_validator_first_checks_integer_digits_from_pydantic_2_14_1() -> None:
+    """Pydantic 2.14.1 (pydantic#13972) checks integer digits in the Python ``Decimal`` validator too.
+
+    The ordering rule in ``field_types`` stays while Pydantic releases before 2.14.1 are supported.
     """
-    mutated: Any = Annotated[
-        Decimal,
-        BeforeValidator(lambda value: value),
-        Field(max_digits=20, decimal_places=10),
-    ]
-    assert TypeAdapter(mutated).validate_python(Decimal('9' * 15)) == Decimal('9' * 15)
+    with pytest.raises(ValidationError, match='before the decimal point'):
+        TypeAdapter(_BEFORE_VALIDATOR_FIRST).validate_python(Decimal('9' * 15))
 
 
 # ============================================================
